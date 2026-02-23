@@ -1,8 +1,8 @@
-# AI 读书会文档项目
+# AI Infra 读书会文档项目
 
 ## About this project
 
-- 这是一个 AI 读书会网站，基于 [Mintlify](https://mintlify.com) 构建
+- 这是一个 AI Infra 读书会网站，基于 [Mintlify](https://mintlify.com) 构建
 - 每本书对应一个独立的 tab 和 `books/` 下的一个子目录
 - 页面使用 MDX 格式，带 YAML frontmatter
 - 配置文件为 `docs.json`
