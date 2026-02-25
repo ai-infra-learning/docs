@@ -130,13 +130,13 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/cr7258/ai-infra-learning"
+        "href": "https://github.com/ai-infra-learning/docs"
       }
     ]
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/cr7258/ai-infra-learning"
+      "github": "https://github.com/ai-infra-learning/docs"
     }
   }
 }
