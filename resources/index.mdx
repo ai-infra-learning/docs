@@ -1,0 +1,32 @@
+---
+title: "学习资源"
+description: "AI Infra 领域的高质量学习资源"
+icon: "book-bookmark"
+---
+
+export const ResourceCard = ({ filename, title, description, href }) => {
+  return (
+    <a className="group cursor-pointer pb-8" href={href}>
+      <img
+        src={`/images/hero-${filename}.png`}
+        className="block dark:hidden pointer-events-none group-hover:scale-105 transition-all duration-100"
+      />
+      <img
+        src={`/images/hero-${filename}-dark.png`}
+        className="pointer-events-none group-hover:scale-105 transition-all duration-100 hidden dark:block"
+      />
+      <h3 className="mt-5 text-gray-900 dark:text-zinc-50 font-medium">
+        {title}
+      </h3>
+      <span className="mt-1.5">{description}</span>
+    </a>
+  );
+};
+
+<div className="grid sm:grid-cols-2 gap-x-6 gap-y-4">
+  <ResourceCard filename="rocket" title="课程" href="/resources/courses" />
+  <ResourceCard filename="cli" title="视频" href="/resources/videos" />
+  <ResourceCard filename="editor" title="论文" href="/resources/papers" />
+  <ResourceCard filename="components" title="博客" href="/resources/blogs" />
+  <ResourceCard filename="rocket" title="书籍" href="/resources/books" />
+</div>

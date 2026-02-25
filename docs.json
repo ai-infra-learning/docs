@@ -1,68 +1,121 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "AI Infra Reading Group",
+  "name": "AI Infra 学习社区",
   "colors": {
     "primary": "#16A34A",
     "light": "#07C983",
     "dark": "#15803D"
   },
-  "favicon": "/logo/logo-dark.png",
+  "favicon": "/images/logo-dark.png",
   "navigation": {
     "tabs": [
       {
-        "tab": "读书会",
+        "tab": "首页",
         "groups": [
           {
             "group": "开始",
             "pages": [
-              "index",
-              "about",
-              "how-to-join"
+              "index"
             ]
           }
         ]
       },
       {
-        "tab": "AI Systems Performance Engineering",
+        "tab": "在线分享",
         "groups": [
           {
             "group": "概览",
             "pages": [
-              "books/ai-systems-performance-engineering/index",
-              "books/ai-systems-performance-engineering/schedule"
+              "talks/index"
             ]
           },
           {
-            "group": "章节笔记",
+            "group": "vLLM 推理优化",
             "pages": [
-              "books/ai-systems-performance-engineering/chapters/preface",
-              "books/ai-systems-performance-engineering/chapters/ch01",
-              "books/ai-systems-performance-engineering/chapters/ch02",
-              "books/ai-systems-performance-engineering/chapters/ch03",
-              "books/ai-systems-performance-engineering/chapters/ch04",
-              "books/ai-systems-performance-engineering/chapters/ch05",
-              "books/ai-systems-performance-engineering/chapters/ch06",
-              "books/ai-systems-performance-engineering/chapters/ch07",
-              "books/ai-systems-performance-engineering/chapters/ch08",
-              "books/ai-systems-performance-engineering/chapters/ch09",
-              "books/ai-systems-performance-engineering/chapters/ch10",
-              "books/ai-systems-performance-engineering/chapters/ch11",
-              "books/ai-systems-performance-engineering/chapters/ch12",
-              "books/ai-systems-performance-engineering/chapters/ch13",
-              "books/ai-systems-performance-engineering/chapters/ch14",
-              "books/ai-systems-performance-engineering/chapters/ch15",
-              "books/ai-systems-performance-engineering/chapters/ch16",
-              "books/ai-systems-performance-engineering/chapters/ch17",
-              "books/ai-systems-performance-engineering/chapters/ch18",
-              "books/ai-systems-performance-engineering/chapters/ch19",
-              "books/ai-systems-performance-engineering/chapters/ch20"
+              "talks/01-vllm-quickstart",
+              "talks/02-pagedattention",
+              "talks/03-prefix-caching",
+              "talks/04-speculative-decoding",
+              "talks/05-chunked-prefills",
+              "talks/06-disaggregating-prefill-and-decoding"
             ]
           },
           {
-            "group": "附录",
+            "group": "推理平台",
             "pages": [
-              "books/ai-systems-performance-engineering/resources"
+              "talks/07-inference-platform"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "读书会",
+        "dropdowns": [
+          {
+            "dropdown": "AI Systems Performance Engineering",
+            "icon": "/images/ai-systems-performance-engineering.jpg",
+            "groups": [
+              {
+                "group": "概览",
+                "pages": [
+                  "books/ai-systems-performance-engineering/index",
+                  "books/ai-systems-performance-engineering/schedule"
+                ]
+              },
+              {
+                "group": "章节笔记",
+                "pages": [
+                  "books/ai-systems-performance-engineering/chapters/preface",
+                  "books/ai-systems-performance-engineering/chapters/ch01",
+                  "books/ai-systems-performance-engineering/chapters/ch02",
+                  "books/ai-systems-performance-engineering/chapters/ch03",
+                  "books/ai-systems-performance-engineering/chapters/ch04",
+                  "books/ai-systems-performance-engineering/chapters/ch05",
+                  "books/ai-systems-performance-engineering/chapters/ch06",
+                  "books/ai-systems-performance-engineering/chapters/ch07",
+                  "books/ai-systems-performance-engineering/chapters/ch08",
+                  "books/ai-systems-performance-engineering/chapters/ch09",
+                  "books/ai-systems-performance-engineering/chapters/ch10",
+                  "books/ai-systems-performance-engineering/chapters/ch11",
+                  "books/ai-systems-performance-engineering/chapters/ch12",
+                  "books/ai-systems-performance-engineering/chapters/ch13",
+                  "books/ai-systems-performance-engineering/chapters/ch14",
+                  "books/ai-systems-performance-engineering/chapters/ch15",
+                  "books/ai-systems-performance-engineering/chapters/ch16",
+                  "books/ai-systems-performance-engineering/chapters/ch17",
+                  "books/ai-systems-performance-engineering/chapters/ch18",
+                  "books/ai-systems-performance-engineering/chapters/ch19",
+                  "books/ai-systems-performance-engineering/chapters/ch20"
+                ]
+              },
+              {
+                "group": "附录",
+                "pages": [
+                  "books/ai-systems-performance-engineering/resources"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "学习资源",
+        "groups": [
+          {
+            "group": "概览",
+            "pages": [
+              "resources/index"
+            ]
+          },
+          {
+            "group": "资料分类",
+            "pages": [
+              "resources/courses",
+              "resources/videos",
+              "resources/papers",
+              "resources/blogs",
+              "resources/books"
             ]
           }
         ]
@@ -70,20 +123,20 @@
     ]
   },
   "logo": {
-    "light": "/logo/logo.png",
-    "dark": "/logo/logo.png"
+    "light": "/images/logo.png",
+    "dark": "/images/logo.png"
   },
   "navbar": {
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com"
+        "href": "https://github.com/cr7258/ai-infra-learning"
       }
     ]
   },
   "footer": {
     "socials": {
-      "github": "https://github.com"
+      "github": "https://github.com/cr7258/ai-infra-learning"
     }
   }
 }
