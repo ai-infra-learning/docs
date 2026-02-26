@@ -115,7 +115,8 @@
               "resources/videos",
               "resources/papers",
               "resources/blogs",
-              "resources/books"
+              "resources/books",
+              "resources/collections"
             ]
           }
         ]
