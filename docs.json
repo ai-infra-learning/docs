@@ -31,19 +31,14 @@
             ]
           },
           {
-            "group": "vLLM 推理优化",
+            "group": "LLM 推理",
             "pages": [
               "talks/01-vllm-quickstart",
               "talks/02-pagedattention",
               "talks/03-prefix-caching",
               "talks/04-speculative-decoding",
               "talks/05-chunked-prefills",
-              "talks/06-disaggregating-prefill-and-decoding"
-            ]
-          },
-          {
-            "group": "推理平台",
-            "pages": [
+              "talks/06-disaggregating-prefill-and-decoding",
               "talks/07-inference-platform"
             ]
           }
