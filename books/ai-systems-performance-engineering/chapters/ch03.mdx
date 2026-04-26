@@ -538,6 +538,17 @@ NUMA 绑定解决的是**页放在哪个 CPU 内存节点**；Pinned Memory 解�
 
 Pinned Memory 是一块被锁定在 CPU RAM 中的 host memory，用来让 CPU → GPU 数据传输更稳定、更高效。图里有三类内存区域：
 
+<div style={{ maxWidth: "520px", margin: "0 auto" }}>
+  <Frame>
+    <img src="/books/ai-systems-performance-engineering/images/ch03-pinned-memory-page-locked-flow.png" alt="普通 pageable tensor 先被 pin 到 page-locked CPU memory，再从 pinned memory 传输到 GPU memory" />
+  </Frame>
+  <p style={{ fontSize: "0.9rem", lineHeight: "1.6", marginTop: "0.5rem" }}>
+    Pinned memory（也称 page-locked 或 nonpageable memory）是一类不能被换出到磁盘的内存。
+  </p>
+</div>
+
+<Accordion title="内存区域、Tensor 位置与数据流">
+
 - **浅黄色区域：Pageable memory**。普通 CPU 内存，属于虚拟内存体系。它的页可能在 RAM，也可能被换出到 Disk，操作系统也可能移动这些页。
 - **浅绿色区域：Pinned memory / page-locked memory**。仍然是 CPU RAM，但这些页被锁住，不能被 swap，也不能被随意迁移。
 - **图右侧区域：GPU memory**。CUDA tensor 真正所在的显存。
@@ -553,14 +564,7 @@ Pinned Memory 是一块被锁定在 CPU RAM 中的 host memory，用来让 CPU �
 - **蓝色箭头**：`pin_memory()` 把 pageable tensor 锁进 pinned memory。
 - **红色箭头**：`.to("cuda")` 把 pinned tensor 拷贝到 GPU。
 
-<div style={{ maxWidth: "520px", margin: "0 auto" }}>
-  <Frame>
-    <img src="/books/ai-systems-performance-engineering/images/ch03-pinned-memory-page-locked-flow.png" alt="普通 pageable tensor 先被 pin 到 page-locked CPU memory，再从 pinned memory 传输到 GPU memory" />
-  </Frame>
-  <p style={{ fontSize: "0.9rem", lineHeight: "1.6", marginTop: "0.5rem" }}>
-    Pinned memory（也称 page-locked 或 nonpageable memory）是一类不能被换出到磁盘的内存。
-  </p>
-</div>
+</Accordion>
 
 ##### **2.2.1 内存绑定负责页的位置**
 
