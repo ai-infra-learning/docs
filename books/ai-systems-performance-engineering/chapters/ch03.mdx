@@ -532,11 +532,25 @@ python -m ch03.compare
 
 </Accordion>
 
-#### 2.2 内存绑定与 Pinned Memory
+#### 2.2 页锁定内存（Pinned memory）
 
-NUMA 绑定解决的是**页放在哪个 CPU 内存节点**；Pinned Memory 解决的是**页能不能稳定地被 GPU/NIC 做 DMA**。
+创建 CPU tensor 时，tensor 内容会被放入内存。这里的内存指的是由 MMU（内存管理单元，Memory Management Unit）管理的一套虚拟内存（virtual memory）抽象：
 
-Pinned Memory 是一块被锁定在 CPU RAM 中的 host memory，用来让 CPU → GPU 数据传输更稳定、更高效。图里有三类内存区域：
+- **RAM 与交换空间（swap space）** 共同组成虚拟内存。它让程序看到的可用空间大于单独的物理 RAM。
+- **普通 CPU tensor 默认是 pageable 的**。Tensor 内容会被切成 page，这些 page 可以位于 RAM，也可以位于交换空间。
+- **Page fault**：通常，当程序试图访问不在 RAM 中的 page 时，就会发生 page fault。此时，OS 会将该 page 调入 RAM。相应地，为了给新 page 腾出空间，OS 可能不得不将另一个 page 调出 RAM。
+
+Pinned memory 的作用是让这块内存稳定留在 RAM 中，不被换出到磁盘。
+
+- **Pinned memory 也叫 page-locked 或 non-pageable memory**。它不能被换出到磁盘，因此访问时间更快、更可预测。
+- **代价是容量更受限制**。Pinned memory 会减少系统可自由分页的内存，不能无限制使用。
+
+CUDA 从 CPU 向 GPU 拷贝 tensor 时，对 pageable memory 和 pinned memory 的处理方式不同：
+
+- **如果源数据在 page-locked memory 中**，device 可以直接访问 RAM 中地址稳定的数据。
+- **如果源数据在 pageable memory 中**，相关 page 必须先回到 RAM，然后才能发送到 GPU。更准确地说，CUDA 会先为 pageable data 创建一份 page-locked copy，再执行 CPU → GPU transfer。
+
+下图展示了这条路径里的三类内存区域：
 
 <div style={{ maxWidth: "520px", margin: "0 auto" }}>
   <Frame>
@@ -566,421 +580,171 @@ Pinned Memory 是一块被锁定在 CPU RAM 中的 host memory，用来让 CPU �
 
 </Accordion>
 
-##### **2.2.1 内存绑定负责页的位置**
+在 PyTorch 的数据加载中，给 `DataLoader` 传入 `pin_memory=True` 会自动把取回的 tensor 放到 pinned memory 中，从而让它们更快地传输到支持 CUDA 的 GPU。
 
-Linux 的 NUMA memory policy 决定内核从哪个 NUMA 节点分配页。[Linux kernel 文档](https://www.kernel.org/doc/html/latest/admin-guide/mm/numa_memory_policy.html)把它定义为内存分配策略，而不是 CPU 亲和性；CPU 亲和性限制线程在哪些核心上运行，memory policy 限制或偏好页从哪些节点分配。
-
-`numactl` 的三个常用策略含义不同：
-
-| 参数 | 行为 | 适用场景 |
-| --- | --- | --- |
-| `--membind=<nodes>` | 只从指定节点分配；指定节点内存不足时分配失败 | 性能测试、训练 rank 与 GPU 一一对应 |
-| `--preferred=<node>` | 优先从指定节点分配；不足时回退到其他节点 | 更稳妥的生产默认值 |
-| `--localalloc` | 从当前运行 CPU 所在节点分配；不足时回退 | 线程迁移很少、CPU 绑定明确的服务 |
-
-在 GPU 训练里，常用的启动方式仍然是 CPU 与内存同时绑定：
-
-```bash
-# GPU 5 与 NUMA node 1 距离最近
-numactl --cpunodebind=1 --membind=1 \
-  python train.py --gpu 5
-```
-
-这个命令只影响**之后发生的内存分配**。如果 Python 进程先加载了大数据、创建了缓存或初始化了 DataLoader worker，再设置 NUMA 策略，已经 fault-in 的页不会自动变成本地页。稳定做法是先设置绑定，再初始化 dataset、batch cache、pinned buffer 和 worker 进程。
-
-<Tip>
-`--membind` 是强约束，内存不足会失败；`--preferred` 是软偏好，内存不足会回退。离线 benchmark 适合用 `--membind` 暴露问题，长期服务更适合在 cgroup/cpuset 约束下使用 `--preferred` 或 `--localalloc`。
-</Tip>
-
-##### **2.2.2 Pinned Memory 负责 DMA 路径**
-
-普通 CPU tensor 位于 pageable memory。GPU 从 pageable host memory 拷贝数据时，CUDA driver 不能直接把这些页交给设备访问；NVIDIA 的技术博客 [How to Optimize Data Transfers in CUDA C/C++](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/) 解释了这一点：driver 需要先创建临时 pinned staging buffer，把 pageable 数据复制进去，再发起 CPU→GPU 传输。这个中间 staging 拷贝就是 pinned memory 能提升 H2D 带宽的核心原因。
-
-[CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#pinned-memory) 对 pinned memory 的建议可以概括为三条：
-
-- page-locked / pinned host memory 能获得更高的 host↔device 传输带宽。
-- `cudaMemcpyAsync()` 这类异步传输需要 pinned host memory，并通过 stream 与计算重叠。
-- pinned memory 是稀缺资源，分配与释放比普通 host memory 更重，不适合无限制滥用。
-
-PyTorch 里的 pinned memory 仍然是 **CPU memory**，不是 GPU memory：
+此外，一旦 tensor 位于 pinned memory 中，就可以使用异步 GPU copy。只需要在 `.to()` 或 `.cuda()` 调用中额外传入 `non_blocking=True`。这可以用来让数据传输与计算重叠。
 
 ```python
 import torch
-
-x = torch.randn(1024, 1024, pin_memory=True)
-print(x.device)       # cpu
-print(x.is_pinned())  # True
-
-y = x.to("cuda", non_blocking=True)
-```
-
-`non_blocking=True` 只表示 host 线程尽量不等拷贝完成。真正把 H2D 拷贝和 GPU kernel 重叠起来，还需要三个条件：GPU 有可用 DMA/copy engine，拷贝在独立 CUDA stream 上提交，源 tensor 位于 pinned memory。PyTorch 官方教程 [good usage of `non_blocking` and `pin_memory()`](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html) 也强调，手动在训练主线程里写 `tensor.pin_memory().to(device, non_blocking=True)` 往往得不偿失，因为 `pin_memory()` 本身会阻塞 host 线程；更好的方式是在 DataLoader 或预分配 buffer 阶段完成 pinning。
-
-##### **2.2.3 PyTorch Profiler 中的四组 H2D trace**
-
-实践中，调用 [`.to()`](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.to.html#torch.Tensor.to) 时，PyTorch 总会调用 [`cudaMemcpyAsync`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g85073372f776b4c4d5f89f7124b7bf79)。如果 `non_blocking=False`（默认值），每次 `cudaMemcpyAsync` 之后都会调用 `cudaStreamSynchronize`，使主线程里的 `.to()` 调用变成阻塞调用。如果 `non_blocking=True`，则不会触发同步，host 上的主线程不会被阻塞。因此从 host 视角看，多个 tensor 可以同时发送到 device，因为线程不需要等待一次 transfer 完成后再发起下一次 transfer。
-
-一般来说，即使 transfer 在 host 侧不是阻塞的，它在 device 侧仍然是阻塞的：当 device 上正在执行另一个操作时，copy 不能同时发生。不过在一些高级场景下，一次 copy 和一次 kernel execution 可以在 GPU 侧同时执行。下面的例子会展示，要启用这种重叠，需要同时满足三个条件：
-
-- 设备必须至少有一个空闲的 DMA（Direct Memory Access）engine。Volterra、Tesla、H100 等现代 GPU 架构通常有不止一个 DMA engine。
-- 传输必须发生在独立的、非默认 CUDA stream 上。PyTorch 中可以用 [Stream](https://docs.pytorch.org/docs/stable/generated/torch.cuda.Stream_class.html#torch.cuda.Stream) 管理 CUDA stream。
-- 源数据必须位于 pinned memory。
-
-下面这段脚本会跑四种组合：pageable/pinned memory 与默认/独立 CUDA stream。每次运行都会导出一个 Chrome trace JSON，文件名里的 `streamed` 和 `pinned` 对应本轮实验的两个开关。后面的四张图就是这些 JSON 在 profiler 里的可视化结果。
-
-<Accordion title="生成四组 H2D trace 的 profiler 脚本">
-
-```python
-import contextlib
-
-import torch
-from torch.cuda import Stream
-
-
-assert torch.cuda.is_available(), "A CUDA device is required to run this script"
-
-# 这条 stream 用来观察“把 H2D copy 放到独立 stream”之后，能否和默认
-# stream 上的计算重叠。
-s = Stream()
-
-torch.manual_seed(42)
-
-# 两份 CPU tensor 大小相同，只差在 host memory 类型：
-# - t1_cpu_pinned 位于 pinned/page-locked memory，更适合异步 DMA
-# - t2_cpu_paged 位于普通 pageable memory，H2D copy 前可能需要 staging
-t1_cpu_pinned = torch.randn(1024**2 * 5, pin_memory=True)
-t2_cpu_paged = torch.randn(1024**2 * 5, pin_memory=False)
-
-# t3_cuda 一开始就在 GPU 上。后面的乘法计算使用它，而不是使用刚刚
-# copy 到 GPU 的 t1/t2。这样才能观察“拷贝一份数据，同时计算另一份
-# 已经在显存里的数据”。
-t3_cuda = torch.randn(1024**2 * 5, device="cuda:0")
-
-device = torch.device("cuda", torch.cuda.current_device())
-
-
-# 被 profiler 观察的核心函数：
-# - pinned 控制 H2D copy 的源 tensor 是否在 pinned memory 中
-# - streamed 控制 H2D copy 是否提交到独立 CUDA stream
-def inner(pinned: bool, streamed: bool):
-    with torch.cuda.stream(s) if streamed else contextlib.nullcontext():
-        if pinned:
-            t1_cuda = t1_cpu_pinned.to(device, non_blocking=True)
-        else:
-            t2_cuda = t2_cpu_paged.to(device, non_blocking=True)
-
-        # 记录 H2D copy 所在 stream 的事件。后面 synchronize 用它保证
-        # 本轮 copy 完成，避免 profiler step 之间互相串扰。
-        t_star_cuda_h2d_event = s.record_event()
-
-    # 独立的 GPU 计算任务。它不依赖刚 copy 上来的 tensor；如果条件满足，
-    # 这段乘法 kernel 可以和 H2D copy 在 GPU 侧重叠。
-    t3_cuda_mul = t3_cuda * t3_cuda * t3_cuda
-
-    # 记录默认 stream 上乘法计算之后的事件。
-    t3_cuda_h2d_event = torch.cuda.current_stream().record_event()
-
-    # 等待 copy 和 compute 都完成，确保 profiler 能完整记录本轮 step。
-    t_star_cuda_h2d_event.synchronize()
-    t3_cuda_h2d_event.synchronize()
-
-
-# 运行一次 profiler，并把 Chrome trace 导出为 JSON。
-def benchmark_with_profiler(
-    pinned,
-    streamed,
-) -> None:
-    # 让 profiler 记录 CUDA 同步事件，便于在 trace 里看到 Event Sync。
-    torch._C._profiler._set_cuda_sync_enabled_val(True)
-
-    # wait/warmup 不计入最终 active trace；active=2 会记录两个 step。
-    wait, warmup, active = 1, 1, 2
-    num_steps = wait + warmup + active
-    rank = 0
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=wait, warmup=warmup, active=active, repeat=1, skip_first=1
-        ),
-    ) as prof:
-        for step_idx in range(1, num_steps + 1):
-            inner(streamed=streamed, pinned=pinned)
-            if rank is None or rank == 0:
-                prof.step()
-
-    # 文件名编码两个开关，方便和四张 profiler 截图一一对应。
-    prof.export_chrome_trace(f"trace_streamed{int(streamed)}_pinned{int(pinned)}.json")
-
-
-# 生成四组对照 trace：
-# 1. pageable + 默认 stream
-# 2. pinned + 默认 stream
-# 3. pageable + 独立 stream
-# 4. pinned + 独立 stream
-benchmark_with_profiler(streamed=False, pinned=False)
-benchmark_with_profiler(streamed=False, pinned=True)
-benchmark_with_profiler(streamed=True, pinned=False)
-benchmark_with_profiler(streamed=True, pinned=True)
-```
-
-</Accordion>
-
-| trace | 源内存 | copy stream | kernel 与 copy 是否重叠 | 现象 |
-| --- | --- | --- | --- | --- |
-| `trace_streamed0_pinned0.json` | pageable | 默认 stream | 不重叠 | pageable staging 让 CPU 侧 `cudaMemcpyAsync` 很长，乘法 kernel 排在 H2D copy 之后 |
-| `trace_streamed0_pinned1.json` | pinned | 默认 stream | 不重叠 | H2D 是 `Pinned -> Device`，但默认 stream 仍然顺序执行 |
-| `trace_streamed1_pinned0.json` | pageable | 独立 stream | 不重叠 | 独立 stream 提供了重叠可能，但 pageable staging 让计算提交太晚 |
-| `trace_streamed1_pinned1.json` | pinned | 独立 stream | 重叠 | H2D copy 和独立乘法 kernel 在不同 stream 上出现时间重叠 |
-
-这是 baseline：CPU 源 tensor 是 pageable memory，拷贝也没有放到独立 CUDA stream。CPU 侧能看到一条很长的 `cudaMemcpyAsync`，GPU 侧是 `Memcpy HtoD (Pageable -> Device)`。虽然名字叫 `cudaMemcpyAsync`，但 pageable memory 需要先经过 page-locked staging，CPU 侧调用本身也会明显耗时。判断是否重叠，要看 GPU 侧同一横轴时间范围内，`Memcpy HtoD` 和独立的乘法 kernel 是否出现在不同 stream 上；这张图里乘法 kernel 排在 H2D 拷贝之后，没有和拷贝重叠执行。
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-trace-streamed0-pinned0-annotated.png" alt="trace_streamed0_pinned0：pageable memory 加默认 stream，H2D copy 与 compute 串行，标出后续乘法 kernel" />
-</Frame>
-
-**图 1：`trace_streamed0_pinned0.json`**
-
-这里 CPU 源 tensor 已经是 pinned memory，所以 GPU 侧变成了 `Memcpy HtoD (Pinned -> Device)`，这一步比 pageable memory 更适合异步 DMA。但 `streamed=0`，拷贝和后面的计算仍然在默认 stream 上排队。CUDA stream 内部是顺序执行的，所以即使源内存是 pinned，也不会和后面的计算并行。图里长的 `cudaEventSynchronize` / `Event Sync` 主要表示 CPU 在等 GPU 事件完成，不代表 CPU 正在做有效计算。
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-trace-streamed0-pinned1.png" alt="trace_streamed0_pinned1：pinned memory 加默认 stream，H2D copy 仍与 compute 串行" />
-</Frame>
-
-**图 2：`trace_streamed0_pinned1.json`**
-
-这里用了独立 stream，但源 tensor 仍然是 pageable memory。GPU 侧能看到 H2D 拷贝跑在另一个 stream 上，比如图里的 `stream 13`。但 pageable memory 会让 `cudaMemcpyAsync` 在 CPU 侧仍然承担 staging 相关开销，CPU 不能足够早地把独立的 GPU 计算提交出去。所以即使用了独立 stream，H2D copy 和 GPU 计算也没有形成有效重叠。
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-trace-streamed1-pinned0.png" alt="trace_streamed1_pinned0：pageable memory 加独立 stream，H2D copy 仍没有形成有效重叠" />
-</Frame>
-
-**图 3：`trace_streamed1_pinned0.json`**
-
-这个组合实现了计算与 copy 重叠：pinned memory + 独立 CUDA stream。H2D 拷贝在 `stream 13` 上执行，独立的 GPU 乘法 kernel 在默认 stream 或另一个 stream 上执行。因为 pinned memory 允许 DMA 更直接地从 host memory 读数据，CPU 可以更快提交这段独立计算，GPU 上就能看到 copy 和 compute 时间段重叠。
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-trace-streamed1-pinned1-annotated.png" alt="trace_streamed1_pinned1：pinned memory 加独立 stream，标出 H2D copy 与乘法 kernel 的重叠时间段" />
-</Frame>
-
-**图 4：`trace_streamed1_pinned1.json`**
-
-##### **2.2.4 PyTorch DataLoader 的正确组合**
-
-在标准训练循环里，pinned memory 通常这样使用：
-
-```python
 from torch.utils.data import DataLoader
 
-dataloader = DataLoader(
-    dataset,
-    batch_size=global_batch,
-    num_workers=8,
+
+device = torch.device("cuda")
+
+loader = DataLoader(
+    train_dataset,
+    batch_size=64,
     pin_memory=True,
-    prefetch_factor=2,
-    persistent_workers=True,
 )
 
-for batch, labels in dataloader:
-    batch = batch.to(device, non_blocking=True)
-    labels = labels.to(device, non_blocking=True)
-    loss = model(batch, labels)
+for x, y in loader:
+    x = x.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
 ```
 
-这段代码里的几个点容易混淆：
+参考资料：
 
-- `pin_memory=True` 让 DataLoader 在返回 batch 前把 tensor 放进 pinned CPU memory；[PyTorch DataLoader 文档](https://docs.pytorch.org/docs/stable/data.html)明确说明它会把 Tensor 复制到 device/CUDA pinned memory。
-- `non_blocking=True` 放在 `.to(device)` 上，减少 host 线程等待，让后续 batch 的准备和当前 GPU 工作更容易重叠。
-- `persistent_workers=True` 避免每个 epoch 反复销毁 worker，NUMA 绑定、dataset cache 和 pinned buffer 更稳定。
-- 自定义 `collate_fn` 返回 dict、dataclass 或自定义 batch 类型时，需要确保里面的 Tensor 能被 DataLoader pinning 逻辑识别；必要时给自定义类型实现 `pin_memory()` 方法。
+- [PyTorch tutorial: A guide on good usage of `non_blocking` and `pin_memory()`](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)
+- [PyTorch DataLoader: Memory Pinning](https://docs.pytorch.org/docs/2.11/data.html#memory-pinning)
+- [PyTorch CUDA semantics: Use pinned memory buffers](https://docs.pytorch.org/docs/2.11/notes/cuda.html#cuda-memory-pinning)
 
-NUMA 与 pinned memory 的组合顺序如下：
+#### 2.3 透明大页（Transparent Hugepages）
 
-```python
-# 伪代码：先绑定，再创建 DataLoader 和 pinned buffer
-gpu_node = get_gpu_numa_node(local_rank)
-bind_process_to_node(gpu_node)          # CPU affinity + NUMA memory policy
+Linux 内存管理通常使用 4 KB 的页；但当进程使用数十或数百 GB 内存时，例如深度学习数据集、预取批次、模型参数等，管理数以百万计的小页会非常低效。
 
-dataloader = DataLoader(
-    dataset,
-    num_workers=8,
-    pin_memory=True,
-    worker_init_fn=lambda worker_id: bind_process_to_node(gpu_node),
-    persistent_workers=True,
-)
-```
+透明大页（Transparent Hugepages，THP）是一种自动使用大页的机制。大页——2 MB 甚至 1 GB 的页——可以通过增大内存块来减少虚拟内存管理的开销。主要好处是减少缺页中断，并减轻 TLB（translation lookaside buffer）的压力。
 
-worker 在本地 NUMA 节点上创建 batch，pinning 发生在本地 CPU DRAM 上，随后 H2D copy 从靠近 GPU 的 CPU 内存发起。这样 `--cpunodebind`、`--membind`、`pin_memory=True` 和 `non_blocking=True` 才构成完整链路。
+##### 2.3.1 TLB 地址转换
 
-<Warning>
-Pinned memory 不能弥补错误 NUMA 放置。如果 worker 在 NUMA node 1 上创建 pinned batch，但 GPU 挂在 node 0，DMA 的源页仍然是远端内存；页被 pin 住之后更不容易靠自动 NUMA balancing 迁移回本地。
-</Warning>
+TLB 是 CPU 用来把虚拟地址映射到物理地址的缓存。页更少、更大时，同样数量的 TLB 条目可以覆盖更多内存，从而减少 TLB miss。
 
-##### **2.2.5 系统限制与验证方式**
+<Accordion title="TLB 的地址转换过程">
 
-Pinned memory 会受 Linux locked memory 限制影响。`mlock(2)` 手册说明，locked memory 会常驻 RAM，`RLIMIT_MEMLOCK` 限制非特权进程可锁定的字节数；Docker 的 `--ulimit` 文档也把 `memlock` 对应到 `RLIMIT_MEMLOCK`。
+**TLB hit**
 
-```bash
-# 查看当前 shell 的最大 locked memory，单位通常是 KB
-ulimit -l
+一个虚拟内存地址（virtual memory address）进入后，需要被翻译成物理地址（physical address）。第一步总是把虚拟地址拆成两部分：虚拟页号（virtual page number）和页偏移（page offset）。页偏移由虚拟地址的最后几位组成。偏移位不会被翻译，而是直接传递到物理内存地址中；因为页表只负责把虚拟页号映射到物理页号，页内的相对位置保持不变。
 
-# 容器里给训练进程放开 memlock
-docker run --gpus all \
-  --ulimit memlock=-1:-1 \
-  --ipc=host \
-  nvcr.io/nvidia/pytorch:25.03-py3 \
-  python train.py
-```
+因此，偏移量会直接映射到物理内存层，而虚拟页号则与 TLB 中已有的标签相对应。这样一来，MMU 无需查询全局内存，就能立即知道该访问哪个物理内存页。
 
-Kubernetes 中常见配置是给容器添加 `IPC_LOCK` capability，并在运行时或节点层面设置合适的 memlock 限制：
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-tlb-hit.png" alt="TLB hit：虚拟页号在 TLB 中找到匹配条目后直接得到物理页号" />
+</Frame>
 
-```yaml
-securityContext:
-  capabilities:
-    add: ["IPC_LOCK"]
-```
+在上图的例子中，虚拟页号在 TLB 中被找到，并立即转换成物理页号。
 
-可以用下面几组命令验证链路是否生效：
+**TLB miss**
 
-```bash
-# 1. NUMA 策略
-numactl --show
-numastat -p $PID
+当虚拟页码在 TLB 中找不到时，就会发生所谓的“TLB 未命中”情况。此时，TLB 必须查询系统的物理内存，以确定对应的物理页码是多少。与 TLB 命中相比，这种查询方式会导致更高的延迟。如果 TLB 已满且发生 TLB 未命中，那么 TLB 中最近最少使用的数据条目会被清除，新的数据条目则会取而代之。在下面的例子中，虚拟页码在 TLB 中不存在，因此 TLB 必须查询物理内存来获取该页码。
 
-# 2. 进程锁页状态
-grep -E "VmLck|VmPin" /proc/$PID/status
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-tlb-miss.png" alt="TLB miss：虚拟页号未命中 TLB 后需要访问页表并把映射写回 TLB" />
+</Frame>
 
-# 3. CUDA samples 中的 pageable vs pinned 带宽
-bandwidthTest --memory=pageable
-bandwidthTest --memory=pinned
-
-# 4. PyTorch tensor 状态
-python - <<'PY'
-import torch
-x = torch.empty(1024, 1024, pin_memory=True)
-print(x.device, x.is_pinned())
-PY
-```
-
-<Note>
-[NVIDIA DALI performance tuning 文档](https://docs.nvidia.com/deeplearning/dali/main-user-guide/docs/advanced_topics_performance_tuning.html) 提到，GPU memory 和 host page-locked memory 的分配/释放需要设备同步，因此 DALI 会用 memory pool 避免频繁重分配。这个经验同样适用于 PyTorch：长生命周期的 pinned buffer、稳定 batch shape 和 worker 复用，通常比每轮临时 pin/unpin 更可靠。
-</Note>
-
-##### **2.2.6 常见误区**
-
-- **把 `pin_memory=True` 当成 GPU 预加载。** DataLoader 返回的 batch 仍在 CPU 上，只是位于 pinned CPU memory。
-- **在训练主循环里临时 `batch.pin_memory()`。** 这会把 pinning 开销放回关键路径，通常不如让 DataLoader 或预分配 buffer 提前完成。
-- **只开 `non_blocking=True`，没有独立 stream。** host 线程可能少等一些，但 copy 和 kernel 不一定真正重叠。
-- **pinned buffer 越多越好。** pinned memory 会减少 OS 可自由分页和迁移的内存，过量使用会影响整机性能。
-- **忽略 batch 形状变化。** 频繁变形会触发 pinned/device buffer 扩容和重新分配，吞吐更容易抖动。
-- **只看 GPU utilization。** H2D copy、DataLoader stall、page fault、NUMA miss 需要结合 PyTorch profiler、Nsight Systems、`numastat -p`、`perf` 一起看。
-
-<Accordion title="延伸资料：数据加载瓶颈与 pinned memory">
-
-| 资料 | 价值 |
-| --- | --- |
-| [CUDA C++ Best Practices Guide: Pinned Memory](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#pinned-memory) | CUDA 官方对 page-locked memory、`cudaMemcpyAsync()`、stream 重叠的定义 |
-| [PyTorch tutorial: good usage of `non_blocking` and `pin_memory()`](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html) | 解释 PyTorch `to(non_blocking=True)`、手动 `pin_memory()` 的代价和安全边界 |
-| [NVIDIA blog: How to Optimize Data Transfers in CUDA C/C++](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/) | 直观说明 pageable → pinned staging 的额外拷贝 |
-| [NVIDIA DALI Loader Evaluator](https://docs.nvidia.com/deeplearning/dali/user-guide/docs/examples/frameworks/pytorch/loader_evaluator/pytorch_data_loader_evaluator.html) | 用 replay/no-overhead 方式判断 GPU 是否在等 DataLoader |
-| [Profiling and Improving the PyTorch Dataloader for high-latency Storage](https://arxiv.org/abs/2211.04908) | 从工程角度分析 PyTorch DataLoader 在高延迟存储上的瓶颈与改进 |
+参考资料：[How is Virtual Memory Translated to Physical Memory?](https://blogs.vmware.com/cloud-foundation/2020/03/03/how-is-virtual-memory-translated-to-physical-memory/)
 
 </Accordion>
 
-#### 2.3 Transparent Hugepages (THP)
+##### 2.3.2 THP 配置
 
-Linux 默认使用 4 KB 页。大模型训练进程会维护大量 tensor metadata、DataLoader cache、通信 buffer 和 checkpoint buffer，页表和 TLB 压力会被放大。[Linux kernel THP 文档](https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html)把 Transparent Hugepages 描述为自动把普通页合并为更大页的机制，常见大小是 2 MB，也可能包含更大的 multi-size THP 配置。
-
-| 策略 | 行为 | 适用场景 | 风险 |
-| --- | --- | --- | --- |
-| `always` | 尽量为匿名内存使用 THP | 吞吐优先的训练、长时间稳定 batch | direct reclaim / compaction 可能带来尾延迟 |
-| `madvise` | 只对 `MADV_HUGEPAGE` 标记区域使用 THP | 生产默认值、混合训练与推理节点 | 依赖应用或 allocator 显式标记 |
-| `never` | 禁用 THP | 极端延迟敏感推理 | TLB miss 可能增加，吞吐不一定最佳 |
-
-原书给出的经验是：训练任务通常能从 THP 获得几个百分点吞吐收益；延迟敏感推理更关注 compaction 带来的长尾抖动。实际决策应以 p99/p999 延迟、GPU utilization 和 CPU `dTLB-load-misses` 为准。
+- **收益幅度**：Hugepages 通常带来的是中等幅度收益，吞吐提升常见在 **3%–5%** 左右。
+- **Pinned memory 限制**：使用大块 pinned memory 时，需要把 `ulimit -l` 调高或设为 unlimited；如果这个限制过低，pin memory 可能失败，进而回退到可交换内存，或者触发 OOM。
+- **推理延迟风险**：THP 的后台 compaction 可能引入不可预测的暂停，这对延迟敏感的 LLM 推理是高风险。
+- **Defrag 策略**：`defrag` 控制内核是否为了分配 THP 做内存整理。THP 需要连续的物理内存，如果当前内存碎片较多，内核可能触发 compaction 来凑出连续空间，这个过程会增加延迟抖动。
+- **训练与推理取舍**：Linux 默认会尽可能自动分配 2 MB 的 THP。吞吐优先的训练 workload 通常启用 THP；延迟优先的推理 workload 通常完全禁用。
 
 ```bash
-# 查看 THP 当前策略
+# 查看 THP 当前策略和 defrag 策略
 cat /sys/kernel/mm/transparent_hugepage/enabled
 cat /sys/kernel/mm/transparent_hugepage/defrag
 
-# 吞吐优先训练节点
+# 启用 THP
 echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
-echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
 
-# 延迟优先推理节点
+# 禁用 THP
 echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+# 设置 THP defrag 策略，减少同步 compaction 对延迟的影响
+echo never | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+
+# 查看系统支持的显式 hugepage 大小
+ls /sys/kernel/mm/hugepages/
+
+# 查看 hugepage 当前状态
+grep -E "HugePages|Hugepagesize|Hugetlb" /proc/meminfo
 ```
-
-对特别大的、生命周期稳定的 host buffer，可以考虑显式 hugepages（`vm.nr_hugepages`、`hugetlbfs` 或应用内 `mmap`/`madvise`）。显式 hugepages 的运维成本更高，但延迟更可控，不依赖内核后台合并。
-
-<Accordion title="练习入口：THP 与 NUMA 系统配置">
-
-配套脚本 [`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 和 [`cpu_gpu_numa_optimizations.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/cpu_gpu_numa_optimizations.sh) 都包含 THP 配置。前者更像通用 GPU 服务器 checklist，后者面向 GB200/GB300 节点，默认把 THP 设为 `madvise`。
-
-验证方式：
-
-```bash
-# 当前进程是否实际拿到 hugepage
-grep -E "AnonHugePages|FilePmdMapped|ShmemPmdMapped" /proc/$PID/smaps_rollup
-
-# TLB 行为变化
-perf stat -e dTLB-loads,dTLB-load-misses -p $PID -- sleep 30
-
-# NUMA 节点上的 page 分布
-numastat -p $PID
-```
-
-</Accordion>
-
-<Warning>
-THP 不是越激进越好。`always` 在内存碎片严重时可能触发同步 compaction，推理服务会表现为偶发长尾。训练节点可以偏向吞吐；在线服务建议从 `madvise` 开始，结合 p99/p999 延迟再调整。
-</Warning>
 
 #### 2.4 调度器与中断亲和性
 
-GPU 训练不是纯 GPU 工作。DataLoader、tokenizer、通信线程、NCCL proxy、CUDA API dispatch、NIC/GPU IRQ 都在 CPU 侧运行。调度器抖动会变成 GPU kernel 之间的空洞，也会让 NCCL collective 出现 straggler。
+GPU 训练不是纯 GPU 工作。DataLoader、tokenizer、通信线程、NCCL proxy、CUDA API dispatch、NIC/GPU IRQ 都在 CPU 侧运行。在繁忙节点上，关键数据管道线程如果频繁被打断，GPU 侧会看到 kernel 之间的空洞，batch 供应也会出现抖动。
 
-[Linux CPU isolation 文档](https://www.kernel.org/doc/html/next/admin-guide/cpu-isolation.html)把隔离目标描述为让某些 CPU 避免异步内核事件、timer、workqueue 和 interrupt 干扰。GPU 节点上更实用的做法是把 CPU 分成三类：
+Linux 默认使用完全公平调度器（Completely Fair Scheduler，CFS）处理普通线程。`SCHED_OTHER` / `SCHED_NORMAL` 适合大多数场景；当某个线程负责持续给 GPU 喂数据时，公平调度不一定能保证它总是及时运行。
 
-| CPU 类别 | 运行内容 | 常用配置 |
-| --- | --- | --- |
-| 计算核心 | DataLoader worker、训练主进程、tokenizer | `taskset`、`numactl --cpunodebind`、cgroup `cpuset` |
-| I/O 与通信核心 | NIC IRQ、NCCL helper、存储 I/O 线程 | `/proc/irq/*/smp_affinity`、RPS/XPS |
-| housekeeping 核心 | kubelet、containerd、监控 agent、kernel workqueue | `reservedSystemCPUs`、`isolcpus`、`nohz_full`、`rcu_nocbs` |
+##### 2.4.1 线程调度
 
-基础排查命令：
+- **默认调度**：普通线程使用 CFS 下的 `SCHED_OTHER`，实时优先级不参与调度决策。`nice` 可以影响普通线程的相对权重，但它不是强隔离。
+- **实时调度**：对极少数延迟敏感的控制线程，可以考虑先进先出（FIFO）或轮转（RR）优先级调度。对应到 Linux 策略就是 `SCHED_FIFO` 和 `SCHED_RR`。`SCHED_FIFO` 没有时间片；`SCHED_RR` 在同优先级线程之间做 round-robin。
+- **使用边界**：实时线程优先级高于普通线程。如果实时线程持续占用 CPU，低优先级线程可能长期拿不到 CPU。实际生产中，优先把关键线程放到专用 CPU 上，再评估是否需要实时优先级。
 
 ```bash
-# 线程实际跑在哪些 CPU 上
-ps -eLo pid,tid,psr,comm | grep -E "python|nccl|nvidia"
+# 查看线程实际运行在哪些 CPU 上，以及调度策略和实时优先级
+ps -eLo pid,tid,psr,policy,rtprio,comm | grep -E "python|nccl|nvidia"
 
-# GPU / NIC IRQ 分布
+# 只给明确的关键线程设置实时策略，优先级不要从 99 开始
+sudo chrt -f -p 10 <tid>  # SCHED_FIFO
+sudo chrt -r -p 10 <tid>  # SCHED_RR
+```
+
+##### 2.4.2 CPU 隔离
+
+CPU 隔离的目标不是让单个 CPU 更快，而是减少 scheduler load balancing、kernel workqueue、timer、IRQ 等系统噪声。隔离关键计算核心时，需要保留 housekeeping cores 来承接系统服务、监控、容器 runtime 和内核后台任务。
+
+- **临时绑定**：`taskset` 适合排查和实验，可以把进程或线程绑定到指定 CPU。
+- **生产隔离**：cgroup `cpuset` 更适合生产环境。`cpuset.cpus` 约束任务可运行的 CPU，`cpuset.mems` 约束可使用的 NUMA memory node。
+- **容器约束**：容器环境中可以用 `docker run --cpuset-cpus` 固定 CPU 范围，用 `--cpuset-mems` 固定 memory node。
+- **启动参数**：`isolcpus`、`nohz_full`、`irqaffinity` 可以做更强的启动期隔离，但运行期调整不如 cgroup 灵活，适合非常明确的低延迟节点。
+
+```bash
+# 把已有进程绑定到 CPU 8-15
+sudo taskset -cp 8-15 <pid>
+
+# 容器只使用 CPU 8-15 和 NUMA node 0
+docker run --cpuset-cpus=8-15 --cpuset-mems=0 <image>
+
+# 查看 cgroup 中实际生效的 CPU / memory node
+cat /sys/fs/cgroup/<workload>/cpuset.cpus.effective
+cat /sys/fs/cgroup/<workload>/cpuset.mems.effective
+```
+
+##### 2.4.3 中断亲和性
+
+GPU 和 NIC 的硬件中断也需要靠 CPU 处理。设备在 NUMA node 0 上触发中断，却由另一个 NUMA node 上的 CPU 处理时，会引入跨节点通信和 cache coherency 流量。性能敏感节点通常会把 GPU/NIC IRQ 绑定到设备所在 NUMA node 附近的 I/O cores。
+
+```bash
+# 查看 CPU 与 NUMA 拓扑
+lscpu -e=CPU,NODE,SOCKET,CORE
+
+# 查看 GPU / NIC 拓扑
+nvidia-smi topo -m
+cat /sys/class/net/<iface>/device/numa_node
+
+# 查看 GPU / NIC IRQ 分布
 grep -Ei "nvidia|mlx|eth|ib" /proc/interrupts
 
-# 查看某个 IRQ 当前 CPU mask
+# 查看和设置某个 IRQ 允许运行的 CPU 列表
 cat /proc/irq/<irq>/smp_affinity_list
+echo 8-15 | sudo tee /proc/irq/<irq>/smp_affinity_list
 ```
 
-GPU/NIC IRQ 应尽量落在同一 NUMA 节点的 I/O 核心上。不要随手写死 `echo 2 > /proc/irq/$irq/smp_affinity`，因为 mask 含义依赖 CPU 编号和机器拓扑。先用 `lscpu -e`, `nvidia-smi topo -m`, `cat /sys/class/net/<iface>/device/numa_node` 找到本地 CPU，再生成 mask。
+如果 `irqbalance` 正在运行，手工设置的 IRQ affinity 可能被后续调整覆盖。生产环境通常需要显式配置 `irqbalance` 规则，或者由运维脚本接管 IRQ affinity。
 
-<Accordion title="练习入口：Grace Blackwell 拓扑脚本">
+参考资料：
 
-[`grace_blackwell_topology.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/grace_blackwell_topology.py) 会读取 NIC 的 NUMA node、local CPU list 和 IRQ 列表，并生成 IRQ/RPS/XPS 亲和性片段。适合先以只读模式生成建议，再由运维脚本落盘。
-
-```bash
-python grace_blackwell_topology.py --interface ib0 --dry-run
-```
-
-[`optimized_rack_prep.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/optimized_rack_prep.py) 把 NIC 拓扑规划和 pinned double-buffer staging 放在一起，可以用来观察“拓扑准备 + 数据准备”对整条 pipeline 的影响。
-
-</Accordion>
-
-<Note>
-实时调度策略（`SCHED_FIFO` / `SCHED_RR`）只适合非常明确的控制线程。把训练主进程或 DataLoader worker 全部设成实时优先级，容易饿死 kubelet、ssh、监控和 kernel worker，故障时反而更难恢复。
-</Note>
+- [CFS Scheduler](https://docs.kernel.org/scheduler/sched-design-CFS.html)
+- [sched(7) - Linux manual page](https://man7.org/linux/man-pages/man7/sched.7.html)
+- [CPU Isolation](https://www.kernel.org/doc/html/next/admin-guide/cpu-isolation.html)
+- [Control Group v2](https://www.kernel.org/doc/html/v6.7/admin-guide/cgroup-v2.html)
+- [Docker Resource Constraints](https://docs.docker.com/engine/containers/resource_constraints/)
+- [SMP IRQ affinity](https://www.kernel.org/doc/html/v6.9/core-api/irq/irq-affinity.html)
 
 #### 2.5 虚拟内存与 Swap
 
@@ -1111,11 +875,87 @@ cat /proc/$PID/maps | grep -E "jemalloc|tcmalloc"
 不要同时 preload 多个 malloc 实现。先用 `torch.profiler`、`perf`, `pmap -x`, `smem` 或 `/proc/$PID/smaps_rollup` 确认瓶颈，再替换 allocator。allocator 能改善碎片和分配开销，但不会解决 batch shape 抖动、worker 过多或 dataset cache 设计问题。
 </Warning>
 
-<Accordion title="练习入口：系统调优脚本">
+#### 2.9 系统调优脚本汇总
 
-[`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 汇总了 CPU governor、swap、THP、dirty ratio、IRQ affinity、locked memory、persistence mode、MPS 和 NUMA balancing 等配置。它会修改 `/etc/sysctl.conf` 和 `/etc/security/limits.conf`，适合拆成可审计的 Ansible/Terraform/DaemonSet 片段，而不是直接复制执行。
+[`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 把本节讨论的 CPU governor、swap、THP、dirty ratio、网络 buffer、IRQ affinity、locked memory、GPU persistence mode、MPS、NUMA balancing 和 CPU isolation 放到一个脚本里。它更适合作为 GPU 服务器调优 checklist；生产环境里应按机器拓扑和运维体系拆成可审计的 Ansible、Terraform 或 DaemonSet 配置，不建议未经审查直接执行。
 
-</Accordion>
+```bash
+#!/bin/bash
+
+# System-wide performance tuning for GPU environments
+# Run as root or with sudo
+
+echo "Applying system-wide GPU performance optimizations..."
+
+# 1. CPU Governor and C-states
+echo "Setting CPU governor to performance mode..."
+cpupower frequency-set -g performance
+echo "Disabling deep C-states in BIOS (manual step required)"
+
+# 2. Virtual Memory and Swapping
+echo "Disabling swap and setting swappiness to 0..."
+swapoff -a
+echo 0 > /proc/sys/vm/swappiness
+
+# 3. Transparent Huge Pages - enable for training, disable for inference
+echo "Configuring Transparent Huge Pages..."
+# For training workloads (throughput-focused):
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+# For inference workloads (latency-focused), use:
+# echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+# 4. Filesystem and I/O tuning
+echo "Tuning filesystem cache settings..."
+echo 20 > /proc/sys/vm/dirty_ratio
+echo 10 > /proc/sys/vm/dirty_background_ratio
+
+# 5. Network optimizations
+echo "Optimizing network settings for RDMA/InfiniBand..."
+echo 'net.core.rmem_max = 268435456' >> /etc/sysctl.conf
+echo 'net.core.wmem_max = 268435456' >> /etc/sysctl.conf
+echo 'net.ipv4.tcp_rmem = 4096 87380 268435456' >> /etc/sysctl.conf
+echo 'net.ipv4.tcp_wmem = 4096 65536 268435456' >> /etc/sysctl.conf
+sysctl -p
+
+# 6. Interrupt affinity (example for 8-core system)
+echo "Setting interrupt affinity..."
+# This would need to be customized per system
+# Example: bind GPU interrupts to specific cores
+for irq in $(grep nvidia /proc/interrupts | cut -d: -f1); do
+    echo 2 > /proc/irq/$irq/smp_affinity  # Bind to CPU 1
+done
+
+# 7. ulimits for memory locking
+echo "Setting unlimited locked memory..."
+cat >> /etc/security/limits.conf << EOF
+* soft memlock unlimited
+* hard memlock unlimited
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+
+# 8. GPU-specific optimizations
+echo "Configuring GPU settings..."
+# Enable persistence mode for all GPUs
+nvidia-smi -pm 1
+
+# Enable MPS (optional, for multi-process scenarios)
+# export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+# export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+# nvidia-cuda-mps-control -d
+
+# 9. NUMA balancing
+echo "Disabling automatic NUMA balancing..."
+echo 0 > /proc/sys/kernel/numa_balancing
+
+# 10. CPU isolation (example - isolate CPUs 2-7 for compute)
+# This requires kernel parameter: isolcpus=2-7 nohz_full=2-7
+echo "CPU isolation requires kernel boot parameters:"
+echo "Add to GRUB: isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7"
+
+echo "System tuning complete. Reboot recommended for all changes to take effect."
+echo "Remember to update /etc/default/grub with CPU isolation parameters if needed."
+```
 
 ### 3. GPU 驱动与运行时设置
 
