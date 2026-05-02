@@ -118,7 +118,15 @@ PyTorch 抽象了 CUDA 编程的复杂性——你写直观的 Python 代码，�
 
 ### 2. CPU 与操作系统调优
 
-GPU 利用率不高的最常见原因：**CPU 没能及时喂数据给 GPU**。CPU 负责数据加载、tokenize、变换、分发内核、线程协调——任何一步慢了，GPU 就空闲。
+**GPU 利用率不足的一个常见根源，是 CPU 端未能及时、持续地为 GPU 提供有效的计算任务**。训练和推理的具体形态不同，但影响 GPU 计算的 CPU 侧任务主要集中在几类：
+
+- **准备输入**：训练时读取样本、tokenize、图像解码、数据增强和 batch 组装；推理时处理请求解析、tokenize、padding 和动态 batching。输入准备跟不上时，GPU 只能等待下一批数据或请求。
+- **提交 GPU 任务**：CPU 调用 CUDA API 完成 kernel launch、memory copy 和 stream synchronization，并把这些任务排进 CUDA stream。只有 CPU 完成提交后，GPU 才能开始执行对应 kernel。大量小 kernel 或频繁同步会放大 CPU 开销，导致 GPU 间歇性空闲。
+- **搬运输入数据**：输入通常先在 CPU memory 中生成，再通过 CPU → GPU copy 放入 GPU memory。
+- **分布式通信**：多 GPU 训练或分布式推理中，CPU 侧会发起 collective 或点对点通信，并依赖专门的通信辅助线程维护通信进度。这些线程被调度打断或阻塞时，GPU 可能因为等待其他 rank 或 device 而闲置。
+- **处理设备中断**：NIC/GPU 相关 interrupt 也需要 CPU 响应。如果中断落在远离设备或关键输入/通信线程的 NUMA node 上，或者频繁打断这些关键线程，都会增加访问延迟和调度开销，进而拉长 GPU 等待时间。
+
+如果这些 CPU 侧任务变慢、出现抖动，或者 OS 调度不稳定，昂贵的 GPU 就可能长时间处于空闲，CPU 与操作系统调优的目标，是让输入管道、GPU 任务提交和通信辅助线程更稳定、更高效地运行，从而减少 GPU 等待时间。
 
 #### 2.1 NUMA 感知与 CPU 绑定
 
@@ -673,78 +681,270 @@ ls /sys/kernel/mm/hugepages/
 grep -E "HugePages|Hugepagesize|Hugetlb" /proc/meminfo
 ```
 
+在内存池非常大的场景中，例如用于 I/O 的预分配固定缓冲区，也可以考虑使用显式 hugepages（HugeTLB），例如 `vm.nr_hugepages` 或 `hugetlbfs`，以获得更可预测的性能。它和 THP 不同：THP 由内核自动尝试分配大页；显式 hugepages 需要提前预留，并由应用或 runtime 明确使用。
+
+```bash
+# 查看默认 hugepage 大小
+grep Hugepagesize /proc/meminfo
+
+# 预留 1024 个 hugepages
+sudo sysctl -w vm.nr_hugepages=1024
+
+# 挂载 hugetlbfs，供支持 HugeTLB 的应用显式使用
+sudo mkdir -p /mnt/huge
+sudo mount -t hugetlbfs none /mnt/huge
+
+# 验证 hugepages 预留和使用情况
+grep -E "HugePages_Total|HugePages_Free|Hugepagesize|Hugetlb" /proc/meminfo
+```
+
 #### 2.4 调度器与中断亲和性
 
-GPU 训练不是纯 GPU 工作。DataLoader、tokenizer、通信线程、NCCL proxy、CUDA API dispatch、NIC/GPU IRQ 都在 CPU 侧运行。在繁忙节点上，关键数据管道线程如果频繁被打断，GPU 侧会看到 kernel 之间的空洞，batch 供应也会出现抖动。
+CPU 侧抖动通常来自三个方面：
 
-Linux 默认使用完全公平调度器（Completely Fair Scheduler，CFS）处理普通线程。`SCHED_OTHER` / `SCHED_NORMAL` 适合大多数场景；当某个线程负责持续给 GPU 喂数据时，公平调度不一定能保证它总是及时运行。
+- **线程调度**：关键数据管道线程或通信辅助线程如果长时间排队、频繁被抢占，就会形成 CPU 侧调度抖动，进而让 GPU 因等待输入或通信而空闲。
+- **CPU 隔离**：这些线程如果和其他 workload 混跑在同一组 CPU 上，容易争抢 CPU core、cache 和内存带宽，响应时间会变得不稳定。
+- **中断亲和性**：GPU/NIC 中断请求（Interrupt Request，IRQ）如果由远离设备的 CPU 处理，或者频繁打断关键线程，会增加额外延迟。
 
 ##### 2.4.1 线程调度
 
-- **默认调度**：普通线程使用 CFS 下的 `SCHED_OTHER`，实时优先级不参与调度决策。`nice` 可以影响普通线程的相对权重，但它不是强隔离。
-- **实时调度**：对极少数延迟敏感的控制线程，可以考虑先进先出（FIFO）或轮转（RR）优先级调度。对应到 Linux 策略就是 `SCHED_FIFO` 和 `SCHED_RR`。`SCHED_FIFO` 没有时间片；`SCHED_RR` 在同优先级线程之间做 round-robin。
-- **使用边界**：实时线程优先级高于普通线程。如果实时线程持续占用 CPU，低优先级线程可能长期拿不到 CPU。实际生产中，优先把关键线程放到专用 CPU 上，再评估是否需要实时优先级。
+在繁忙的系统上，需要确保数据管道线程等重要线程不会被频繁中断。Linux 默认使用**完全公平调度器（Completely Fair Scheduler，CFS）**，对大多数情况都有效。
+
+但如果有一个对延迟非常敏感、例如需要为 GPU 提供数据的线程，可以考虑对该线程使用实时的**先进先出（FIFO）**或**轮转（RR）**优先级调度。这样可以确保高优先级线程在不被普通优先级线程抢占的情况下运行。
+
+<div style={{ maxWidth: "980px", margin: "0 auto" }}>
+  <Frame>
+    <img src="/books/ai-systems-performance-engineering/images/ch03-fifo-rr-cfs.png" alt="CFS、FIFO、RR 三种调度策略的对比示意图" />
+  </Frame>
+</div>
+
+<Accordion title="CFS 中 vruntime 的计算方式">
+
+**完全公平调度器（Completely Fair Scheduler，CFS）** 面向普通线程，目标是让 runnable task 获得相对公平的 CPU 时间。它会跟踪每个 task 的虚拟运行时间（virtual runtime，`vruntime`）；运行得越少的 task，`vruntime` 越小，越容易被选中。任务进入 runnable 状态后，会被放入红黑树（red-black tree）。
+
+nice 值通常范围是 `-20` 到 `19`，数值越小，普通线程的调度优先级越高。每个 nice 值对应一个权重，`nice=0` 的权重是 `1024`。Linux 使用预定义的 nice 权重表，相邻 nice 级别大约相差 `1.25` 倍：nice 每降 1，权重约增加 25%；nice 每升 1，权重约减少 20%。
+
+nice 权重如下：
+
+| nice | weight |
+| --- | --- |
+| `-5` | `3121` |
+| `-4` | `2501` |
+| `-3` | `1991` |
+| `-2` | `1586` |
+| `-1` | `1277` |
+| `0` | `1024` |
+| `1` | `820` |
+| `2` | `655` |
+| `3` | `526` |
+| `4` | `423` |
+| `5` | `335` |
+
+关键公式可以近似写成：
+
+```text
+vruntime 增量 = 实际运行时间 × (nice=0 的权重 / 当前线程权重)
+```
+
+例如两个线程都实际运行 `10 ms`：
+
+```text
+nice=0： vruntime 增量 = 10 ms × (1024 / 1024) = 10 ms
+nice=-1：vruntime 增量 = 10 ms × (1024 / 1277) ≈ 8.0 ms
+```
+
+低 nice 值线程的权重更大，同样运行 `10 ms`，`vruntime` 增加更少，因此更容易保持在红黑树左侧，也更早再次被 CFS 选中运行。
+
+</Accordion>
+
+<Accordion title="设置调度策略">
+
+先查看线程当前运行在哪些 CPU 上，以及调度策略、实时优先级和 nice 值：
 
 ```bash
-# 查看线程实际运行在哪些 CPU 上，以及调度策略和实时优先级
-ps -eLo pid,tid,psr,policy,rtprio,comm | grep -E "python|nccl|nvidia"
-
-# 只给明确的关键线程设置实时策略，优先级不要从 99 开始
-sudo chrt -f -p 10 <tid>  # SCHED_FIFO
-sudo chrt -r -p 10 <tid>  # SCHED_RR
+ps -L -p <pid> -o pid,tid,psr,policy,rtprio,ni,comm
 ```
+
+示例输出：
+
+```text
+    PID     TID PSR POL RTPRIO  NI COMMAND
+  18421   18421  12 TS       -   0 python
+  18421   18488  14 TS       -   0 pt_data_worker
+  18421   18503  16 FF      10   - nccl-helper
+```
+
+字段含义：
+
+- `PSR`：线程当前运行过的 CPU 编号。
+- `POL`：调度策略。`TS` 是普通 CFS 时间共享策略，`FF` 对应 `SCHED_FIFO`，`RR` 对应 `SCHED_RR`。
+- `RTPRIO`：实时优先级。普通 CFS 线程通常显示为 `-`。
+- `NI`：nice 值，只影响普通 CFS 线程的权重。
+
+普通 CFS 线程通常先通过 nice 调整权重：
+
+```bash
+# 调高普通线程优先级，负 nice 值通常需要 sudo
+sudo renice -n -5 -p <pid>
+```
+
+对极少数延迟敏感的线程，可以用 `chrt` 设置实时 FIFO 或 RR 策略：
+
+```bash
+# 设置为 SCHED_FIFO，实时优先级为 10
+sudo chrt -f -p 10 <tid>
+
+# 设置为 SCHED_RR，实时优先级为 10
+sudo chrt -r -p 10 <tid>
+
+# 查看某个线程当前调度策略
+chrt -p <tid>
+```
+
+`chrt -p <tid>` 的输出示例：
+
+```text
+pid 18503's current scheduling policy: SCHED_FIFO
+pid 18503's current scheduling priority: 10
+```
+
+不过要谨慎使用，因为实时线程如果管理不当，可能会使其他进程饥饿。实际中，如果已经将关键线程绑定到专用 CPU core，通常不需要再调整实时线程优先级。
+
+</Accordion>
 
 ##### 2.4.2 CPU 隔离
 
-CPU 隔离的目标不是让单个 CPU 更快，而是减少 scheduler load balancing、kernel workqueue、timer、IRQ 等系统噪声。隔离关键计算核心时，需要保留 housekeeping cores 来承接系统服务、监控、容器 runtime 和内核后台任务。
+CPU 隔离的目标，是将**关键输入线程**、通信辅助线程与其他工作负载尽量分开运行，减少它们受到调度器负载均衡、内核工作队列、定时器和中断请求等系统噪声的干扰。
 
 - **临时绑定**：`taskset` 适合排查和实验，可以把进程或线程绑定到指定 CPU。
 - **生产隔离**：cgroup `cpuset` 更适合生产环境。`cpuset.cpus` 约束任务可运行的 CPU，`cpuset.mems` 约束可使用的 NUMA memory node。
 - **容器约束**：容器环境中可以用 `docker run --cpuset-cpus` 固定 CPU 范围，用 `--cpuset-mems` 固定 memory node。
 - **启动参数**：`isolcpus`、`nohz_full`、`irqaffinity` 可以做更强的启动期隔离，但运行期调整不如 cgroup 灵活，适合非常明确的低延迟节点。
 
+<Accordion title="CPU 隔离配置示例">
+
 ```bash
-# 把已有进程绑定到 CPU 8-15
+# 临时绑定：把已有进程绑定到 CPU 8-15
 sudo taskset -cp 8-15 <pid>
 
-# 容器只使用 CPU 8-15 和 NUMA node 0
-docker run --cpuset-cpus=8-15 --cpuset-mems=0 <image>
+# 生产隔离：创建 cgroup，并限制 CPU / NUMA memory node
+# 下面假设 CPU 8-15 属于 NUMA node 0，可以使用 lscpu -e=CPU,NODE,SOCKET,CORE 命令确认
+sudo mkdir -p /sys/fs/cgroup/gpu-workload
 
-# 查看 cgroup 中实际生效的 CPU / memory node
-cat /sys/fs/cgroup/<workload>/cpuset.cpus.effective
-cat /sys/fs/cgroup/<workload>/cpuset.mems.effective
+# 只允许该 cgroup 内的任务运行在 CPU 8-15 上
+echo 8-15 | sudo tee /sys/fs/cgroup/gpu-workload/cpuset.cpus
+
+# 只允许该 cgroup 使用 NUMA node 0 上的 memory
+echo 0 | sudo tee /sys/fs/cgroup/gpu-workload/cpuset.mems
+
+# 把目标进程加入这个 cgroup，使其受到上面的 CPU / memory node 约束
+echo <pid> | sudo tee /sys/fs/cgroup/gpu-workload/cgroup.procs
+
+# 查看 cgroup 实际生效的 CPU / memory node
+cat /sys/fs/cgroup/gpu-workload/cpuset.cpus.effective
+cat /sys/fs/cgroup/gpu-workload/cpuset.mems.effective
+
+# 容器约束：容器只使用 CPU 8-15 和 NUMA node 0
+docker run --cpuset-cpus=8-15 --cpuset-mems=0 <image>
 ```
+
+如果需要比 cgroup 更强的启动期隔离，可以通过内核启动参数配置 `isolcpus`、`nohz_full`、`rcu_nocbs` 和 `irqaffinity`。这些参数需要写入 `/etc/default/grub` 中的 `GRUB_CMDLINE_LINUX`，更新 GRUB 并重启后生效。
+
+```bash
+# 备份 GRUB 配置
+sudo cp /etc/default/grub /etc/default/grub.bak
+
+# 编辑 /etc/default/grub
+sudo editor /etc/default/grub
+
+# 在 /etc/default/grub 中修改或追加这一项
+GRUB_CMDLINE_LINUX="isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15 irqaffinity=0-7"
+
+# Ubuntu / Debian 更新 GRUB 配置并重启
+sudo update-grub
+sudo reboot
+
+# 重启后确认启动参数已经生效
+cat /proc/cmdline
+```
+
+参数含义可以这样理解：
+
+- `isolcpus=8-15`：让普通调度器尽量不要把普通任务放到 CPU `8-15` 上。
+- `nohz_full=8-15`：减少这些 CPU 上的周期性调度时钟中断。
+- `rcu_nocbs=8-15`：把 RCU callback 从这些 CPU 上移走，减少内核后台干扰。
+- `irqaffinity=0-7`：默认把 IRQ 放到 CPU `0-7`，让 CPU `8-15` 更干净。
+
+注意 `isolcpus=8-15` 不会自动把训练/推理进程放到 CPU `8-15`。它只是减少普通系统任务对这些 CPU 的占用。真正把 workload 放进去，还是要配合 `taskset`、cgroup `cpuset` 或容器的 `--cpuset-cpus`。
+
+</Accordion>
 
 ##### 2.4.3 中断亲和性
 
-GPU 和 NIC 的硬件中断也需要靠 CPU 处理。设备在 NUMA node 0 上触发中断，却由另一个 NUMA node 上的 CPU 处理时，会引入跨节点通信和 cache coherency 流量。性能敏感节点通常会把 GPU/NIC IRQ 绑定到设备所在 NUMA node 附近的 I/O cores。
+IRQ（Interrupt Request）是硬件或内核子系统通知 CPU 处理事件的一种机制。CPU 收到中断后，会暂停当前正在执行的普通任务，转去执行对应的中断处理逻辑。
+
+常见 IRQ 类型包括：
+
+- **设备中断**：来自 NIC、GPU、NVMe 等硬件设备。例如网卡收到数据、发送完成、RDMA 操作完成事件，或者 GPU 任务完成、错误和事件通知。
+- **定时器中断**：来自系统 timer，用于调度器计时、时间片管理和周期性内核任务。
+- **核间中断（Inter-Processor Interrupt，IPI）**：一个 CPU core 向另一个 CPU core 发送的中断，常见于 TLB shootdown、调度唤醒等场景。
+- **IRQ affinity**：控制某个 IRQ 由哪些 CPU core 处理。
+
+中断亲和性的调优目标，是把 GPU/NIC IRQ 绑定到设备所在 NUMA node 上的 CPU core，避免由远端 NUMA node 处理设备中断。否则，设备在 NUMA node 0 上触发中断，却由另一个 NUMA node 上的 CPU 处理时，会引入跨节点通信和缓存一致性流量。
+
+<Accordion title="中断亲和性配置示例">
 
 ```bash
-# 查看 CPU 与 NUMA 拓扑
-lscpu -e=CPU,NODE,SOCKET,CORE
-
-# 查看 GPU / NIC 拓扑
-nvidia-smi topo -m
-cat /sys/class/net/<iface>/device/numa_node
-
-# 查看 GPU / NIC IRQ 分布
+# 查看 GPU / NIC IRQ 分布，先打印表头，再过滤设备行
+head -n 1 /proc/interrupts
 grep -Ei "nvidia|mlx|eth|ib" /proc/interrupts
 
-# 查看和设置某个 IRQ 允许运行的 CPU 列表
+# 示例输出中，行首的 575 是 IRQ 编号，后面的计数表示各 CPU 处理该 IRQ 的次数
+# 575: ... 16 ... IR-PCI-MSI-0000:c1:00.0 0-edge nvidia
+# IR-PCI-MSI：PCIe 设备使用的 MSI 中断，IR 通常表示经过 interrupt remapping
+# 0000:c1:00.0：PCIe 设备地址，也叫 BDF（Bus:Device.Function），来自 IR-PCI-MSI-0000:c1:00.0
+# 0-edge：边沿触发的中断
+# nvidia：处理这个 IRQ 的驱动或设备名
+
+# CPU 很多时，可以只打印非零计数
+awk '
+NR==1 { for (i=1; i<=NF; i++) cpu[i]=$i; n=NF; next }
+/nvidia|mlx|eth|ib/ {
+  irq=$1; sub(":", "", irq)
+  printf "IRQ %s:", irq
+  for (i=2; i<=n+1; i++) {
+    if ($i != 0) printf " %s=%s", cpu[i-1], $i
+  }
+  print ""
+}
+' /proc/interrupts
+
+# 示例输出：IRQ 575 主要由 CPU64 处理过 16 次
+# IRQ 575: CPU64=16
+
+# 查看和设置某个 IRQ 允许运行的 CPU 列表，<irq> 用行首的 IRQ 编号替换
+# 上面的示例中，<irq> 就是 575
 cat /proc/irq/<irq>/smp_affinity_list
+
+# 先确认设备所在 NUMA node，以及该 NUMA node 对应哪些 CPU
+# 1. 查询 GPU 的 BDF。也可以直接使用 /proc/interrupts 中的 0000:c1:00.0
+nvidia-smi --query-gpu=index,pci.bus_id --format=csv
+
+# 2. 用 BDF 确认具体设备和它所在的 NUMA node
+lspci -s 0000:c1:00.0
+cat /sys/bus/pci/devices/0000:c1:00.0/numa_node
+
+# 3. 查询 CPU 与 NUMA node 的对应关系
+lscpu -e=CPU,NODE,SOCKET,CORE
+
+# 如果设备在 NUMA node 0，可以查看 node0 对应的 CPU 列表
+cat /sys/devices/system/node/node0/cpulist
+
+# 确认 CPU 8-15 与该设备位于同一 NUMA node 后，把这个 IRQ 的处理 CPU 限制为 8-15
 echo 8-15 | sudo tee /proc/irq/<irq>/smp_affinity_list
 ```
 
-如果 `irqbalance` 正在运行，手工设置的 IRQ affinity 可能被后续调整覆盖。生产环境通常需要显式配置 `irqbalance` 规则，或者由运维脚本接管 IRQ affinity。
-
-参考资料：
-
-- [CFS Scheduler](https://docs.kernel.org/scheduler/sched-design-CFS.html)
-- [sched(7) - Linux manual page](https://man7.org/linux/man-pages/man7/sched.7.html)
-- [CPU Isolation](https://www.kernel.org/doc/html/next/admin-guide/cpu-isolation.html)
-- [Control Group v2](https://www.kernel.org/doc/html/v6.7/admin-guide/cgroup-v2.html)
-- [Docker Resource Constraints](https://docs.docker.com/engine/containers/resource_constraints/)
-- [SMP IRQ affinity](https://www.kernel.org/doc/html/v6.9/core-api/irq/irq-affinity.html)
+</Accordion>
 
 #### 2.5 虚拟内存与 Swap
 
