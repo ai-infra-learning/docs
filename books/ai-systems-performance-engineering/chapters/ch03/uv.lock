@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "torch", specifier = ">=2.0" }]
+requires-dist = [{ name = "torch", specifier = ">=2.9" }]
 
 [[package]]
 name = "cuda-bindings"

@@ -1040,9 +1040,100 @@ docker run --cpuset-cpus=8-15 --cpuset-mems=0 --memory=128g --memory-swap=128g <
 
 </Accordion>
 
-#### 2.6 文件系统缓存与 Checkpoint 写入
+#### 2.6 文件系统缓存
 
-Checkpoint 写入会把 CPU、page cache、文件系统和网络存储一起拉进关键路径。几十 GB 的 checkpoint 如果集中写入，Linux page cache 可能先吸收大量 dirty page，然后在后台 writeback 时挤占 DataLoader 和通信线程的内存带宽。
+对于大型训练任务，最佳实践是频繁将 checkpoint 写入磁盘，以便在需要时能从已知的良好 checkpoint 重新启动失败任务。然而，在进行 checkpoint 写入时，大量数据的突发写入可能会填满操作系统 page cache 并导致停顿。
+
+常见解决方案包括：
+
+**继续使用 page cache，但降低冲击**：
+
+- **调整写回阈值**：调整 dirty page 阈值，控制内核什么时候开始后台写回，以及什么时候阻塞写入进程。
+- **异步写 checkpoint**：使用 [PyTorch Distributed Checkpoint（DCP）async_save](https://docs.pytorch.org/tutorials/recipes/distributed_async_checkpoint_recipe.html)，把 checkpoint 写入从训练主 loop 中移出去。`async_save()` 会返回 future，需要控制并发 checkpoint 数量，避免 CPU memory 压力叠加。
+- **分片写 checkpoint**：使用 PyTorch Distributed Checkpoint（DCP），让多个 rank 写各自的 checkpoint 分片，避免单 rank 或单文件形成过大的突发写入。
+- **丢弃 checkpoint cache**：写完后调用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`，提示内核尽快丢弃 checkpoint 对应的 page cache。
+
+**完全绕过 page cache**：
+
+- **Direct I/O**：延迟敏感的训练 workflow 可以评估 `O_DIRECT`、`io_uring` 和 [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/)。
+- **适用条件**：这类方式需要文件系统、存储设备和 I/O 栈支持 direct I/O，适合已经验证过 I/O 路径的场景。
+
+<Accordion title="PyTorch DCP 异步 checkpoint 示例">
+
+下面示例只保留训练 loop 中的核心结构。`AppState` 是对 model 和 optimizer 的 `Stateful` 包装，用来让 DCP 保存和恢复分布式 state dict。
+
+```python
+import torch.distributed.checkpoint as dcp
+
+
+checkpoint_future = None
+
+for step in range(num_steps):
+    loss = train_step(model, optimizer)
+
+    if should_save(step):
+        # 通常限制同一时刻只有一个异步 checkpoint，避免 CPU memory 压力叠加
+        if checkpoint_future is not None:
+            checkpoint_future.result()
+
+        state_dict = {"app": AppState(model, optimizer)}
+        checkpoint_future = dcp.async_save(
+            state_dict,
+            checkpoint_id=f"checkpoint_step_{step}",
+        )
+
+# 训练结束前等待最后一个 checkpoint 完成
+if checkpoint_future is not None:
+    checkpoint_future.result()
+```
+
+DCP 的异步 checkpoint 会先把模型复制到内部 CPU buffer，保证 checkpoint 写入期间模型和 optimizer 权重不会继续变化；代价是 CPU memory 会随着 `checkpoint_size_per_rank × rank 数量` 增加。如果模型很大，普通 `async_save()` 的 GPU → CPU staging 仍可能阻塞训练 loop。
+
+PyTorch 2.9 引入了 `DefaultStager`，可以把 state dict 创建和 GPU → CPU copy 也放到后台线程中：
+
+```python
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.staging import DefaultStager
+
+
+checkpoint_future = None
+
+for step in range(num_steps):
+    optimizer.zero_grad()
+    loss = model(batch).sum()
+    loss.backward()
+
+    # 等待上一个 checkpoint 的 staging 完成，再修改模型参数
+    if checkpoint_future is not None:
+        checkpoint_future.staging_completion.result()
+
+    optimizer.step()
+
+    # 避免同时排队多个 checkpoint upload
+    if checkpoint_future is not None:
+        checkpoint_future.upload_completion.result()
+
+    checkpoint_future = dcp.async_save(
+        {"app": AppState(model, optimizer)},
+        checkpoint_id=f"checkpoint_step_{step}",
+        async_stager=DefaultStager(),
+    )
+
+if checkpoint_future is not None:
+    checkpoint_future.upload_completion.result()
+```
+
+`DefaultStager` 会引入后台线程，占用额外 CPU 资源。训练节点需要预留足够 CPU core，否则异步 checkpoint 本身也可能影响输入管道或通信辅助线程。
+
+</Accordion>
+
+<Accordion title="后台写回的含义">
+
+在 Linux page cache 语境里，writeback 可以翻译为**后台写回**。它指内核把 page cache 里的 dirty page 异步写回到磁盘或后端存储。
+
+应用写文件时，数据通常会先进入 page cache，写调用可以较快返回；随后内核在后台把 dirty page 写回存储。当 dirty page 太多，或者后端存储写入跟不上时，内核可能开始限制新的写入，训练进程就会看到 checkpoint 写入停顿。
+
+</Accordion>
 
 ```bash
 # 使用比例配置，适合内存规模差异不大的节点
@@ -1053,31 +1144,6 @@ sudo sysctl vm.dirty_ratio=20
 sudo sysctl vm.dirty_background_bytes=$((8 * 1024 * 1024 * 1024))
 sudo sysctl vm.dirty_bytes=$((32 * 1024 * 1024 * 1024))
 ```
-
-工程上常见的处理方式：
-
-- 训练主 loop 只提交 checkpoint 任务，写盘由后台线程或独立进程完成。
-- 使用 [PyTorch Distributed Checkpoint](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)、DeepSpeed checkpoint 分片或 safetensors 分片，避免单 rank 写超大文件。
-- 数据集和 checkpoint 目录用 bind mount 或本地 NVMe cache，绕开容器 writable layer。
-- 写完冷数据后调用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`，减少 checkpoint 污染 page cache。
-- 极限 I/O 场景评估 `O_DIRECT`、`io_uring` 和 [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/)。NVIDIA 的 GDS overview 说明它能让 GPU memory 与存储之间建立直接 DMA 路径，减少 CPU bounce buffer。
-
-<Accordion title="练习入口：GDS 与 checkpoint 准备">
-
-[`gpu_setup_commands.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/gpu_setup_commands.sh) 包含 `nvidia-peermem`、`nvidia-fs`、`CUFILE_ENV_PATH_JSON` 和 `gdsio` 检查项。它更适合作为节点初始化 checklist，不建议未经审查直接在生产机器执行。
-
-```bash
-# 页缓存和 writeback 观察
-grep -E "Dirty|Writeback|Cached" /proc/meminfo
-iostat -x 1
-pidstat -d -p $PID 1
-
-# GDS 环境检查
-lsmod | grep -E "nvidia_fs|nvidia_peermem"
-gdsio -x 0 -d 0 -s 1G -i 1M -w 4 -I 0
-```
-
-</Accordion>
 
 #### 2.7 CPU 频率与 C-states
 
