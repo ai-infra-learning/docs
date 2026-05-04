@@ -91,14 +91,15 @@ class ToyModel(nn.Module):
 def setup(rank: int, world_size: int, config: RunConfig) -> None:
     """初始化单节点多进程分布式环境。
 
-    MASTER_ADDR=localhost 表示这个示例只覆盖单节点；每个 rank 绑定到同编号
-    CUDA device。CUDA/FSDP 训练使用 NCCL 后端。
+    MASTER_ADDR=localhost 表示这个示例只覆盖单节点；这里使用 Gloo backend，
+    和 PyTorch DCP async checkpoint 示例保持一致。
     """
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", config.master_port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # 每个 rank 绑定到同编号 CUDA device。
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 
 def cleanup() -> None:
