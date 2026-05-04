@@ -983,6 +983,15 @@ swapon --show
 # 临时关闭所有 swap 设备和文件，重启后按系统配置恢复
 sudo swapoff -a
 
+# 如需永久禁用，编辑 /etc/fstab，把 swap 条目注释掉
+sudo vim /etc/fstab
+
+# 例如把这一行：
+# /swapfile none swap sw 0 0
+
+# 改成：
+# # /swapfile none swap sw 0 0
+
 # 再次查看，若无输出，表示当前没有启用的 swap
 swapon --show
 
