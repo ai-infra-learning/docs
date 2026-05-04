@@ -948,32 +948,88 @@ echo 8-15 | sudo tee /proc/irq/<irq>/smp_affinity_list
 
 #### 2.5 虚拟内存与 Swap
 
-Swap 对 GPU 作业通常是灾难性信号。GPU 需要的 host batch、通信 buffer 或 checkpoint buffer 一旦被换出，下一次 CPU 访问会变成磁盘 I/O，随后 H2D copy、NCCL proxy 或 DataLoader 都会阻塞。
+不言而喻，应尽量避免发生内存交换。一旦进程的部分内存被换出到磁盘，性能往往会出现灾难性的、跨数量级的下降。GPU 程序通常会分配大量主机内存用于数据缓存；如果操作系统将其中一部分换出到磁盘，那么当 GPU 相关流程再次需要访问这些数据时，就会遭遇巨大的延迟。
 
-| 配置 | 含义 | 适用场景 |
-| --- | --- | --- |
-| `vm.swappiness=0` | 尽量不 swap，但极端内存压力下仍可能换出 | 有 swap 兜底的通用节点 |
-| `swapoff -a` | 完全禁用 swap | 专用训练节点、内存容量明确的推理节点 |
-| cgroup v2 `memory.swap.max=0` | 对单个 cgroup 禁止 swap | Kubernetes / systemd 管理的作业 |
+<Accordion title="swappiness 的含义">
 
-[Linux cgroup v2 文档](https://kernel.org/doc/html/next/admin-guide/cgroup-v2.html)把 `memory.swap.max` 定义为 cgroup 的 swap 上限。集群环境里，禁用全机 swap 不一定总能落地，但可以对训练容器的 cgroup 单独限制 swap。
+`vm.swappiness` 控制 Linux 在内存压力下使用 swap 的倾向，取值通常是 `0` 到 `100`。数值越高，内核越倾向于把匿名页换出到 swap；数值越低，内核越倾向于把数据留在 RAM 中。
+
+建议设置 `vm.swappiness=0`，它告诉 Linux 除非遇到极端内存压力，否则应尽量避免 swap。
+
+**需要强调的是，`vm.swappiness=0` 不等于完全禁用 swap；它只是降低内核使用 swap 的倾向，在极端内存压力下仍然可能发生 swap。** 如果需要完全关闭 swap，需要使用 `swapoff -a`，或者在 cgroup v2 中设置 `memory.swap.max=0`。
+
+</Accordion>
+
+<Accordion title="Swap 配置示例">
 
 ```bash
-# 全机策略
-sudo sysctl vm.swappiness=0
+# 查看当前 swappiness
+sysctl vm.swappiness
+
+# 示例输出：当前值是 60
+# vm.swappiness = 60
+# swappiness 越高，Linux 越倾向于使用 swap；0 表示除非极端内存压力，否则尽量避免 swap
+
+# 临时把 swappiness 设置为 0，重启后恢复
+sudo sysctl -w vm.swappiness=0
+
+# 查看当前启用的 swap 设备或文件
+swapon --show
+
+# 示例输出：当前有一个 64G swapfile，但 USED 为 0
+# NAME      TYPE SIZE USED PRIO
+# /swapfile file  64G   0B   -2
+
+# 临时关闭所有 swap 设备和文件，重启后按系统配置恢复
 sudo swapoff -a
 
-# 观测是否出现 swap 或主缺页
-free -h
-vmstat 1
-grep -E "VmRSS|VmSwap|VmLck|VmPin" /proc/$PID/status
+# 再次查看，若无输出，表示当前没有启用的 swap
+swapon --show
 
-# cgroup v2 示例
+# 查看内存和 swap 汇总
+free -m
+
+# 示例输出：重点看 Swap 行，total/used 都为 0 表示当前没有 swap
+#                total        used        free      shared  buff/cache   available
+# Mem:          257000       80000       20000        1024      157000      170000
+# Swap:              0           0           0
+
+# 持续观察 swap in / swap out
+vmstat 1
+
+# 示例输出：重点看 si / so，长期为 0 表示没有 swap in / swap out
+# procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+#  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+#  1  0      0 204800 100000 800000    0    0     0    12 2000 5000 10  3 87  0  0
+
+# 查看目标进程是否发生 swap，以及 locked/pinned memory 情况
+grep -E "VmRSS|VmSwap|VmLck|VmPin" /proc/<pid>/status
+
+# 示例输出：VmSwap 为 0 kB 表示该进程当前没有被换出到 swap
+# VmRSS:    83886080 kB
+# VmLck:           0 kB
+# VmPin:           0 kB
+# VmSwap:          0 kB
+
+# 查看 cgroup v2 中任务当前内存和 swap 用量，单位是 bytes
 cat /sys/fs/cgroup/<job>/memory.current
 cat /sys/fs/cgroup/<job>/memory.swap.current
+
+# 示例输出：memory.current 是当前内存用量；memory.swap.current 为 0 表示该 cgroup 没有使用 swap
+# 85899345920
+# 0
+
+# 对某个 cgroup 禁止 swap
+echo 0 | sudo tee /sys/fs/cgroup/<job>/memory.swap.max
+
+# 确认 swap 上限已经设置为 0
+cat /sys/fs/cgroup/<job>/memory.swap.max
+
+# Docker 示例：固定 CPU / NUMA node，并让容器没有额外 swap 空间
+docker run --cpuset-cpus=8-15 --cpuset-mems=0 --memory=128g --memory-swap=128g <image>
 ```
 
-内存 limit 也会影响 page cache 和 pinned memory。给训练容器设置过紧的 memory limit，可能让 page cache 回收、pinned allocation 或 DataLoader worker 在高峰期失败。更稳的方式是按 batch size、worker 数量、prefetch 深度、checkpoint 写入峰值预留 headroom。
+</Accordion>
 
 #### 2.6 文件系统缓存与 Checkpoint 写入
 
