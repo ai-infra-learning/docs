@@ -35,6 +35,7 @@ class RunConfig:
     steps: int
     batch_size: int
     hidden_size: int
+    layers: int
     checkpoint_dir: str
     master_port: str
 
@@ -74,17 +75,25 @@ class AppState(Stateful):
 
 
 class ToyModel(nn.Module):
-    """用于制造 checkpoint 的简单 MLP，结构保持接近 PyTorch DCP 示例。"""
+    """用于制造较大 checkpoint 的简单 MLP。"""
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, layers: int):
         super().__init__()
-        # 结构对应原始示例中的 net1 -> relu -> net2，只把维度放大。
+        if layers < 1:
+            raise ValueError("layers must be >= 1")
+        # 保留 net1 -> relu -> net2 的主结构，中间按 layers 放大隐藏层数量。
         self.net1 = nn.Linear(hidden_size, hidden_size)
         self.relu = nn.ReLU()
+        self.hidden_layers = nn.ModuleList(
+            nn.Linear(hidden_size, hidden_size) for _ in range(layers - 1)
+        )
         self.net2 = nn.Linear(hidden_size, hidden_size // 2)
 
     def forward(self, x):
-        return self.net2(self.relu(self.net1(x)))
+        x = self.relu(self.net1(x))
+        for layer in self.hidden_layers:
+            x = self.relu(layer(x))
+        return self.net2(x)
 
 
 def setup(rank: int, world_size: int, config: RunConfig) -> None:
@@ -172,7 +181,7 @@ def run(rank: int, world_size: int, config: RunConfig) -> None:
 
     # 固定随机种子，保证每次运行模型初始化一致。
     torch.manual_seed(0)
-    model = ToyModel(config.hidden_size).to(device)
+    model = ToyModel(config.hidden_size, config.layers).to(device)
     # fully_shard 会把模型参数分片到多个 rank 上，模拟 FSDP 训练场景。
     model = fully_shard(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
@@ -202,16 +211,17 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "A CUDA device is required to run this script"
     # 参数固定在 main 中，四个脚本保持一致，运行时不需要手动传参。
     config = RunConfig(
-        steps=3,
+        steps=10,
         batch_size=8,
-        hidden_size=2048,
+        hidden_size=4096,
+        layers=4,
         checkpoint_dir="checkpoint_sync",
         master_port="12355",
     )
     world_size = torch.cuda.device_count()
     print(
         f"Running DCP sync save on {world_size} devices. "
-        f"hidden_size={config.hidden_size}",
+        f"hidden_size={config.hidden_size}, layers={config.layers}",
         flush=True,
     )
     mp.spawn(run, args=(world_size, config), nprocs=world_size, join=True)
