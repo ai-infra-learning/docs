@@ -230,8 +230,6 @@ def run(rank: int, world_size: int, config: RunConfig) -> None:
         if checkpoint_future is not None:
             wait_start = time.perf_counter()
             checkpoint_future.staging_completion.result()
-            # 等待所有 rank 的 staging 都完成后，再打印 staging 统计。
-            dist.barrier()
             log_staging_done(
                 rank,
                 checkpoint_step,
@@ -247,8 +245,6 @@ def run(rank: int, world_size: int, config: RunConfig) -> None:
         if checkpoint_future is not None:
             wait_start = time.perf_counter()
             checkpoint_future.upload_completion.result()
-            # 等待所有 rank 都完成写入后，再由 rank 0 统计目录大小。
-            dist.barrier()
             log_upload_done(
                 rank,
                 checkpoint_step,
@@ -271,12 +267,10 @@ def run(rank: int, world_size: int, config: RunConfig) -> None:
         # 训练结束前必须等待最后一个 checkpoint 的 staging 和 upload 都完成。
         wait_start = time.perf_counter()
         checkpoint_future.staging_completion.result()
-        dist.barrier()
         log_staging_done(rank, checkpoint_step, checkpoint_submit_time, wait_start)
 
         wait_start = time.perf_counter()
         checkpoint_future.upload_completion.result()
-        dist.barrier()
         log_upload_done(
             rank,
             checkpoint_step,
@@ -285,7 +279,6 @@ def run(rank: int, world_size: int, config: RunConfig) -> None:
             wait_start,
         )
 
-    dist.barrier()
     cleanup()
 
 
