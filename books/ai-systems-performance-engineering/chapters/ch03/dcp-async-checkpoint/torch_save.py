@@ -124,6 +124,7 @@ if __name__ == "__main__":
     )
     print(
         "Running plain torch.save baseline on one CUDA device. "
+        f"steps={config.steps}, batch_size={config.batch_size}, "
         f"hidden_size={config.hidden_size}, layers={config.layers}",
         flush=True,
     )

@@ -296,6 +296,7 @@ if __name__ == "__main__":
     world_size = torch.cuda.device_count()
     print(
         f"Running DCP async_save with DefaultStager on {world_size} devices. "
+        f"steps={config.steps}, batch_size={config.batch_size}, "
         f"hidden_size={config.hidden_size}, layers={config.layers}",
         flush=True,
     )
