@@ -212,7 +212,7 @@ if __name__ == "__main__":
     # 参数固定在 main 中，四个脚本保持一致，运行时不需要手动传参。
     config = RunConfig(
         steps=20,
-        batch_size=1,
+        batch_size=8,
         hidden_size=8192,
         layers=4,
         checkpoint_dir="checkpoint_sync",
