@@ -7,6 +7,9 @@
 
 set -uo pipefail
 
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0,1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHAPTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -46,6 +49,7 @@ run_script() {
   printf '=%.0s' {1..88}
   printf '\n'
   printf 'Running %s\n' "$script_name"
+  printf 'CUDA_VISIBLE_DEVICES=%s\n' "$CUDA_VISIBLE_DEVICES"
   printf 'Command: uv run python dcp-async-checkpoint/%s\n' "$script_name"
   printf '=%.0s' {1..88}
   printf '\n'
