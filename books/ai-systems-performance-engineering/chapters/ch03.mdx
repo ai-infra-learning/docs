@@ -1147,34 +1147,134 @@ sudo sysctl vm.dirty_bytes=$((32 * 1024 * 1024 * 1024))
 
 #### 2.7 CPU 频率与 C-states
 
-CPU 频率策略影响的是抖动和尾延迟，不只是平均吞吐。DataLoader worker、NCCL helper 或推理前处理线程如果频繁从低频或深度 C-state 唤醒，GPU 会看到短小但密集的空洞。
+许多计算节点默认会让 CPU 运行在省电模式下：CPU 空闲时可能被降频，或者进入低功耗睡眠状态。这可以节省能耗、降低发热和成本。训练过程中，GPU 在处理当前 batch 时，CPU 不一定始终处于 100% 利用率；但当新的数据准备、kernel launch 或通信任务到来时，CPU 从低频或睡眠状态恢复会引入额外延迟。
+
+**为了获得更高且更稳定的性能，AI 系统通常会把 CPU frequency governor 配置为 `performance`。** 该模式会让 CPU 尽量保持在较高频率，减少频率切换带来的延迟抖动。这个配置可以通过 `cpupower frequency-set -g performance` 完成，也可以在 BIOS 中设置。
+
+CPU 空闲状态（C-states）同样会影响延迟稳定性。C-states 是 ACPI 规范定义的 CPU 省电模式：CPU core 空闲时可以进入 C-state 来节省能耗。**`C0` 表示 active 状态，`C0` 以上表示更深的睡眠状态。C-state 越深，省电越多，但新的工作到来时，core 唤醒所需时间也越长。限制或禁用深层 C-states 可以减少额外的延迟尖峰。**
+
+<Accordion title="CPU 频率的查看与设置">
 
 ```bash
-# 查看 governor 和实际频率
+# 查看 CPU governor、频率范围和当前频率
 cpupower frequency-info
-lscpu | grep -E "MHz|Model name"
-
-# 训练/benchmark 节点常用配置
-sudo cpupower frequency-set -g performance
-
-# C-state 需要 BIOS 或内核启动参数配合
-# processor.max_cstate=1 intel_idle.max_cstate=0
 ```
 
-CPU 侧调到 performance 后，还要看 GPU 是否因功耗或温度节流。`nvidia-smi dmon`、DCGM exporter 和 `nvidia-smi -q -d PERFORMANCE,POWER,TEMPERATURE` 能帮助确认 GPU P-state、功耗上限和 throttle reason。
+示例输出：
 
-<Accordion title="练习入口：功耗与性能扫描">
+```text
+analyzing CPU 30:
+  driver: acpi-cpufreq
+  hardware limits: 1.50 GHz - 2.25 GHz
+  available frequency steps:  2.25 GHz, 2.00 GHz, 1.50 GHz
+  available cpufreq governors: conservative ondemand userspace powersave performance schedutil
+  current policy: frequency should be within 1.50 GHz and 2.25 GHz.
+                  The governor "performance" may decide which speed to use
+                  within this range.
+  current CPU frequency: 2.25 GHz (asserted by call to hardware)
+  boost state support:
+    Supported: yes
+    Active: yes
+    Total States: 3
+    Pstate-P0:  2250MHz
+    Pstate-P1:  2000MHz
+    Pstate-P2:  1500MHz
+```
 
-[`power_tuning_tool.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/power_tuning_tool.py) 和 [`power_perf_watt_tool.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/power_perf_watt_tool.py) 会用 NVML 采样功耗并扫不同 power limit 下的 GEMM 表现。
+- `driver` 表示 Linux 当前用来管理 CPU 频率的驱动，并执行升频、降频、切换 governor 这些操作，这里是 `acpi-cpufreq`。
+- `hardware limits` 表示硬件支持的频率范围。
+- `available cpufreq governors` 表示可选 governor。
+- `current policy` 表示当前频率策略；示例中 governor 是 `performance`。
+- `current CPU frequency` 表示当前 CPU 频率。
+- `boost state support` 表示 CPU 是否具备动态加速频率（boost）能力。动态加速频率是 CPU 官方支持的自动加速机制；在温度、功耗、电流等条件允许时，CPU 可以自动运行到更高频率。
+  - `Supported: yes` 表示硬件和驱动支持动态加速频率。
+  - `Active: yes` 表示动态加速频率已启用，CPU 在满足温度和功耗条件时可以临时把频率拉到更高档位。
+  - `Pstate-Px` 列出了 CPU 可用的性能状态档位，频率从高到低；当前 governor 会根据自己的策略选择使用哪个频率档位。
 
 ```bash
-python -m ch03.power_tuning_tool \
-  --power-limits 300,350,400 \
-  --iterations 5 \
-  --warmup 1
+# 临时设置为 performance governor
+sudo cpupower frequency-set -g performance
 ```
 
-输出里的 TFLOP/s 和 TFLOP/J 可用于决定生产节点是追求峰值吞吐，还是更关注每瓦性能。
+有些系统安装 `cpupower` 后支持配置文件，可以把 governor 持久化到服务配置中：
+
+```bash
+sudo vim /etc/default/cpupower
+```
+
+设置：
+
+```bash
+governor='performance'
+```
+
+然后启用服务：
+
+```bash
+sudo systemctl enable --now cpupower
+```
+
+</Accordion>
+
+<Accordion title="C-states 的查看与设置">
+
+```bash
+# 查看 CPU 空闲状态；输出只包含 idle states，不包含 active 状态 C0
+cpupower idle-info
+```
+
+示例输出：
+
+```text
+CPUidle driver: acpi_idle
+CPUidle governor: menu
+analyzing CPU 11:
+
+Number of idle states: 3
+Available idle states: POLL C1 C2
+POLL:
+Flags/Description: CPUIDLE CORE POLL IDLE
+Latency: 0
+Usage: 2762100
+Duration: 86467608
+C1:
+Flags/Description: ACPI FFH MWAIT 0x0
+Latency: 1
+Usage: 1085803729
+Duration: 316930767923
+C2:
+Flags/Description: ACPI IOPORT 0x814
+Latency: 400
+Usage: 715600804
+Duration: 4256146765248
+```
+
+- `CPUidle driver` 表示 CPU idle 驱动，这里是 `acpi_idle`。
+- `CPUidle governor` 表示 idle state 选择策略，这里是 `menu`。`menu` 是常见的默认策略，会根据下一次 timer 事件、历史 idle 时长、延迟需求等信息，预测该进入哪个 idle state。
+- `Available idle states` 表示当前 CPU 可进入的 idle states：
+  - `POLL` 表示轮询状态。**有任务执行时 CPU 处于 `C0`；没有任务执行时，CPU 可以进入 `POLL` 这种 idle state 轮询等待新任务**。它的 `Latency: 0`，唤醒延迟最低，但更耗电。
+  - `C1`、`C2` 表示更深的空闲状态；示例中 `C2` 的 `Latency: 400`，唤醒延迟明显高于 `C1`。
+- `Usage` 表示进入该 idle state 的次数，`Duration` 表示累计停留时间。
+
+Linux 下可以通过内核启动参数限制深层 C-states。常见做法是在 GRUB 中加入 `processor.max_cstate=1 intel_idle.max_cstate=0`，限制 CPU 进入深层睡眠状态。
+
+```bash
+# 编辑 GRUB 配置
+sudo vim /etc/default/grub
+
+# 示例：追加到 GRUB_CMDLINE_LINUX
+GRUB_CMDLINE_LINUX="processor.max_cstate=1 intel_idle.max_cstate=0"
+
+# 更激进的低延迟配置：没有任务执行时，CPU 会采用类似 POLL 的轮询等待方式，而不是进入 C1/C2 这类空闲省电状态
+GRUB_CMDLINE_LINUX="processor.max_cstate=1 intel_idle.max_cstate=0 idle=poll"
+
+# 重新生成 GRUB 配置并重启
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+sudo reboot
+
+# 重启后确认启动参数生效
+cat /proc/cmdline
+```
 
 </Accordion>
 
