@@ -1455,9 +1455,11 @@ OS 调优保证 CPU 侧不拖慢 GPU；GPU 驱动与运行时设置决定 contex
 
 #### 3.1 持久化模式（Persistence Mode）
 
-默认情况下，如果没有应用正在使用 GPU，driver 可能让 GPU 进入更低功耗状态，并卸载部分 driver context。下一次应用重新使用 GPU 时，driver 需要重新初始化 GPU，**这个冷启动过程可能带来一两秒级别的延迟**。对于**频繁启动/停止 job 的训练集群**，或者**低流量但延迟敏感的推理服务**，这类初始化开销会影响整体性能。
+默认情况下，如果没有应用正在使用 GPU，driver 可能让 GPU 进入更低功耗状态，并卸载部分驱动上下文。下一次应用重新使用 GPU 时，driver 需要重新初始化 GPU，**这个冷启动过程可能带来一两秒级别的延迟**。对于**频繁启动/停止 job 的训练集群**，或者**低流量但延迟敏感的推理服务**，这类初始化开销会影响整体性能。
 
-Linux 上当最后一个 client 关闭 GPU device file 后，GPU state 可能被卸载；`nvidia-persistenced` 通过保持 device file 打开来避免反复初始化。开启 persistence mode 后，即使没有活跃应用，**GPU driver 也会保持加载**，硬件处于更容易快速接管新任务的 ready state。它不会让 GPU kernel 的数学计算更快，但能减少**作业启动延迟**和 **idle 后首次 CUDA 调用的冷启动停顿**；代价是 **GPU 空闲时功耗会略高**。
+在 Linux 上，client 通过打开 GPU device file 来 attach GPU；关闭 device file 时，相当于 detach GPU。只要还有 client 保持 device file 打开，GPU state 就会继续留在 driver 中。
+
+`nvidia-persistenced` 的核心做法，是在后台运行并保持 GPU device file 打开。这样即使没有训练或推理进程正在使用 GPU，driver 也会继续保留 GPU state，从而避免下一个 job 到来时重新初始化。持久化模式不会让 GPU kernel 的数学计算更快，但能减少**作业启动延迟**和 **idle 后首次 CUDA 调用的冷启动停顿**；代价是 **GPU 空闲时功耗会略高**。
 
 ```bash
 # 以 CSV 形式查看所有 GPU 的 UUID 和当前 persistence mode 状态
