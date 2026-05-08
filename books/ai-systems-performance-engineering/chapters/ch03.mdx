@@ -1280,31 +1280,166 @@ cat /proc/cmdline
 
 #### 2.8 Host 内存分配器调优
 
-多线程数据准备会频繁分配小对象、变长序列、token buffer 和临时 batch。glibc `malloc` 在高并发下可能出现 arena 膨胀、碎片和 RSS 不回收。`jemalloc`、`tcmalloc`、`mimalloc` 这类 allocator 通常更适合长时间运行的数据 pipeline。
+在 GPU 计算中，CPU 需要持续准备 batch 并及时送给 GPU。优化 memory allocator 可以减少内存分配带来的卡顿和抖动，避免 GPU 等待数据，从而维持高 GPU 利用率和整体吞吐。
 
-| allocator | 优势 | 注意事项 |
-| --- | --- | --- |
-| `jemalloc` | 多线程碎片控制好，`background_thread` 可异步回收 | 需要确认 `LD_PRELOAD` 真正生效 |
-| `tcmalloc` | thread cache 快，CPU-heavy preprocessing 常见 | cache 过大时 RSS 会长期偏高 |
-| glibc `malloc` | 默认、兼容性最好 | 大 worker 数下 arena 数量可能过多 |
+<Accordion title="memory allocator 的作用">
+
+如果程序每次申请内存都直接向操作系统请求，会产生很大的系统调用开销，而且频繁分配和释放还会导致内存碎片、多线程锁竞争、cache 利用率低等问题。memory allocator 的作用就是在程序和操作系统之间做一层高效的内存管理：**它先一次性向系统申请大块内存，再按需切分、复用和回收**，从而减少系统调用、降低碎片、提升性能和并发效率。
+
+<div style={{ maxWidth: "900px", margin: "0 auto" }}>
+  <Frame>
+    <img src="/books/ai-systems-performance-engineering/images/ch03-memory-allocator.png" alt="Memory allocator 位于应用和操作系统之间，缓存并复用释放后的内存，减少频繁向 OS 申请和归还内存的开销" />
+  </Frame>
+</div>
+
+</Accordion>
+
+<Accordion title="ptmalloc、jemalloc 与 tcmalloc 对比">
+
+Linux 上常见的默认 allocator 是 glibc `malloc`，其底层实现通常称为 `ptmalloc`。它兼容性好，但在高并发数据管道中可能出现 arena 膨胀、碎片和 RSS（Resident Set Size，常驻集大小）不回收。
+
+`jemalloc` 和 `tcmalloc` 是常见替代 allocator，优势主要体现在降低多线程锁竞争、改善碎片控制，以及更灵活地管理释放后的内存。
+
+<div style={{ maxWidth: "900px", margin: "0 auto" }}>
+  <Frame>
+    <img src="/books/ai-systems-performance-engineering/images/ch03-ptmalloc-tcmalloc-jemalloc.png" alt="ptmalloc、jemalloc 与 tcmalloc 在 arena、thread cache、central cache 和后台回收策略上的对比" />
+  </Frame>
+</div>
+
+**ptmalloc（glibc malloc）**
+
+**分配流程**：线程申请内存时，ptmalloc 会先尝试从当前线程的 `tcache` 命中。`tcache` 是线程本地缓存，主要缓存小对象；在 64-bit glibc 默认配置下，`tcache` 可服务的请求大小最大约为 `1032B`。如果 `tcache` 没命中，请求会进入对应的 arena，在 arena 的 bins 中查找合适的空闲 chunk。
+
+较小的 chunk 通常从 `fastbins` / `small bins` 复用，较大的 chunk 会从 `large bins` 查找。如果 bins 中没有合适空间，则通过 `brk` 扩展 heap，或通过 `mmap` 向操作系统申请新内存。大块分配通常更可能走 `mmap`，默认阈值从约 `128KB` 开始，并可能动态调整。
+
+**释放流程**：释放时，如果 chunk 大小适合且当前线程的 `tcache` 还有空间，会优先放回 `tcache`；否则回到对应 arena 的 bins。相邻空闲 chunk 在合适情况下会合并，较大的 `mmap` 内存块也可能直接归还给操作系统。
+
+**锁竞争特点**：`tcache` 命中时很快，但 `tcache miss`、`tcache flush`、较大对象分配、跨线程释放等情况仍可能进入 arena。**多个线程共享同一个 arena 时，即使操作不同 size class，也可能竞争 arena 相关锁，因此高并发下更容易出现性能抖动。**
+
+**tcmalloc（Google）**
+
+**分配流程**：tcmalloc 的核心是让小对象优先走线程本地缓存。小对象常见口径是 `≤32KB`，会优先从当前线程的 `ThreadCache` 按 size class 获取。
+
+如果 `ThreadCache` 不够，会从共享的 `CentralCache` 批量补充；如果 `CentralCache` 也不够，再从 `PageHeap` 获取 span。`span` 是一段连续 page，可以被切成小对象，也可以承载大对象。大对象通常指 `>32KB` 的请求，一般绕过 `ThreadCache`，直接走 `CentralCache` / `PageHeap` 路径。
+
+**释放流程**：小对象释放时，会根据地址找到所属 span 和 size class，然后优先放回当前线程的 `ThreadCache`。如果 `ThreadCache` 超过预算，会批量归还一部分对象给 `CentralCache`。大对象释放时，会回到 `PageHeap`，并尝试和相邻空闲 span 合并。
+
+**锁竞争特点**：tcmalloc 的优势是大量小对象分配可以在线程本地完成；缓存不够时，**也是批量访问 `CentralCache`**，不是每次 `malloc` / `free` 都访问共享结构。**同时，`CentralCache` 按 size class 分散管理，不同 size class 通常不会竞争同一把锁，因此锁竞争通常比 ptmalloc 更低。**
+
+**jemalloc（FreeBSD / Facebook）**
+
+**分配流程**：jemalloc 也有线程本地缓存，叫 `TCache`。小对象优先从 `TCache` 按 size class 获取；如果没有命中，再进入线程关联的 arena。jemalloc 不是每个线程一个 arena，多个线程可能共享同一个 arena。large object 不走 slab，而是由 arena 通过 `extent` 管理。
+
+**释放流程**：小对象通常先回到当前线程的 `TCache`；如果不能缓存，就回到对象所属 arena 的 bin / slab。large object 会回到所属 arena 的 extent 管理结构。释放的内存通常回到对象原本所属的 arena，而不是简单回到当前调用 `free` 的线程对应的 arena。
+
+**锁竞争特点**：jemalloc 和 ptmalloc 都可能多个线程共享 arena，但 jemalloc 的 arena 内部拆得更细：不同 size class 通常对应不同 bin，bin / slab / extent 的锁粒度也更细。**因此两个线程即使共享同一个 arena，只要操作不同 size class，通常也不容易竞争同一把 arena 级别的大锁。**
+
+</Accordion>
+
+<Accordion title="jemalloc 的 arena、bin、slab、run 与 extent">
+
+jemalloc 的小对象分配通常按 size class 进入对应 `bin`，再从这个 bin 管理的 `slab` / `run` 中取一个空闲 `object`。large object 不走 slab，通常由 `extent` 管理。
+
+```text
+arena
+├── bin(size class = 64B)
+│   ├── slab / run
+│   │   ├── object 64B  # 返回给一次小对象分配
+│   │   ├── object 64B
+│   │   └── ...
+│   └── slab / run
+│       └── object 64B
+│
+├── bin(size class = 128B)
+│   └── slab / run
+│       ├── object 128B
+│       └── ...
+│
+└── extent
+    ├── backing pages for slabs / runs
+    └── large object
+```
+
+- **arena**：allocator 内部的一个内存管理域，负责维护 bins、large allocation、锁和统计信息。多线程程序可以分散到多个 arena，减少锁竞争，但 arena 过多也可能让 RSS 变高。
+- **bin**：arena 内按 size class 划分的小对象管理结构。比如 `64B bin`、`128B bin`，每个 bin 通常管理一批对应尺寸的 slab / run。
+- **slab**：一段被切成固定大小 object 的内存块。一个 `64B slab` 只切 64B object，一个 `128B slab` 只切 128B object。一个 slab 里会有多个 object，用来批量服务同一 size class 的小对象分配，减少频繁向 OS 申请内存的开销。
+- **run**：可以理解为 slab 的近似概念，常用于描述一段连续内存被切成多个同尺寸 object 的结构；在不同 allocator 或不同版本文档里，`run` 和 `slab` 的命名可能不同。
+- **object**：slab / run 被切分后得到的固定大小内存槽位，也是最终返回给应用的一次小对象分配结果。
+- **extent**：jemalloc 中按 page 粒度管理的一段连续虚拟内存范围。小对象 slab / run 可以由 extent 支撑，large object 也可能直接由 extent 管理。
+
+</Accordion>
+
+<Accordion title="jemalloc 和 tcmalloc 配置">
+
+使用 `jemalloc` 或 `tcmalloc` 前，系统中需要有对应的动态库；随后可以通过 `LD_PRELOAD` 让目标进程在启动时优先加载对应 allocator。
 
 ```bash
-# jemalloc 示例
+# Ubuntu / Debian 示例
+sudo apt update
+sudo apt install -y libjemalloc2 google-perftools
+```
+
+安装后可以通过动态库缓存确认系统是否能找到它们：
+
+```bash
+ldconfig -p | grep -E "jemalloc|tcmalloc"
+
+# 输出类似
+libtcmalloc_minimal.so.4 (libc6,x86-64) => /lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
+libjemalloc.so.2 (libc6,x86-64) => /lib/x86_64-linux-gnu/libjemalloc.so.2
+```
+
+**jemalloc**
+
+`MALLOC_CONF` 是 `jemalloc` 的配置环境变量。`jemalloc` 可以把分配分散到多个 arena，减少多线程分配时的锁竞争；也可以启用后台线程，在业务线程之外做内存清理。下面是一组常见配置：
+
+```bash
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 export MALLOC_CONF="narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true"
+```
 
-# tcmalloc 示例
+<div style={{ maxWidth: "900px", margin: "0 auto" }}>
+  <Frame>
+    <img src="/books/ai-systems-performance-engineering/images/ch03-active-dirty-myzzy-page.png" alt="jemalloc 中 active、dirty、muzzy page 的状态流转：应用释放内存后，allocator 可先保留页面等待复用，再按 decay 策略逐步清理" />
+  </Frame>
+</div>
+
+- `narenas:8` 设置 arena 数量为 8。arena 多一些可以降低多线程锁竞争，但太多也可能增加内存占用。
+- `background_thread:true` 启用后台线程做内存清理，避免释放后的清理工作直接卡在业务线程上。
+- `dirty_decay_ms:10000` 控制 dirty pages 延迟多久再回收或归还，`10000` 表示 10 秒。dirty page 指应用已经释放、但内容还保留的页面，jemalloc 可以直接复用。
+- `muzzy_decay_ms:10000` 控制 muzzy pages 的回收延迟，也设成 10 秒。muzzy page 指应用已释放、旧数据不需要保留，但虚拟地址范围仍留在进程里的页面。与 dirty pages 相比，muzzy pages 再次被分配时往往需要重新触发 page fault 并补入物理页，因此复用成本通常更高。
+- 把 dirty / muzzy page 的回收延迟调长，可以减少频繁向 OS 申请/归还内存的开销，但 RSS 可能保持得更高。RSS（Resident Set Size）表示进程当前实际占用的物理内存；应用释放对象后，allocator 可能先把内存留在 arena 或 cache 里复用，不一定马上还给 OS。
+
+**tcmalloc**
+
+`tcmalloc` 使用自己的 `TCMALLOC_*` 环境变量。
+
+```bash
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
 export TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=$((512 * 1024 * 1024))
 export TCMALLOC_RELEASE_RATE=16
-
-# 确认 allocator 已加载
-cat /proc/$PID/maps | grep -E "jemalloc|tcmalloc"
 ```
 
-<Warning>
-不要同时 preload 多个 malloc 实现。先用 `torch.profiler`、`perf`, `pmap -x`, `smem` 或 `/proc/$PID/smaps_rollup` 确认瓶颈，再替换 allocator。allocator 能改善碎片和分配开销，但不会解决 batch shape 抖动、worker 过多或 dataset cache 设计问题。
-</Warning>
+- `TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES` 控制所有 thread cache 可占用的总大小。值越大，线程本地分配越容易命中 cache，但 RSS 可能更高。
+- `TCMALLOC_RELEASE_RATE` 控制 tcmalloc 把空闲内存归还给 OS 的积极程度。值越大，释放越积极；值太大可能增加向 OS 申请/归还内存的开销。
+
+```bash
+# 确认目标进程是否已经加载 allocator
+cat /proc/$PID/maps | grep -E "jemalloc|tcmalloc"
+
+# 输出类似
+7cb7b42fb000-7cb7b4306000 r--p 00000000 103:04 686402                    /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4.5.16
+7cb7b4306000-7cb7b4318000 r-xp 0000b000 103:04 686402                    /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4.5.16
+7cb7b4318000-7cb7b431f000 r--p 0001d000 103:04 686402                    /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4.5.16
+7cb7b431f000-7cb7b4320000 r--p 00023000 103:04 686402                    /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4.5.16
+7cb7b4320000-7cb7b4321000 rw-p 00024000 103:04 686402                    /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4.5.16
+```
+
+- `/proc/$PID/maps` 查看某个进程实际映射到地址空间里的动态库。
+- 这里必须换成目标训练或推理进程的 PID；查 `/proc/1/maps` 只是在看 PID 1 是否加载了 allocator。
+- 如果没有输出，说明这个进程启动时没有加载 `jemalloc` 或 `tcmalloc`。
+
+</Accordion>
 
 #### 2.9 系统调优脚本汇总
 
