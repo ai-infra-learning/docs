@@ -2019,44 +2019,9 @@ Rack-scale GPU 系统还会把调度问题推到拓扑层。[NVIDIA rack-scale s
 
 </Accordion>
 
-### 7. Grace Blackwell 超级芯片架构
-
-Grace Blackwell 的核心变化是 CPU、GPU、内存和互连被设计成一体化系统，而不是松散连接的 PCIe 外设。[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html)说明，GB200 Grace Blackwell Superchip 由 Grace CPU 与两颗 Blackwell GPU 通过 900 GB/s NVLink-C2C 连接。
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-imex-service.webp" alt="Grace Blackwell NVL72 中 IMEX service 运行在 compute tray 上，通过 NVLink Switch 建立跨节点 GPU 通信域" />
-</Frame>
-
-图源：[NVIDIA Technical Blog：Running AI Workloads on Rack-Scale Supercomputers](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)
-
-这改变了瓶颈位置，但没有消除拓扑问题：
-
-- CPU DRAM、GPU HBM、NIC、NVLink Switch 仍有距离和带宽差异。
-- Linux 仍需要正确的 CPU affinity、NUMA memory policy 和 IRQ affinity。
-- pinned memory、prefetch、double buffering 仍是隐藏数据搬运延迟的关键。
-- NCCL、GDS、RDMA 是否走到目标路径，仍要通过日志和拓扑 dump 验证。
-
-Grace/Blackwell 节点的调优顺序可以这样组织：
-
-1. 用 `nvidia-smi topo -m`、`lscpu -e`、`numactl -H` 和 `ibdev2netdev` 建立 CPU/GPU/NIC 拓扑图。
-2. 为每个 GPU rank 选择本地 CPU、memory node 和 NIC。
-3. 绑定 DataLoader worker、NCCL helper 和 IRQ/RPS/XPS。
-4. 设置 THP、swappiness、dirty ratio、CPU governor、persistence mode。
-5. 用 `torch.profiler`、Nsight Systems、NCCL logs 和 DCGM 验证 GPU bubble 是否减少。
-
-<Accordion title="练习入口：Grace Blackwell rack prep">
-
-[`cpu_gpu_numa_optimizations.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/cpu_gpu_numa_optimizations.sh) 和 [`grace_blackwell_topology.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/grace_blackwell_topology.py) 是这一节最贴近硬件的代码。前者做节点级调优，后者生成 NIC/GPU/NUMA 亲和性建议。
-
-[`baseline_rack_prep.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/baseline_rack_prep.py) 与 [`optimized_rack_prep.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/optimized_rack_prep.py) 则把 topology-aware host preparation 和 pinned double-buffer staging 放进可运行练习。
-
-</Accordion>
-
 ---
 
-## 核心要点
-
-### 核心思想：让 GPU 永远不等待
+## 核心思想：让 GPU 永远不等待
 
 本章所有优化围绕同一目标：消除导致 GPU 空闲的一切因素。
 
