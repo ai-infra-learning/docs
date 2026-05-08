@@ -1447,28 +1447,36 @@ OS 调优保证 CPU 侧不拖慢 GPU；GPU 驱动与运行时设置决定 contex
 
 | 设置 | 主要作用 | 适合场景 | 避免场景 |
 | --- | --- | --- | --- |
-| Persistence Mode | 保持 driver state 和 GPU 初始化状态 | 短作业、低流量推理、MIG 节点 | 对单个长训练作业收益有限 |
+| 持久化模式（Persistence Mode） | 保持 driver state 和 GPU 初始化状态 | 短作业、低流量推理、MIG 节点 | 对单个长训练作业收益有限 |
 | MPS | 多进程共享 GPU 并发执行 | 小推理、多 MPI rank、小 kernel 组合 | 单进程已打满 GPU、强隔离多租户 |
 | MIG | 硬件级 GPU 分区 | 多租户推理、教学/实验平台、资源保证 | 依赖 NVLink/P2P 的分布式训练 |
 | Clock / power limit | 稳定 benchmark 和性能功耗比 | 性能回归测试、容量规划 | 未监控温度/功耗的生产脚本 |
 | CUDA allocator | 减少显存碎片和分配同步 | 变长 batch、推理服务、长期训练 | 把 OOM 当成单纯 allocator 问题 |
 
-#### 3.1 GPU Persistence Mode
+#### 3.1 持久化模式（Persistence Mode）
 
-[NVIDIA Driver Persistence 文档](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)说明，Linux 上当最后一个 client 关闭 GPU device file 后，GPU state 可能被卸载；`nvidia-persistenced` 通过保持 device file 打开来避免反复初始化。
+默认情况下，如果没有应用正在使用 GPU，driver 可能让 GPU 进入更低功耗状态，并卸载部分 driver context。下一次应用重新使用 GPU 时，driver 需要重新初始化 GPU，**这个冷启动过程可能带来一两秒级别的延迟**。对于**频繁启动/停止 job 的训练集群**，或者**低流量但延迟敏感的推理服务**，这类初始化开销会影响整体性能。
+
+Linux 上当最后一个 client 关闭 GPU device file 后，GPU state 可能被卸载；`nvidia-persistenced` 通过保持 device file 打开来避免反复初始化。开启 persistence mode 后，即使没有活跃应用，**GPU driver 也会保持加载**，硬件处于更容易快速接管新任务的 ready state。它不会让 GPU kernel 的数学计算更快，但能减少**作业启动延迟**和 **idle 后首次 CUDA 调用的冷启动停顿**；代价是 **GPU 空闲时功耗会略高**。
 
 ```bash
-# 查询
+# 以 CSV 形式查看所有 GPU 的 UUID 和当前 persistence mode 状态
 nvidia-smi --query-gpu=uuid,persistence_mode --format=csv
 
-# 启用 legacy persistence mode
+# 为所有 GPU 启用 legacy persistence mode
 sudo nvidia-smi -pm 1
 
-# systemd 环境中运行 daemon
+# 为指定 GPU 启用 persistence mode；<target_gpu> 可以是 GPU index，例如 0
+sudo nvidia-smi -i <target_gpu> -pm ENABLED
+
+# 使用 nvidia-smi -q 查看指定 GPU 的详细状态，其中 Persistence Mode 应显示为 Enabled
+nvidia-smi -i <target_gpu> -q
+
+# systemd 环境中启动 nvidia-persistenced，并设置为开机自启
 sudo systemctl enable --now nvidia-persistenced
 ```
 
-Persistence mode 不会让 kernel 更快，但能减少 job 间冷启动、driver state 重建和部分 MIG 状态抖动。它适合短任务密集的集群，也适合推理服务在低流量时保持 GPU readiness。
+参考资料：[NVIDIA Driver Persistence](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)
 
 #### 3.2 Multi-Process Service (MPS)
 
