@@ -1441,88 +1441,6 @@ cat /proc/$PID/maps | grep -E "jemalloc|tcmalloc"
 
 </Accordion>
 
-#### 2.9 系统调优脚本汇总
-
-[`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 把本节讨论的 CPU governor、swap、THP、dirty ratio、网络 buffer、IRQ affinity、locked memory、GPU persistence mode、MPS、NUMA balancing 和 CPU isolation 放到一个脚本里。它更适合作为 GPU 服务器调优 checklist；生产环境里应按机器拓扑和运维体系拆成可审计的 Ansible、Terraform 或 DaemonSet 配置，不建议未经审查直接执行。
-
-```bash
-#!/bin/bash
-
-# System-wide performance tuning for GPU environments
-# Run as root or with sudo
-
-echo "Applying system-wide GPU performance optimizations..."
-
-# 1. CPU Governor and C-states
-echo "Setting CPU governor to performance mode..."
-cpupower frequency-set -g performance
-echo "Disabling deep C-states in BIOS (manual step required)"
-
-# 2. Virtual Memory and Swapping
-echo "Disabling swap and setting swappiness to 0..."
-swapoff -a
-echo 0 > /proc/sys/vm/swappiness
-
-# 3. Transparent Huge Pages - enable for training, disable for inference
-echo "Configuring Transparent Huge Pages..."
-# For training workloads (throughput-focused):
-echo always > /sys/kernel/mm/transparent_hugepage/enabled
-# For inference workloads (latency-focused), use:
-# echo never > /sys/kernel/mm/transparent_hugepage/enabled
-
-# 4. Filesystem and I/O tuning
-echo "Tuning filesystem cache settings..."
-echo 20 > /proc/sys/vm/dirty_ratio
-echo 10 > /proc/sys/vm/dirty_background_ratio
-
-# 5. Network optimizations
-echo "Optimizing network settings for RDMA/InfiniBand..."
-echo 'net.core.rmem_max = 268435456' >> /etc/sysctl.conf
-echo 'net.core.wmem_max = 268435456' >> /etc/sysctl.conf
-echo 'net.ipv4.tcp_rmem = 4096 87380 268435456' >> /etc/sysctl.conf
-echo 'net.ipv4.tcp_wmem = 4096 65536 268435456' >> /etc/sysctl.conf
-sysctl -p
-
-# 6. Interrupt affinity (example for 8-core system)
-echo "Setting interrupt affinity..."
-# This would need to be customized per system
-# Example: bind GPU interrupts to specific cores
-for irq in $(grep nvidia /proc/interrupts | cut -d: -f1); do
-    echo 2 > /proc/irq/$irq/smp_affinity  # Bind to CPU 1
-done
-
-# 7. ulimits for memory locking
-echo "Setting unlimited locked memory..."
-cat >> /etc/security/limits.conf << EOF
-* soft memlock unlimited
-* hard memlock unlimited
-* soft nofile 1048576
-* hard nofile 1048576
-EOF
-
-# 8. GPU-specific optimizations
-echo "Configuring GPU settings..."
-# Enable persistence mode for all GPUs
-nvidia-smi -pm 1
-
-# Enable MPS (optional, for multi-process scenarios)
-# export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-# export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
-# nvidia-cuda-mps-control -d
-
-# 9. NUMA balancing
-echo "Disabling automatic NUMA balancing..."
-echo 0 > /proc/sys/kernel/numa_balancing
-
-# 10. CPU isolation (example - isolate CPUs 2-7 for compute)
-# This requires kernel parameter: isolcpus=2-7 nohz_full=2-7
-echo "CPU isolation requires kernel boot parameters:"
-echo "Add to GRUB: isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7"
-
-echo "System tuning complete. Reboot recommended for all changes to take effect."
-echo "Remember to update /etc/default/grub with CPU isolation parameters if needed."
-```
-
 ### 3. GPU 驱动与运行时设置
 
 OS 调优保证 CPU 侧不拖慢 GPU；GPU 驱动与运行时设置决定 context、时钟、隔离和显存分配是否稳定。不同设置的目标不同，不适合一次性全部打开。
@@ -1684,9 +1602,119 @@ Unified Memory / UVM 能让数据在 CPU 与 GPU 间自动迁移，但深度学�
 
 Docker `--gpus` 或 `NVIDIA_VISIBLE_DEVICES` 控制 GPU 暴露范围，不提供硬 GPU memory limit。需要硬隔离时使用 MIG；需要软共享时再考虑 MPS 或 Kubernetes GPU sharing。
 
-### 4. 容器运行时优化
+### 4. 系统调优脚本
 
-#### 4.1 NVIDIA Container Toolkit
+[`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 脚本里包含 CPU 频率策略、swap、透明大页（THP）、网络参数、中断亲和性等调优项。
+
+<Accordion title="system_tuning.sh 示例">
+
+```bash
+#!/bin/bash
+
+# GPU 环境的系统级性能调优示例
+# 需要以 root 用户运行，或用 sudo 执行
+
+echo "Applying system-wide GPU performance optimizations..."
+
+# 1. CPU governor 与 C-states
+echo "Setting CPU governor to performance mode..."
+# 把 CPU governor 切到 performance，减少动态降频带来的唤醒和升频延迟
+cpupower frequency-set -g performance
+# 深层 C-states 通常需要在 BIOS 或内核启动参数中配置，这里只打印提醒
+echo "Disabling deep C-states in BIOS (manual step required)"
+
+# 2. 虚拟内存与 swap
+echo "Disabling swap and setting swappiness to 0..."
+# 临时关闭所有 swap 设备和 swap 文件，重启后会按系统配置恢复
+swapoff -a
+# 设置 swappiness=0，尽量避免在非极端内存压力下使用 swap
+echo 0 > /proc/sys/vm/swappiness
+
+# 3. Transparent Huge Pages：训练偏吞吐可以启用，推理偏延迟通常禁用
+echo "Configuring Transparent Huge Pages..."
+# 训练 workload：吞吐优先
+# 启用 THP，让内核尽量使用 2MB transparent hugepages
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+# 推理 workload：延迟优先时可改成 never
+# 禁用 THP，减少 compaction 等后台行为带来的延迟抖动
+# echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+# 4. 文件系统与 I/O 调优
+echo "Tuning filesystem cache settings..."
+# dirty_ratio 控制 dirty page 可占系统内存的最高比例，超过后写入进程可能被阻塞
+echo 20 > /proc/sys/vm/dirty_ratio
+# dirty_background_ratio 控制后台写回开始触发的比例
+echo 10 > /proc/sys/vm/dirty_background_ratio
+
+# 5. 网络参数调优，适用于 RDMA / InfiniBand 等高吞吐网络
+echo "Optimizing network settings for RDMA/InfiniBand..."
+# 提高 socket receive buffer 上限
+echo 'net.core.rmem_max = 268435456' >> /etc/sysctl.conf
+# 提高 socket send buffer 上限
+echo 'net.core.wmem_max = 268435456' >> /etc/sysctl.conf
+# 设置 TCP receive buffer 的 min / default / max
+echo 'net.ipv4.tcp_rmem = 4096 87380 268435456' >> /etc/sysctl.conf
+# 设置 TCP send buffer 的 min / default / max
+echo 'net.ipv4.tcp_wmem = 4096 65536 268435456' >> /etc/sysctl.conf
+# 重新加载 /etc/sysctl.conf，使上面的网络参数生效
+sysctl -p
+
+# 6. 中断亲和性示例：下面以 8-core 系统为例
+echo "Setting interrupt affinity..."
+# 实际生产中需要按 GPU / NIC 所在 NUMA node 和 CPU 拓扑定制
+# 示例：把 NVIDIA GPU 相关 IRQ 绑定到指定 CPU core
+# 从 /proc/interrupts 中找出 NVIDIA 相关 IRQ 编号
+for irq in $(grep nvidia /proc/interrupts | cut -d: -f1); do
+    # smp_affinity 使用 bitmask；这里写入 2 表示绑定到 CPU 1
+    echo 2 > /proc/irq/$irq/smp_affinity  # 绑定到 CPU 1
+done
+
+# 7. locked memory 与文件描述符限制
+echo "Setting unlimited locked memory..."
+# 写入 PAM limits 配置，提高 memlock 和 nofile 限制；通常需要重新登录或重启服务后生效
+cat >> /etc/security/limits.conf << EOF
+* soft memlock unlimited
+* hard memlock unlimited
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+
+# 8. GPU 相关设置
+echo "Configuring GPU settings..."
+# 为所有 GPU 启用 persistence mode
+# 减少 GPU driver state 在任务间反复初始化的开销
+nvidia-smi -pm 1
+
+# 可选：启用 MPS，适用于多进程共享 GPU 的场景
+# 指定 MPS daemon 使用的 pipe 目录
+# export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+# 指定 MPS daemon 的日志目录
+# export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+# 启动 MPS control daemon
+# nvidia-cuda-mps-control -d
+
+# 9. NUMA balancing
+echo "Disabling automatic NUMA balancing..."
+# 禁用自动 NUMA balancing，避免内核自动迁移 page 影响手工 NUMA 绑定策略
+echo 0 > /proc/sys/kernel/numa_balancing
+
+# 10. CPU isolation 示例：把 CPU 2-7 留给计算任务
+# 这类设置需要通过内核启动参数生效，例如 isolcpus=2-7 nohz_full=2-7
+echo "CPU isolation requires kernel boot parameters:"
+# 打印需要加入 GRUB 的内核启动参数示例
+echo "Add to GRUB: isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7"
+
+# 提醒：部分参数需要重启后才会完全生效
+echo "System tuning complete. Reboot recommended for all changes to take effect."
+# 提醒：如需 CPU isolation，需要手动更新 GRUB 配置
+echo "Remember to update /etc/default/grub with CPU isolation parameters if needed."
+```
+
+</Accordion>
+
+### 5. 容器运行时优化
+
+#### 5.1 NVIDIA Container Toolkit
 
 容器共享宿主 Linux kernel，CUDA kernel 仍在同一块 GPU 上执行。容器 GPU 性能通常接近裸机，真正容易出问题的是 driver/CUDA 版本、设备注入、文件系统和网络路径。
 
@@ -1711,7 +1739,7 @@ docker run --rm \
 
 版本匹配规则以官方 [NVIDIA Data Center Driver/CUDA support matrix](https://docs.nvidia.com/datacenter/tesla/drivers/supported-drivers-and-cuda-toolkit-versions.html) 为准。写作时（2026-04-25）该矩阵中 R535 支持 CUDA 12.x，R580/R595 支持 CUDA 13.x；[CUDA Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) 也说明 CUDA 12.x 工具链的最低 driver 是 525.60.13。实际生产不要只记大版本，镜像里的 `NVIDIA_REQUIRE_CUDA` 约束和宿主 driver 小版本都要检查。
 
-#### 4.2 避免 Overlay FS 开销
+#### 5.2 避免 Overlay FS 开销
 
 容器 writable layer 适合代码和少量日志，不适合训练数据、checkpoint、tokenized cache 和模型权重。大文件读写应通过 bind mount、PVC 或本地 NVMe cache 进入容器。
 
@@ -1750,7 +1778,7 @@ ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 </Accordion>
 
-#### 4.3 减小镜像体积
+#### 5.3 减小镜像体积
 
 镜像体积主要影响拉取、启动和节点磁盘压力。长训练对启动时间不敏感，但大集群滚动升级、弹性推理和 spot 节点恢复会放大镜像体积的成本。
 
@@ -1761,9 +1789,9 @@ ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
 - 权重、数据集、checkpoint 不进入镜像，通过对象存储、PVC、bind mount 或本地缓存加载。
 - HPC 环境可评估 Apptainer/Singularity，减少 root daemon 依赖并复用宿主文件系统。
 
-### 5. Kubernetes 编排与拓扑感知调度
+### 6. Kubernetes 编排与拓扑感知调度
 
-#### 5.1 GPU Operator 与 Device Plugin
+#### 6.1 GPU Operator 与 Device Plugin
 
 Kubernetes 通过 device plugin framework 暴露 GPU。NVIDIA 的 [k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin) 会注册 `nvidia.com/gpu`，也能在 MIG 或 sharing 配置下注册 `nvidia.com/mig-*`、`nvidia.com/gpu.shared` 等资源。
 
@@ -1785,7 +1813,7 @@ kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=100
 [DCGM exporter](https://docs.nvidia.com/datacenter/dcgm/latest/gpu-telemetry/dcgm-exporter.html) 能把 GPU 利用率、显存、温度、功耗和 MIG 指标导出到 Prometheus。排查“调度看似成功但吞吐不稳定”时，DCGM 指标要和 kubelet、node exporter、NCCL 日志一起看。
 </Note>
 
-#### 5.2 Topology Manager
+#### 6.2 Topology Manager
 
 默认 Kubernetes 调度器只知道资源数量，不理解 GPU、CPU、NUMA、NIC、NVLink domain 的距离。请求 4 张 GPU 成功，不代表这 4 张 GPU 在同一个 NVLink clique，也不代表 CPU 和 NIC 离它们最近。
 
@@ -1838,7 +1866,7 @@ volumes:
 
 </Accordion>
 
-#### 5.3 网络优化
+#### 6.3 网络优化
 
 多节点训练里，网络路径与 GPU 拓扑同等重要。NCCL 可能走 NVLink、PCIe P2P、InfiniBand/RDMA、RoCE 或普通 TCP socket；错误的 NIC、CNI overlay 或安全策略会直接压低 all-reduce 带宽。
 
@@ -1862,7 +1890,7 @@ env:
 
 `NCCL_DEBUG=INFO` 和 `NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml` 是低成本诊断入口。训练性能异常时，先确认 NCCL 选到的 NIC、GPU bus id、P2P level 和 ring/tree 构造，再看模型代码。
 
-#### 5.4 资源隔离与 QoS
+#### 6.4 资源隔离与 QoS
 
 [Kubernetes QoS 文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)定义了 `Guaranteed`、`Burstable`、`BestEffort` 三类。节点内存紧张时，Kubernetes 会优先驱逐 `BestEffort`，其次是 `Burstable`，最后是 `Guaranteed`。
 
@@ -1880,7 +1908,7 @@ GPU 训练 Pod 通常应该做到：
 - 训练节点预留 housekeeping CPU，避免 kubelet/containerd/监控 agent 与 DataLoader worker 抢核。
 - I/O 隔离用本地 NVMe 分区、cgroup v2 I/O controller 或存储层 QoS 补齐；Kubernetes 默认资源模型不直接表达磁盘带宽。
 
-#### 5.5 MIG 在 Kubernetes 中的使用
+#### 6.5 MIG 在 Kubernetes 中的使用
 
 MIG 在 Kubernetes 中表现为扩展资源。例如配套 YAML 使用 `nvidia.com/mig-2g.45gb` 请求两个 MIG 实例：
 
@@ -1904,7 +1932,7 @@ MIG 资源不能跨节点拼接。一个 Pod 请求两个 `2g.45gb` 实例时，
 
 </Accordion>
 
-#### 5.6 调度器：Kubernetes、Slurm 与 Slinky
+#### 6.6 调度器：Kubernetes、Slurm 与 Slinky
 
 训练平台和推理平台的调度目标不同。训练更像 HPC batch：一组 rank 要同时拿到 GPU、CPU、内存、网络和文件系统带宽；推理更像在线服务：关注 rollout、autoscaling、灰度、SLO、可观测和多租户隔离。调度器选型不是“谁更先进”，而是资源模型和团队操作模型是否匹配。
 
@@ -1991,7 +2019,7 @@ Rack-scale GPU 系统还会把调度问题推到拓扑层。[NVIDIA rack-scale s
 
 </Accordion>
 
-### 6. Grace Blackwell 超级芯片架构
+### 7. Grace Blackwell 超级芯片架构
 
 Grace Blackwell 的核心变化是 CPU、GPU、内存和互连被设计成一体化系统，而不是松散连接的 PCIe 外设。[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html)说明，GB200 Grace Blackwell Superchip 由 Grace CPU 与两颗 Blackwell GPU 通过 900 GB/s NVLink-C2C 连接。
 
