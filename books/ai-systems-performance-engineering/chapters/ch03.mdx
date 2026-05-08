@@ -1478,6 +1478,37 @@ nvidia-smi -i <target_gpu> -q
 sudo systemctl enable --now nvidia-persistenced
 ```
 
+<Accordion title="Kubernetes 中通过 GPU Operator 启用持久化模式">
+
+在 Kubernetes 中，安装 GPU Operator 时启用 `driver.enabled=true`，GPU Operator 会部署 `nvidia-driver-daemonset` 来管理节点侧 NVIDIA driver，并启动 `nvidia-persistenced`，从而启用持久化模式。
+
+```bash
+# 添加 NVIDIA Helm repo
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+
+# 安装或更新 GPU Operator，并让 Operator 管理节点侧 NVIDIA driver
+helm upgrade --install gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator \
+  --create-namespace \
+  --set driver.enabled=true
+
+# 查看每个 GPU node 上的 driver pod
+kubectl -n gpu-operator get pods -l app=nvidia-driver-daemonset -o wide
+
+# 进入某个 driver pod，确认 nvidia-persistenced 是否以 persistence mode 运行
+kubectl -n gpu-operator exec -it <nvidia-driver-pod> -- \
+  pgrep -a nvidia-persistenced
+
+# 在 driver pod 中确认 GPU persistence mode
+kubectl -n gpu-operator exec -it <nvidia-driver-pod> -- \
+  nvidia-smi --query-gpu=uuid,persistence_mode --format=csv
+```
+
+如果集群使用宿主机预装 driver，并在 GPU Operator 中设置 `driver.enabled=false`，Operator 不会部署 driver DaemonSet。这种情况下，持久化模式应通过节点镜像、systemd 或单独的节点级 DaemonSet 在宿主侧启用。
+
+</Accordion>
+
 参考资料：[NVIDIA Driver Persistence](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)
 
 #### 3.2 Multi-Process Service (MPS)
