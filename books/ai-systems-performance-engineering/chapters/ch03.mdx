@@ -1642,71 +1642,54 @@ mps / without_mps = 1.18x
 
 **静态 SM 分区示例**
 
-Static SM partitioning 适用于 Ampere 及更新架构。它在 MPS 之上进一步创建独占 SM partition，让不同 client 使用不同的 SM 分区。
+MPS 还支持静态 SM 分区（static SM partitioning），主要有以下好处：
 
-这个功能还依赖 `nvidia-cuda-mps-control` 本身支持 `-S`、`sm_partition` 和 `lspart`。如果 `nvidia-cuda-mps-control --help` 里没有这些选项或命令，说明当前 driver/MPS 工具版本不能运行 static SM partitioning。
-
-[run_static_partition_demo.sh](/books/ai-systems-performance-engineering/chapters/ch03/mps/run_static_partition_demo.sh) 会先跑一轮 Basic MPS，再启动 `-S` 模式的 MPS control daemon 做 static SM partitioning。两轮都运行相同数量的 `mps_demo.py` client，最后对比 Basic MPS 和 static partitioning 完成的总矩阵乘法次数。
-
-```bash
-# 进入 ch03 代码目录
-cd books/ai-systems-performance-engineering/chapters/ch03
-
-GPU_INDEX=0 RUN_SECONDS=60 N=1024 PARTITION_CHUNKS="7 7 7 6" ./mps/run_static_partition_demo.sh
-```
-
-`7 7 7 6` 表示为 `4` 个 client 创建 `4` 个大小接近的 partition，用来做接近平均的 SM 切分。
+- **确定性的资源分配**：可以显式控制每个 client 能访问哪些 SM，不再完全依赖 MPS 的动态调度。
+- **client 之间的空间隔离**：不同 client 可以被放到不同 SM partition，减少彼此干扰。
 
 静态 SM 分区常用的配置和查看命令如下：
 
 ```bash
-# CUDA_VISIBLE_DEVICES 控制当前进程可见的 GPU；0 表示只看到 GPU 0。
-# 如果要设置多个 GPU，可以用逗号分隔，例如 0,1。
-# 以 -S 模式启动 MPS control daemon，并让它只绑定 GPU 0。
-sudo env CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d -S
+# -S 是开启静态 SM 分区的关键参数。
+# 启动支持静态 SM 分区的 MPS control daemon。
+nvidia-cuda-mps-control -d -S
 
-# 查询目标 GPU 的 UUID。
-GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
-
-# 查看当前 SM partition 状态。
-echo "lspart" | sudo nvidia-cuda-mps-control
-
-# 从 "Partition GPU-.../... created" 输出中提取 CUDA_MPS_SM_PARTITION 需要的分区 ID。
-parse_partition() {
-  sed -nE 's/^.*(GPU-[^[:space:]]+\/[^[:space:]]+).*$/\1/p' | tail -n 1
-}
-
-# 创建四个大小接近的 SM partition。
-PART_0=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
-PART_1=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
-PART_2=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
-PART_3=$(echo "sm_partition add $GPU_UUID 6" | sudo nvidia-cuda-mps-control | parse_partition)
-
-# CUDA client 初始化前设置 CUDA_MPS_SM_PARTITION，绑定到指定 partition。
-CUDA_MPS_SM_PARTITION="$PART_0" uv run python mps/mps_demo.py --workers 1 --seconds 60
-
-# 删除 partition 并关闭 MPS。
-echo "sm_partition rm ${PART_0%/*} ${PART_0#*/}" | sudo nvidia-cuda-mps-control
-echo quit | sudo nvidia-cuda-mps-control
-```
-
-查看命令的输出示例如下：
-
-```text
-# echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control
-Partition GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA created
-
-# echo "lspart" | sudo nvidia-cuda-mps-control
+# 查看当前分区配置。
+# 这里 GPU-74d43ed3 是示例 GPU UUID 的短显示；实际环境以 lspart 输出为准。
+echo "lspart" | nvidia-cuda-mps-control
 GPU           Partition                             free    used    free  used  clients
                                                     chunk   chunk    SM    SM
-GPU-74d43ed3      -                                 0       27      0     108  -
-GPU-74d43ed3  Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
-GPU-74d43ed3  Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
-GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
-GPU-74d43ed3  Ax4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       6       -     24   Yes
-```
+GPU-74d43ed3      -                                 10       0       92    92   -
 
-`clients=Yes` 表示已有 client 使用该 partition；`used chunk` 是分配的 chunk 数，实际对应多少 SM 以 `used SM` 为准。
+# 创建 3 个不同大小的 SM 分区。
+# 这里的 5、3、2 表示分配的 chunk 数。
+# 这里的 chunk 是 MPS 用来分配 SM 的单位；一个 chunk 对应多少个 SM 由具体 GPU 决定。
+# Hopper 之前的 GPU 通常是 1 chunk = 4 SM，Hopper 及更新架构的 GPU 通常是 1 chunk = 8 SM，最终以 lspart 输出里的 used SM 为准。
+echo "sm_partition add GPU-74d43ed3 5" | nvidia-cuda-mps-control
+GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+echo "sm_partition add GPU-74d43ed3 3" | nvidia-cuda-mps-control
+GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+echo "sm_partition add GPU-74d43ed3 2" | nvidia-cuda-mps-control
+GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+# CUDA_MPS_SM_PARTITION 用来指定当前 CUDA client 使用哪个静态 SM 分区。
+# 这个变量必须在 CUDA 初始化前设置。
+CUDA_MPS_SM_PARTITION=GPU-74d43ed3/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ./large_workload &
+CUDA_MPS_SM_PARTITION=GPU-74d43ed3/Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ./medium_workload &
+CUDA_MPS_SM_PARTITION=GPU-74d43ed3/Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ./small_workload &
+
+# 查看分区使用情况。
+# clients=Yes 表示已有 client 使用该 partition。
+echo "lspart" | nvidia-cuda-mps-control
+GPU           Partition                             free    used    free  used  clients
+                                                    chunk   chunk    SM    SM
+GPU-74d43ed3      -                                 0       10       0     80   -
+GPU-74d43ed3  Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       5        -     40   Yes
+GPU-74d43ed3  Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       3        -     24   Yes
+GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2        -     28   Yes
+```
 
 </Accordion>
 
