@@ -9,7 +9,7 @@ CH03_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 GPU_INDEX="${GPU_INDEX:-0}"
 WORKERS="${WORKERS:-4}"
-SECONDS="${SECONDS:-60}"
+RUN_SECONDS="${RUN_SECONDS:-60}"
 N="${N:-1024}"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -42,7 +42,7 @@ sum_iters() {
 print_config() {
   echo "GPU_INDEX=$GPU_INDEX"
   echo "WORKERS=$WORKERS"
-  echo "SECONDS=$SECONDS"
+  echo "RUN_SECONDS=$RUN_SECONDS"
   echo "N=$N"
 }
 
@@ -53,7 +53,7 @@ run_demo() {
     uv run python mps/mps_demo.py \
       --device "$GPU_INDEX" \
       --workers "$WORKERS" \
-      --seconds "$SECONDS" \
+      --seconds "$RUN_SECONDS" \
       --n "$N"
 }
 
