@@ -1493,19 +1493,15 @@ helm upgrade --install gpu-operator nvidia/gpu-operator \
   --create-namespace \
   --set driver.enabled=true
 
-# 查看每个 GPU node 上的 driver pod
-kubectl -n gpu-operator get pods -l app=nvidia-driver-daemonset -o wide
+# 查看每个 GPU node 上的 device plugin pod
+kubectl -n gpu-operator get pods | grep nvidia-device-plugin-daemonset
 
-# 进入某个 driver pod，确认 nvidia-persistenced 是否以 persistence mode 运行
-kubectl -n gpu-operator exec -it <nvidia-driver-pod> -- \
-  pgrep -a nvidia-persistenced
-
-# 在 driver pod 中确认 GPU persistence mode
-kubectl -n gpu-operator exec -it <nvidia-driver-pod> -- \
+# 在 device plugin pod 中确认 GPU persistence mode
+# 如果命令输出中 `persistence_mode` 为 `Enabled`，说明当前 GPU 已经启用持久化模式。
+kubectl -n gpu-operator exec -it <nvidia-device-plugin-pod> \
+  -c nvidia-device-plugin -- \
   nvidia-smi --query-gpu=uuid,persistence_mode --format=csv
 ```
-
-如果集群使用宿主机预装 driver，并在 GPU Operator 中设置 `driver.enabled=false`，Operator 不会部署 driver DaemonSet。这种情况下，持久化模式应通过节点镜像、systemd 或单独的节点级 DaemonSet 在宿主侧启用。
 
 </Accordion>
 
