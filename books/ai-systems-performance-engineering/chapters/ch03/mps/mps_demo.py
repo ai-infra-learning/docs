@@ -11,16 +11,15 @@ import os
 import time
 
 
-def worker(worker_id: int, seconds: int, n: int) -> None:
+def worker(worker_id: int, device: int, seconds: int, n: int) -> None:
     """单个 worker 进程执行的逻辑。"""
 
     # torch 放在 worker 内部 import，避免主进程过早初始化 CUDA。
     # 多进程 CUDA 程序建议使用 spawn 启动方式。
     import torch
 
-    # 使用当前进程可见设备中的 cuda:0。
-    # 如果 MPS daemon 只暴露了物理 GPU 0，那么这里的 cuda:0 就对应那张 GPU。
-    torch.cuda.set_device(0)
+    # 使用指定 CUDA device。默认是 cuda:0。
+    torch.cuda.set_device(device)
 
     # 创建两个 n x n 的 GPU 矩阵。
     # n 越大，计算量和显存占用越高。
@@ -50,7 +49,7 @@ def worker(worker_id: int, seconds: int, n: int) -> None:
     # PID 可以和 `echo ps | nvidia-cuda-mps-control` 的输出对应起来。
     print(
         f"worker={worker_id} pid={os.getpid()} "
-        f"iters={iters} device={torch.cuda.get_device_name(0)}",
+        f"iters={iters} device={torch.cuda.get_device_name(device)}",
         flush=True,
     )
 
@@ -63,6 +62,9 @@ def main() -> None:
     # 启动多少个 worker 子进程。
     # 每个 worker 都会创建自己的 CUDA context，用来验证多个进程是否通过 MPS 共享 GPU。
     parser.add_argument("--workers", type=int, default=4)
+
+    # 使用哪张 CUDA device。默认使用 cuda:0。
+    parser.add_argument("--device", type=int, default=0)
 
     # 每个 worker 持续执行 GPU 矩阵乘法的秒数。
     # 建议设置长一点，例如 60 秒，方便观察 nvidia-smi 和 mps-control 输出。
@@ -78,7 +80,7 @@ def main() -> None:
     ctx = mp.get_context("spawn")
 
     procs = [
-        ctx.Process(target=worker, args=(i, args.seconds, args.n))
+        ctx.Process(target=worker, args=(i, args.device, args.seconds, args.n))
         for i in range(args.workers)
     ]
 
@@ -87,6 +89,10 @@ def main() -> None:
 
     for proc in procs:
         proc.join()
+
+    failed = [proc.exitcode for proc in procs if proc.exitcode != 0]
+    if failed:
+        raise SystemExit(f"{len(failed)} worker process(es) failed: exit codes {failed}")
 
 
 if __name__ == "__main__":

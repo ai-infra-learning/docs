@@ -1527,7 +1527,7 @@ MPS 主要解决 **compute sharing 和调度并发**，不是硬隔离方案。�
 
 **Basic MPS**
 
-`run_basic_comparison.sh` 会先在不开 MPS 的情况下运行 demo，再启动 MPS 并重复运行同一个 demo。脚本会自动设置 `EXCLUSIVE_PROCESS`、启动 `nvidia-cuda-mps-control -d`、查看 MPS client 和 `nvidia-cuda-mps-server`，最后汇总两次运行的总 `iters`。
+`run_basic_comparison.sh` 会先在不开 MPS 的情况下运行 demo，再启动 MPS 并重复运行同一个 demo。脚本会自动设置 `EXCLUSIVE_PROCESS`、启动 `nvidia-cuda-mps-control -d`、查看 MPS client 和 `nvidia-cuda-mps-server`，最后汇总两次运行的总 `iters`。脚本通过 Python 的 `--device` 指定目标 GPU，不依赖 `CUDA_VISIBLE_DEVICES` 做设备选择，避免 device index 重映射带来的混淆。
 
 ```bash
 # 进入 ch03 代码目录

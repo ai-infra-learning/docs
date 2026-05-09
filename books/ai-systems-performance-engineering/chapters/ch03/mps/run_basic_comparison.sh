@@ -46,6 +46,17 @@ print_config() {
   echo "N=$N"
 }
 
+run_demo() {
+  # 清理外部 shell 里可能残留的 CUDA_VISIBLE_DEVICES。
+  # 这里直接通过 --device 指定目标 GPU，避免 CUDA_VISIBLE_DEVICES 的 index remap 影响 PyTorch 子进程。
+  env -u CUDA_VISIBLE_DEVICES \
+    uv run python mps/mps_demo.py \
+      --device "$GPU_INDEX" \
+      --workers "$WORKERS" \
+      --seconds "$SECONDS" \
+      --n "$N"
+}
+
 run_without_mps() {
   echo "================================================================================"
   echo "Running without MPS"
@@ -55,11 +66,7 @@ run_without_mps() {
   "${SUDO[@]}" nvidia-smi -i "$GPU_INDEX" -c DEFAULT >/dev/null
 
   cd "$CH03_DIR"
-  CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
-    uv run python mps/mps_demo.py \
-      --workers "$WORKERS" \
-      --seconds "$SECONDS" \
-      --n "$N" | tee "$BASELINE_OUT"
+  run_demo | tee "$BASELINE_OUT"
 }
 
 run_with_mps() {
@@ -71,18 +78,13 @@ run_with_mps() {
   # MPS 场景中，这个 process 通常是 nvidia-cuda-mps-server。
   "${SUDO[@]}" nvidia-smi -i "$GPU_INDEX" -c EXCLUSIVE_PROCESS >/dev/null
 
-  # 启动 MPS control daemon，并限制它只管理指定 GPU。
-  "${SUDO[@]}" env CUDA_VISIBLE_DEVICES="$GPU_INDEX" nvidia-cuda-mps-control -d
+  # 启动 MPS control daemon。client 通过 --device 选择目标 GPU。
+  "${SUDO[@]}" nvidia-cuda-mps-control -d
   MPS_STARTED=1
 
   cd "$CH03_DIR"
 
-  # client 侧清理 CUDA_VISIBLE_DEVICES，避免 device index 重映射混淆。
-  env -u CUDA_VISIBLE_DEVICES \
-    uv run python mps/mps_demo.py \
-      --workers "$WORKERS" \
-      --seconds "$SECONDS" \
-      --n "$N" >"$MPS_OUT" 2>&1 &
+  run_demo >"$MPS_OUT" 2>&1 &
 
   local demo_pid=$!
 
