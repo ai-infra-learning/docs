@@ -1509,36 +1509,133 @@ kubectl -n gpu-operator exec -it <nvidia-device-plugin-pod> \
 
 #### 3.2 Multi-Process Service (MPS)
 
-[NVIDIA MPS 文档](https://docs.nvidia.com/deploy/mps/)把 MPS 定义为 CUDA API 的 binary-compatible 实现，用于让协作式多进程 CUDA 应用利用 Hyper-Q 并发能力。它的核心价值是把多个小工作负载的 kernel 交错执行，减少 context 切换和 GPU 空闲。
+[NVIDIA Multi-Process Service（MPS）](https://docs.nvidia.com/deploy/mps/introduction.html) 是一种与 CUDA API 二进制兼容的客户端-服务端运行时，用来让多个协作式 CUDA 进程更高效地共享同一张 GPU。普通多进程共享 GPU 时，GPU scheduler 通常在不同进程之间做 time-slicing：先执行进程 A 的 kernel，再执行进程 B 的 kernel。如果这些 kernel 很短，或者进程之间存在等待间隙，GPU 可能在上下文切换和空闲之间来回摆动，整体利用率偏低。
+
+使用 MPS 时，需要先启动一个 MPS control daemon；当 CUDA client 连接时，它会按需拉起 `nvidia-cuda-mps-server`。**MPS 的本质是在多个进程之上创建一层共享的调度伞：只要 SM（Streaming Multiprocessors）、Tensor Cores 等 GPU 资源还有空余，GPU 就可以同时执行来自不同进程的 kernel，而不是在多个进程之间严格按时间片轮转。MPS 会把多个进程的 context 合并到一个 scheduler context 里，从而减少独立进程之间完整 context switch 和空闲等待的成本。**
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-mps.png" alt="MPS 让多个 CUDA 进程通过同一个 MPS server 共享 GPU，减少普通 time-slicing 带来的上下文切换和空闲间隙" />
+</Frame>
+
+MPS 的典型场景是多个小推理任务、多个 MPI rank、短 kernel 组合任务共用一张大 GPU。例如多个推理进程各自只使用部分显存和部分 SM 计算资源时，MPS 可以让它们更充分地并发运行，提高整体 GPU 利用率。单个训练或推理进程已经长期打满 GPU 时，MPS 不会让计算超过 100% 利用率，通常也不会带来收益。
+
+MPS 主要解决 **compute sharing 和调度并发**，不是硬隔离方案。它不会像 MIG 一样切分 GPU memory；多个 client 仍共享同一张 GPU 的显存，一个进程 OOM 可能影响同一 GPU 上的其他进程。默认情况下，MPS client 通常运行在同一个 Unix user 下；多用户共享时也不等于安全隔离。需要强隔离时，应优先考虑 MIG。MPS 还可以通过 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 限制 client 可使用的执行资源比例，例如 `50` 表示限制到大约 50% 的 SM execution capacity。
+
+<Accordion title="MPS 配置与验证步骤">
+
+下面的例子使用配套脚本 `books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py`。脚本会启动多个 Python 子进程，每个子进程在 GPU 上反复执行矩阵乘法，用来验证多个 CUDA 进程是否通过 MPS 共享同一张 GPU。
+
+**Basic MPS**
+
+`run_basic_comparison.sh` 会先在不开 MPS 的情况下运行 demo，再启动 MPS 并重复运行同一个 demo。脚本会自动设置 `EXCLUSIVE_PROCESS`、启动 `nvidia-cuda-mps-control -d`、查看 MPS client 和 `nvidia-cuda-mps-server`，最后汇总两次运行的总 `iters`。
 
 ```bash
-# root 或服务用户启动 MPS control daemon
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
-nvidia-cuda-mps-control -d
+# 进入 ch03 代码目录
+cd books/ai-systems-performance-engineering/chapters/ch03
 
-# 限制新 client 的活跃 SM 百分比
-export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50
+# 默认使用 GPU 0、4 个 worker、运行 60 秒、矩阵大小 1024。
+./mps/run_basic_comparison.sh
+
+# 也可以通过环境变量调整参数。
+GPU_INDEX=0 WORKERS=4 SECONDS=60 N=1024 ./mps/run_basic_comparison.sh
 ```
 
-MPS 更适合 GPU 没被单个进程打满的场景，例如多个小模型推理、多个 MPI rank 共用一张 GPU、许多短 kernel 组成的任务。单个训练进程已经长期 95% 以上 SM utilization 时，MPS 只会增加共享复杂度。
+worker 输出大致如下：
 
-| 维度 | MPS | Kubernetes time-slicing |
-| --- | --- | --- |
-| 执行方式 | 多 client kernel 可并发 | 多 workload 时间片轮转 |
-| 隔离 | 不是硬件安全隔离 | 不是硬件安全隔离 |
-| 内存控制 | MPS daemon 可做均分限制，仍共享物理 GPU | device plugin 暴露多个逻辑副本 |
-| 适用 | 填满小 kernel 间隙 | 多用户交互、轻量共享 |
+```text
+worker=0 pid=281301 iters=18420 device=NVIDIA A100-SXM4-80GB
+worker=1 pid=281302 iters=18302 device=NVIDIA A100-SXM4-80GB
+worker=2 pid=281303 iters=18155 device=NVIDIA A100-SXM4-80GB
+worker=3 pid=281304 iters=18091 device=NVIDIA A100-SXM4-80GB
+```
 
-<Accordion title="练习入口：MIG/MPS 状态检查">
+最后会汇总不开 MPS 与开启 MPS 的总 `iters`：
 
-[`mig_mps_tool.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/mig_mps_tool.py) 通过 NVML 报告 MIG 模式、MIG device 和 MPS 相关状态。
+```text
+Benchmark summary
+================================================================================
+mode              total_iters
+without_mps             72100
+with_mps                80650
+mps / without_mps = 1.12x
+```
+
+脚本运行到 MPS 阶段时，`echo ps | sudo nvidia-cuda-mps-control` 能看到多个 client PID；`nvidia-smi` 能看到 `nvidia-cuda-mps-server`。这两个现象同时出现，就说明这些 Python 进程正在通过 MPS server 使用 GPU。
+
+**Multiple Partitions Example：静态 SM 分区**
+
+Static SM partitioning 适用于 Ampere 及更新架构。它在 MPS 之上进一步创建独占 SM partition，让不同 client 使用不同的 SM 分区。
 
 ```bash
-python -m ch03.mig_mps_tool --device 0
+# 进入 ch03 代码目录
+cd books/ai-systems-performance-engineering/chapters/ch03
+
+# 查询 GPU 0 的 UUID，并写入变量。
+GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
+echo "$GPU_UUID"
+
+# 启动支持 static SM partitioning 的 MPS control daemon。
+sudo env CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d -S
+unset CUDA_VISIBLE_DEVICES
+
+# 查看当前分区状态。
+echo "lspart" | sudo nvidia-cuda-mps-control
+
+# 创建三个不同大小的 SM partition。
+PART_LARGE=$(echo "sm_partition add $GPU_UUID 5" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_MEDIUM=$(echo "sm_partition add $GPU_UUID 3" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_SMALL=$(echo "sm_partition add $GPU_UUID 2" | sudo nvidia-cuda-mps-control | tail -n 1)
+
+echo "$PART_LARGE"
+echo "$PART_MEDIUM"
+echo "$PART_SMALL"
+
+# 分别把三个 client 绑定到不同 partition。
+CUDA_MPS_SM_PARTITION="$PART_LARGE" \
+  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
+
+CUDA_MPS_SM_PARTITION="$PART_MEDIUM" \
+  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
+
+CUDA_MPS_SM_PARTITION="$PART_SMALL" \
+  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
+
+sleep 5
+
+# 查看分区使用状态。clients 为 Yes 表示已有 client 使用该 partition。
+echo "lspart" | sudo nvidia-cuda-mps-control
+
+# 查看 MPS client 和 MPS server。
+echo ps | sudo nvidia-cuda-mps-control
+nvidia-smi
+
+wait
+
+# 删除 partition。PART_LARGE%/* 是 GPU UUID，PART_LARGE#*/ 是 partition token。
+echo "sm_partition rm ${PART_LARGE%/*} ${PART_LARGE#*/}" | sudo nvidia-cuda-mps-control
+echo "sm_partition rm ${PART_MEDIUM%/*} ${PART_MEDIUM#*/}" | sudo nvidia-cuda-mps-control
+echo "sm_partition rm ${PART_SMALL%/*} ${PART_SMALL#*/}" | sudo nvidia-cuda-mps-control
+
+# 关闭 MPS。
+echo quit | sudo nvidia-cuda-mps-control
 ```
+
+`lspart` 输出里重点看 `used chunk`、`used SM` 和 `clients`：
+
+```text
+GPU           Partition                             free    used    free  used  clients
+                                                    chunk   chunk    SM    SM
+GPU-74d43ed3      -                                 0       10      0     80   -
+GPU-74d43ed3  Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       5       -     40   Yes
+GPU-74d43ed3  Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       3       -     24   Yes
+GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2       -     28   Yes
+```
+
+`sm_partition add ... 5/3/2` 里的数字是 chunk 数；实际对应多少 SM，以 `lspart` 的 `used SM` 为准。
 
 </Accordion>
+
+参考资料：[NVIDIA MPS Introduction](https://docs.nvidia.com/deploy/mps/introduction.html)、[NVIDIA MPS Common Tasks](https://docs.nvidia.com/deploy/mps/appendix-common-tasks.html)、[NVIDIA MPS Tools and Interface Reference](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)
 
 #### 3.3 Multi-Instance GPU (MIG)
 
