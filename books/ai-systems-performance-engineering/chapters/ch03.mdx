@@ -1523,11 +1523,30 @@ MPS 主要解决 **compute sharing 和调度并发**，不是硬隔离方案。�
 
 <Accordion title="MPS 配置示例">
 
-下面的例子使用配套脚本 [mps_demo.py](/books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py)。脚本会启动多个 Python 子进程，每个子进程在 GPU 上反复执行矩阵乘法，用来验证多个 CUDA 进程是否通过 MPS 共享同一张 GPU。
+常用的 MPS 配置和查看命令如下：
 
-**Basic MPS**
+```bash
+# CUDA_VISIBLE_DEVICES 控制当前进程可见的 GPU；0 表示只看到 GPU 0。
+# 如果要设置多个 GPU，可以用逗号分隔，例如 0,1。
+# 启动 MPS control daemon，并让它只绑定 GPU 0。
+# CUDA client 连接时，会按需拉起 nvidia-cuda-mps-server。
+sudo env CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d
 
-`run_basic_comparison.sh` 会跑两轮：第一轮不开 MPS，第二轮启动 MPS 后再跑同一个 demo。两轮使用相同的 worker 数、矩阵大小和运行时长，最后用所有 worker 的总 `iters` 近似比较吞吐量。
+# 查看当前 MPS client 和 server。
+echo ps | sudo nvidia-cuda-mps-control
+
+# 多个 client 的 SERVER 相同，表示它们连接到同一个 MPS server。
+PID       ID        SERVER         DEVICE                    NAMESPACE      COMMAND
+3817508   1         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+3817500   2         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+
+# 关闭 MPS。
+echo quit | sudo nvidia-cuda-mps-control
+```
+
+**基本 MPS 示例**
+
+[mps_demo.py](/books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py) 会启动多个 Python 子进程，让它们在同一张 GPU 上反复执行矩阵乘法，模拟多个 CUDA 进程共享 GPU 的场景。[run_basic_comparison.sh](/books/ai-systems-performance-engineering/chapters/ch03/mps/run_basic_comparison.sh) 会跑两轮：第一轮不开 MPS，第二轮开启 MPS 后运行同一个 demo。两轮使用相同的 worker 数、矩阵大小和运行时长，最后比较所有 worker 完成的总矩阵乘法次数。
 
 ```bash
 # 进入 ch03 代码目录
@@ -1612,85 +1631,75 @@ mode              total_iters
 without_mps            394603
 with_mps               464780
 mps / without_mps = 1.18x
-# total_iters 是所有 worker 的 iters 之和；这里 MPS 版本约为不开 MPS 的 1.18 倍。
+# total_iters 是所有 worker 完成的总矩阵乘法次数；这里 MPS 版本约为不开 MPS 的 1.18 倍。
 ```
 
-这段输出可以从几个关键信号判断：
+这段输出里有几个地方值得注意：
 
-- **吞吐提升**：这组 demo 中，开启 MPS 后总吞吐约提升 `18%`。两轮实验都使用 `4` 个 worker、`N=1024`、运行 `60` 秒，因此可以用所有 worker 的 `iters` 之和近似表示总吞吐。不开 MPS 时总共完成 `394603` 次矩阵乘法；开启 MPS 后完成 `464780` 次，`464780 / 394603 ≈ 1.18x`。
-- **MPS client**：实际运行 CUDA work 的应用进程。这里就是 `4` 个 `python3` worker，它们真正发起矩阵乘法 kernel。`echo ps | sudo nvidia-cuda-mps-control` 能看到多个 client PID，并且它们的 `SERVER` 都是 `3817822`，说明这些 Python 进程连接到了同一个 MPS server。
-- **MPS server**：中间代理进程，也就是 `nvidia-cuda-mps-server`。它代表多个 client 统一持有 GPU context，并把这些 client 的 GPU work 提交给 GPU。`nvidia-smi` 的进程表里能看到 `nvidia-cuda-mps-server`，说明这些 Python worker 正在通过 MPS server 使用 GPU。
+- **吞吐提升**：两轮实验都使用 `4` 个 worker、`N=1024`、运行 `60` 秒，因此可以用总矩阵乘法次数近似比较吞吐。**不开 MPS 时完成 `394603` 次，开启 MPS 后完成 `464780` 次，对应吞吐约为不开 MPS 的 `1.18x`**。
+- **MPS client**：实际运行 CUDA work 的应用进程。这里就是 `4` 个 `python3` worker，它们的 `SERVER` 都是 `3817822`，说明它们连接到了同一个 MPS server。
+- **MPS server**：中间代理进程，也就是 `nvidia-cuda-mps-server`。它代表多个 client 统一持有 GPU context，并把这些 client 的 GPU work 提交给 GPU。
 
-**Multiple Partitions Example：静态 SM 分区**
+**静态 SM 分区示例**
 
 Static SM partitioning 适用于 Ampere 及更新架构。它在 MPS 之上进一步创建独占 SM partition，让不同 client 使用不同的 SM 分区。
+
+[run_static_partition_demo.sh](/books/ai-systems-performance-engineering/chapters/ch03/mps/run_static_partition_demo.sh) 会先跑一轮 Basic MPS，再启动 `-S` 模式的 MPS control daemon 做 static SM partitioning。两轮都运行相同数量的 `mps_demo.py` client，最后对比 Basic MPS 和 static partitioning 完成的总矩阵乘法次数。
 
 ```bash
 # 进入 ch03 代码目录
 cd books/ai-systems-performance-engineering/chapters/ch03
 
-# 查询 GPU 0 的 UUID，并写入变量。
-GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
-echo "$GPU_UUID"
+GPU_INDEX=0 RUN_SECONDS=60 N=1024 PARTITION_CHUNKS="7 7 7 6" ./mps/run_static_partition_demo.sh
+```
 
-# 启动支持 static SM partitioning 的 MPS control daemon。
+`7 7 7 6` 表示为 `4` 个 client 创建 `4` 个大小接近的 partition，用来做接近平均的 SM 切分。
+
+静态 SM 分区常用的配置和查看命令如下：
+
+```bash
+# CUDA_VISIBLE_DEVICES 控制当前进程可见的 GPU；0 表示只看到 GPU 0。
+# 如果要设置多个 GPU，可以用逗号分隔，例如 0,1。
+# 以 -S 模式启动 MPS control daemon，并让它只绑定 GPU 0。
 sudo env CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d -S
-unset CUDA_VISIBLE_DEVICES
 
-# 查看当前分区状态。
+# 查询目标 GPU 的 UUID。
+GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
+
+# 查看当前 SM partition 状态。
 echo "lspart" | sudo nvidia-cuda-mps-control
 
-# 创建三个不同大小的 SM partition。
-PART_LARGE=$(echo "sm_partition add $GPU_UUID 5" | sudo nvidia-cuda-mps-control | tail -n 1)
-PART_MEDIUM=$(echo "sm_partition add $GPU_UUID 3" | sudo nvidia-cuda-mps-control | tail -n 1)
-PART_SMALL=$(echo "sm_partition add $GPU_UUID 2" | sudo nvidia-cuda-mps-control | tail -n 1)
+# 创建四个大小接近的 SM partition。
+PART_0=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_1=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_2=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_3=$(echo "sm_partition add $GPU_UUID 6" | sudo nvidia-cuda-mps-control | tail -n 1)
 
-echo "$PART_LARGE"
-echo "$PART_MEDIUM"
-echo "$PART_SMALL"
+# CUDA client 初始化前设置 CUDA_MPS_SM_PARTITION，绑定到指定 partition。
+CUDA_MPS_SM_PARTITION="$PART_0" uv run python mps/mps_demo.py --workers 1 --seconds 60
 
-# 分别把三个 client 绑定到不同 partition。
-CUDA_MPS_SM_PARTITION="$PART_LARGE" \
-  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
-
-CUDA_MPS_SM_PARTITION="$PART_MEDIUM" \
-  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
-
-CUDA_MPS_SM_PARTITION="$PART_SMALL" \
-  uv run python mps/mps_demo.py --workers 1 --seconds 60 &
-
-sleep 5
-
-# 查看分区使用状态。clients 为 Yes 表示已有 client 使用该 partition。
-echo "lspart" | sudo nvidia-cuda-mps-control
-
-# 查看 MPS client 和 MPS server。
-echo ps | sudo nvidia-cuda-mps-control
-nvidia-smi
-
-wait
-
-# 删除 partition。PART_LARGE%/* 是 GPU UUID，PART_LARGE#*/ 是 partition token。
-echo "sm_partition rm ${PART_LARGE%/*} ${PART_LARGE#*/}" | sudo nvidia-cuda-mps-control
-echo "sm_partition rm ${PART_MEDIUM%/*} ${PART_MEDIUM#*/}" | sudo nvidia-cuda-mps-control
-echo "sm_partition rm ${PART_SMALL%/*} ${PART_SMALL#*/}" | sudo nvidia-cuda-mps-control
-
-# 关闭 MPS。
+# 删除 partition 并关闭 MPS。
+echo "sm_partition rm ${PART_0%/*} ${PART_0#*/}" | sudo nvidia-cuda-mps-control
 echo quit | sudo nvidia-cuda-mps-control
 ```
 
-`lspart` 输出里重点看 `used chunk`、`used SM` 和 `clients`：
+查看命令的输出示例如下：
 
 ```text
+# echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control
+GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+# echo "lspart" | sudo nvidia-cuda-mps-control
 GPU           Partition                             free    used    free  used  clients
                                                     chunk   chunk    SM    SM
-GPU-74d43ed3      -                                 0       10      0     80   -
-GPU-74d43ed3  Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       5       -     40   Yes
-GPU-74d43ed3  Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       3       -     24   Yes
-GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2       -     28   Yes
+GPU-74d43ed3      -                                 0       27      0     108  -
+GPU-74d43ed3  Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
+GPU-74d43ed3  Cx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
+GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       7       -     28   Yes
+GPU-74d43ed3  Ax4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       6       -     24   Yes
 ```
 
-`sm_partition add ... 5/3/2` 里的数字是 chunk 数；实际对应多少 SM，以 `lspart` 的 `used SM` 为准。
+`clients=Yes` 表示已有 client 使用该 partition；`used chunk` 是分配的 chunk 数，实际对应多少 SM 以 `used SM` 为准。
 
 </Accordion>
 
