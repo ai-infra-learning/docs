@@ -1543,10 +1543,10 @@ GPU_INDEX=0 WORKERS=4 SECONDS=60 N=1024 ./mps/run_basic_comparison.sh
 worker 输出大致如下：
 
 ```text
-worker=0 pid=281301 iters=18420 device=NVIDIA A100-SXM4-80GB
-worker=1 pid=281302 iters=18302 device=NVIDIA A100-SXM4-80GB
-worker=2 pid=281303 iters=18155 device=NVIDIA A100-SXM4-80GB
-worker=3 pid=281304 iters=18091 device=NVIDIA A100-SXM4-80GB
+worker=0 pid=281301 iters=18420 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+worker=1 pid=281302 iters=18302 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+worker=2 pid=281303 iters=18155 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+worker=3 pid=281304 iters=18091 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 ```
 
 最后会汇总不开 MPS 与开启 MPS 的总 `iters`：

@@ -20,6 +20,8 @@ def worker(worker_id: int, device: int, seconds: int, n: int) -> None:
 
     # 使用指定 CUDA device。默认是 cuda:0。
     torch.cuda.set_device(device)
+    device_name = torch.cuda.get_device_name(device)
+    device_uuid = torch.cuda.get_device_properties(device).uuid
 
     # 创建两个 n x n 的 GPU 矩阵。
     # n 越大，计算量和显存占用越高。
@@ -35,7 +37,7 @@ def worker(worker_id: int, device: int, seconds: int, n: int) -> None:
     start = time.perf_counter()
     iters = 0
 
-    while time.perf_counter() - start < seconds:
+    while time.perf_counter() - start < seconds or iters == 0:
         _ = a @ b
         iters += 1
 
@@ -49,7 +51,7 @@ def worker(worker_id: int, device: int, seconds: int, n: int) -> None:
     # PID 可以和 `echo ps | nvidia-cuda-mps-control` 的输出对应起来。
     print(
         f"worker={worker_id} pid={os.getpid()} "
-        f"iters={iters} device={torch.cuda.get_device_name(device)}",
+        f"iters={iters} cuda:{device}={device_name} uuid={device_uuid}",
         flush=True,
     )
 

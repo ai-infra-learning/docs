@@ -66,7 +66,7 @@ run_without_mps() {
   "${SUDO[@]}" nvidia-smi -i "$GPU_INDEX" -c DEFAULT >/dev/null
 
   cd "$CH03_DIR"
-  run_demo | tee "$BASELINE_OUT"
+  run_demo 2>&1 | tee "$BASELINE_OUT"
 }
 
 run_with_mps() {
@@ -121,6 +121,9 @@ print_summary() {
   printf "%-16s %12s\n" "without_mps" "$baseline_iters"
   printf "%-16s %12s\n" "with_mps" "$mps_iters"
   echo "mps / without_mps = $ratio"
+  if [[ "$baseline_iters" -eq 0 || "$mps_iters" -eq 0 ]]; then
+    echo "Warning: one run reported 0 iterations. Check the logs above for CUDA errors or use a smaller N."
+  fi
   echo
   echo "Note: higher total_iters is better. MPS is not guaranteed to improve every workload."
 }
