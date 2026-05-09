@@ -1644,6 +1644,8 @@ mps / without_mps = 1.18x
 
 Static SM partitioning 适用于 Ampere 及更新架构。它在 MPS 之上进一步创建独占 SM partition，让不同 client 使用不同的 SM 分区。
 
+这个功能还依赖 `nvidia-cuda-mps-control` 本身支持 `-S`、`sm_partition` 和 `lspart`。如果 `nvidia-cuda-mps-control --help` 里没有这些选项或命令，说明当前 driver/MPS 工具版本不能运行 static SM partitioning。
+
 [run_static_partition_demo.sh](/books/ai-systems-performance-engineering/chapters/ch03/mps/run_static_partition_demo.sh) 会先跑一轮 Basic MPS，再启动 `-S` 模式的 MPS control daemon 做 static SM partitioning。两轮都运行相同数量的 `mps_demo.py` client，最后对比 Basic MPS 和 static partitioning 完成的总矩阵乘法次数。
 
 ```bash
@@ -1669,11 +1671,16 @@ GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
 # 查看当前 SM partition 状态。
 echo "lspart" | sudo nvidia-cuda-mps-control
 
+# 从 "Partition GPU-.../... created" 输出中提取 CUDA_MPS_SM_PARTITION 需要的分区 ID。
+parse_partition() {
+  sed -nE 's/^.*(GPU-[^[:space:]]+\/[^[:space:]]+).*$/\1/p' | tail -n 1
+}
+
 # 创建四个大小接近的 SM partition。
-PART_0=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
-PART_1=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
-PART_2=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | tail -n 1)
-PART_3=$(echo "sm_partition add $GPU_UUID 6" | sudo nvidia-cuda-mps-control | tail -n 1)
+PART_0=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
+PART_1=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
+PART_2=$(echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control | parse_partition)
+PART_3=$(echo "sm_partition add $GPU_UUID 6" | sudo nvidia-cuda-mps-control | parse_partition)
 
 # CUDA client 初始化前设置 CUDA_MPS_SM_PARTITION，绑定到指定 partition。
 CUDA_MPS_SM_PARTITION="$PART_0" uv run python mps/mps_demo.py --workers 1 --seconds 60
@@ -1687,7 +1694,7 @@ echo quit | sudo nvidia-cuda-mps-control
 
 ```text
 # echo "sm_partition add $GPU_UUID 7" | sudo nvidia-cuda-mps-control
-GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Partition GPU-74d43ed3-cdf7-e667-3644-bf5b4f46ed65/Dx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA created
 
 # echo "lspart" | sudo nvidia-cuda-mps-control
 GPU           Partition                             free    used    free  used  clients

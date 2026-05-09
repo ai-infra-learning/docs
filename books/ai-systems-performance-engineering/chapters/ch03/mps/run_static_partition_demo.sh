@@ -190,12 +190,16 @@ run_basic_mps() {
 
 create_partition() {
   local chunk="$1"
+  local output
   local partition
 
   # 创建指定 chunk 数的 SM partition。
-  partition="$(echo "sm_partition add $GPU_UUID $chunk" | "${SUDO[@]}" nvidia-cuda-mps-control | tail -n 1 | tr -d '[:space:]')"
+  # 新版 MPS control 的输出形如 "Partition GPU-.../... created"。
+  # CUDA_MPS_SM_PARTITION 只接受中间的 "GPU-.../..." 这一段。
+  output="$(echo "sm_partition add $GPU_UUID $chunk" | "${SUDO[@]}" nvidia-cuda-mps-control)"
+  partition="$(sed -nE 's/^.*(GPU-[^[:space:]]+\/[^[:space:]]+).*$/\1/p' <<<"$output" | tail -n 1)"
   if [[ "$partition" != */* ]]; then
-    echo "Failed to create SM partition for chunk=$chunk. Output: $partition" >&2
+    echo "Failed to create SM partition for chunk=$chunk. Output: $output" >&2
     exit 1
   fi
 
