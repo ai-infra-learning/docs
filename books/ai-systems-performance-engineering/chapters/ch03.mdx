@@ -1521,46 +1521,105 @@ MPS 的典型场景是多个小推理任务、多个 MPI rank、短 kernel 组�
 
 MPS 主要解决 **compute sharing 和调度并发**，不是硬隔离方案。它不会像 MIG 一样切分 GPU memory；多个 client 仍共享同一张 GPU 的显存，一个进程 OOM 可能影响同一 GPU 上的其他进程。默认情况下，MPS client 通常运行在同一个 Unix user 下；多用户共享时也不等于安全隔离。需要强隔离时，应优先考虑 MIG。MPS 还可以通过 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 限制 client 可使用的执行资源比例，例如 `50` 表示限制到大约 50% 的 SM execution capacity。
 
-<Accordion title="MPS 配置与验证步骤">
+<Accordion title="MPS 配置示例">
 
-下面的例子使用配套脚本 `books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py`。脚本会启动多个 Python 子进程，每个子进程在 GPU 上反复执行矩阵乘法，用来验证多个 CUDA 进程是否通过 MPS 共享同一张 GPU。
+下面的例子使用配套脚本 [mps_demo.py](/books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py)。脚本会启动多个 Python 子进程，每个子进程在 GPU 上反复执行矩阵乘法，用来验证多个 CUDA 进程是否通过 MPS 共享同一张 GPU。
 
 **Basic MPS**
 
-`run_basic_comparison.sh` 会先在不开 MPS 的情况下运行 demo，再启动 MPS 并重复运行同一个 demo。脚本会自动设置 `EXCLUSIVE_PROCESS`、启动 `nvidia-cuda-mps-control -d`、查看 MPS client 和 `nvidia-cuda-mps-server`，最后汇总两次运行的总 `iters`。脚本通过 Python 的 `--device` 指定目标 GPU，不依赖 `CUDA_VISIBLE_DEVICES` 做设备选择，避免 device index 重映射带来的混淆。
+`run_basic_comparison.sh` 会跑两轮：第一轮不开 MPS，第二轮启动 MPS 后再跑同一个 demo。两轮使用相同的 worker 数、矩阵大小和运行时长，最后用所有 worker 的总 `iters` 近似比较吞吐量。
 
 ```bash
 # 进入 ch03 代码目录
 cd books/ai-systems-performance-engineering/chapters/ch03
 
-# 默认使用 GPU 0、4 个 worker、运行 60 秒、矩阵大小 1024。
+# 默认使用 GPU 0、4 个 worker、运行 30 秒、矩阵大小 1024。
 ./mps/run_basic_comparison.sh
 
 # 也可以通过环境变量调整参数。
 GPU_INDEX=0 WORKERS=4 RUN_SECONDS=60 N=1024 ./mps/run_basic_comparison.sh
 ```
 
-worker 输出大致如下：
+实际输出示例如下：
 
 ```text
-worker=0 pid=281301 iters=18420 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
-worker=1 pid=281302 iters=18302 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
-worker=2 pid=281303 iters=18155 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
-worker=3 pid=281304 iters=18091 cuda:0=NVIDIA A100-SXM4-80GB uuid=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
-```
+GPU_INDEX=0
+WORKERS=4
+RUN_SECONDS=60
+N=1024
+# GPU_INDEX 表示目标 GPU 编号；WORKERS 表示并发 Python worker 数；
+# RUN_SECONDS 表示每轮运行时长；N 表示矩阵乘法的矩阵大小。
 
-最后会汇总不开 MPS 与开启 MPS 的总 `iters`：
+================================================================================
+Running without MPS
+================================================================================
+# iters 表示该 worker 在 60 秒内完成的矩阵乘法次数。
+worker=0 pid=3811977 iters=98663 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=3 pid=3811980 iters=98640 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=2 pid=3811979 iters=98640 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=1 pid=3811978 iters=98660 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
 
-```text
+================================================================================
+Running with MPS
+================================================================================
+# echo ps | sudo nvidia-cuda-mps-control
+--------------------------------------------------------------------------------
+# SERVER 是 nvidia-cuda-mps-server 的 PID；这里 4 个 worker 都连接到同一个 SERVER。
+PID       ID        SERVER         DEVICE                    NAMESPACE      COMMAND
+3817508   1         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+3817500   2         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+3817499   3         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+3817504   4         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
+
+# nvidia-smi -i 0
+--------------------------------------------------------------------------------
+Sat May  9 04:24:00 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.20             Driver Version: 580.126.20     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-80GB          Off |   00000000:01:00.0 Off |                    0 |
+| N/A   45C    P0            280W /  275W |    1915MiB /  81920MiB |    100%   E. Process |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+# Compute M. 显示 E. Process，表示 GPU 处于 EXCLUSIVE_PROCESS compute mode。
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         3817499    M+C   ...apters/ch03/.venv/bin/python3        466MiB |
+|    0   N/A  N/A         3817500    M+C   ...apters/ch03/.venv/bin/python3        466MiB |
+|    0   N/A  N/A         3817504    M+C   ...apters/ch03/.venv/bin/python3        466MiB |
+|    0   N/A  N/A         3817508    M+C   ...apters/ch03/.venv/bin/python3        466MiB |
+|    0   N/A  N/A         3817822      C   nvidia-cuda-mps-server                   36MiB |
++-----------------------------------------------------------------------------------------+
+# Processes 表里出现 nvidia-cuda-mps-server，说明 worker 正在通过 MPS server 使用 GPU。
+
+worker=3 pid=3817508 iters=116200 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=1 pid=3817500 iters=116200 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=0 pid=3817499 iters=116180 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+worker=2 pid=3817504 iters=116200 cuda:0=NVIDIA A100-SXM4-80GB uuid=f707b56f-f3ae-f293-8278-b76d17e8adc4
+
+================================================================================
 Benchmark summary
 ================================================================================
 mode              total_iters
-without_mps             72100
-with_mps                80650
-mps / without_mps = 1.12x
+without_mps            394603
+with_mps               464780
+mps / without_mps = 1.18x
+# total_iters 是所有 worker 的 iters 之和；这里 MPS 版本约为不开 MPS 的 1.18 倍。
 ```
 
-脚本运行到 MPS 阶段时，`echo ps | sudo nvidia-cuda-mps-control` 能看到多个 client PID；`nvidia-smi` 能看到 `nvidia-cuda-mps-server`。这两个现象同时出现，就说明这些 Python 进程正在通过 MPS server 使用 GPU。
+这段输出可以从几个关键信号判断：
+
+- **吞吐提升**：这组 demo 中，开启 MPS 后总吞吐约提升 `18%`。两轮实验都使用 `4` 个 worker、`N=1024`、运行 `60` 秒，因此可以用所有 worker 的 `iters` 之和近似表示总吞吐。不开 MPS 时总共完成 `394603` 次矩阵乘法；开启 MPS 后完成 `464780` 次，`464780 / 394603 ≈ 1.18x`。
+- **MPS client**：实际运行 CUDA work 的应用进程。这里就是 `4` 个 `python3` worker，它们真正发起矩阵乘法 kernel。`echo ps | sudo nvidia-cuda-mps-control` 能看到多个 client PID，并且它们的 `SERVER` 都是 `3817822`，说明这些 Python 进程连接到了同一个 MPS server。
+- **MPS server**：中间代理进程，也就是 `nvidia-cuda-mps-server`。它代表多个 client 统一持有 GPU context，并把这些 client 的 GPU work 提交给 GPU。`nvidia-smi` 的进程表里能看到 `nvidia-cuda-mps-server`，说明这些 Python worker 正在通过 MPS server 使用 GPU。
 
 **Multiple Partitions Example：静态 SM 分区**
 
@@ -1635,7 +1694,11 @@ GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2       -     28   Y
 
 </Accordion>
 
-参考资料：[NVIDIA MPS Introduction](https://docs.nvidia.com/deploy/mps/introduction.html)、[NVIDIA MPS Common Tasks](https://docs.nvidia.com/deploy/mps/appendix-common-tasks.html)、[NVIDIA MPS Tools and Interface Reference](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)
+参考资料：
+
+- [NVIDIA MPS Introduction](https://docs.nvidia.com/deploy/mps/introduction.html)
+- [NVIDIA MPS Common Tasks](https://docs.nvidia.com/deploy/mps/appendix-common-tasks.html)
+- [NVIDIA MPS Tools and Interface Reference](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)
 
 #### 3.3 Multi-Instance GPU (MIG)
 

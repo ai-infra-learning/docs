@@ -11,14 +11,16 @@ import os
 import time
 
 
-def worker(worker_id: int, device: int, seconds: int, n: int) -> None:
+def worker(worker_id: int, seconds: int, n: int) -> None:
     """单个 worker 进程执行的逻辑。"""
 
     # torch 放在 worker 内部 import，避免主进程过早初始化 CUDA。
     # 多进程 CUDA 程序建议使用 spawn 启动方式。
     import torch
 
-    # 使用指定 CUDA device。默认是 cuda:0。
+    # 脚本通过 CUDA_VISIBLE_DEVICES 选择物理 GPU。
+    # Python 进程内部固定使用当前可见设备中的 cuda:0。
+    device = 0
     torch.cuda.set_device(device)
     device_name = torch.cuda.get_device_name(device)
     device_uuid = torch.cuda.get_device_properties(device).uuid
@@ -65,9 +67,6 @@ def main() -> None:
     # 每个 worker 都会创建自己的 CUDA context，用来验证多个进程是否通过 MPS 共享 GPU。
     parser.add_argument("--workers", type=int, default=4)
 
-    # 使用哪张 CUDA device。默认使用 cuda:0。
-    parser.add_argument("--device", type=int, default=0)
-
     # 每个 worker 持续执行 GPU 矩阵乘法的秒数。
     # 建议设置长一点，例如 60 秒，方便观察 nvidia-smi 和 mps-control 输出。
     parser.add_argument("--seconds", type=int, default=60)
@@ -82,7 +81,7 @@ def main() -> None:
     ctx = mp.get_context("spawn")
 
     procs = [
-        ctx.Process(target=worker, args=(i, args.device, args.seconds, args.n))
+        ctx.Process(target=worker, args=(i, args.seconds, args.n))
         for i in range(args.workers)
     ]
 
