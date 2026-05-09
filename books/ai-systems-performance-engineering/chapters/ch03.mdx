@@ -1509,17 +1509,21 @@ kubectl -n gpu-operator exec -it <nvidia-device-plugin-pod> \
 
 #### 3.2 Multi-Process Service (MPS)
 
-[NVIDIA Multi-Process Service（MPS）](https://docs.nvidia.com/deploy/mps/introduction.html) 是一种与 CUDA API 二进制兼容的客户端-服务端运行时，用来让多个协作式 CUDA 进程更高效地共享同一张 GPU。普通多进程共享 GPU 时，GPU scheduler 通常在不同进程之间做 time-slicing：先执行进程 A 的 kernel，再执行进程 B 的 kernel。如果这些 kernel 很短，或者进程之间存在等待间隙，GPU 可能在上下文切换和空闲之间来回摆动，整体利用率偏低。
+通常，当多个进程共享同一张 GPU 时，GPU 调度器会在它们之间做时间片切换。例如，如果两个 Python 进程各自都有一些 kernel 要在同一张 GPU 上运行，GPU 可能先执行一个进程的 kernel，再执行另一个进程的 kernel，如此往复。如果这些 kernel 很短，并且它们之间存在空闲间隔，GPU 就可能因为反复进行上下文切换、而不是把这些任务重叠执行，导致利用率不足。
 
-使用 MPS 时，需要先启动一个 MPS control daemon；当 CUDA client 连接时，它会按需拉起 `nvidia-cuda-mps-server`。**MPS 的本质是在多个进程之上创建一层共享的调度伞：只要 SM（Streaming Multiprocessors）、Tensor Cores 等 GPU 资源还有空余，GPU 就可以同时执行来自不同进程的 kernel，而不是在多个进程之间严格按时间片轮转。MPS 会把多个进程的 context 合并到一个 scheduler context 里，从而减少独立进程之间完整 context switch 和空闲等待的成本。**
+NVIDIA MPS 提供了一种机制，让多个进程可以在同一张 GPU 上并发运行，而不必严格依赖时间片切换。启用 MPS 后，只要 GPU 资源可用，例如 streaming multiprocessors（SMs）、Tensor Cores 等，GPU 就可以同时执行来自不同进程的 kernel。**MPS 本质上是把多个进程的上下文合并到一个调度上下文中。这样一来，就不必为独立进程之间的切换和空闲等待付出完整代价。**
 
 <Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-mps.png" alt="MPS 让多个 CUDA 进程通过同一个 MPS server 共享 GPU，减少普通 time-slicing 带来的上下文切换和空闲间隙" />
+  <img src="/books/ai-systems-performance-engineering/images/ch03-mps.png" alt="MPS 让多个 CUDA 进程通过共享调度上下文在同一张 GPU 上并发执行" />
 </Frame>
 
-MPS 的典型场景是多个小推理任务、多个 MPI rank、短 kernel 组合任务共用一张大 GPU。例如多个推理进程各自只使用部分显存和部分 SM 计算资源时，MPS 可以让它们更充分地并发运行，提高整体 GPU 利用率。单个训练或推理进程已经长期打满 GPU 时，MPS 不会让计算超过 100% 利用率，通常也不会带来收益。
+MPS 由以下几个组件组成：
 
-MPS 主要解决 **compute sharing 和调度并发**，不是硬隔离方案。它不会像 MIG 一样切分 GPU memory；多个 client 仍共享同一张 GPU 的显存，一个进程 OOM 可能影响同一 GPU 上的其他进程。默认情况下，MPS client 通常运行在同一个 Unix user 下；多用户共享时也不等于安全隔离。需要强隔离时，应优先考虑 MIG。MPS 还可以通过 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 限制 client 可使用的执行资源比例，例如 `50` 表示限制到大约 50% 的 SM execution capacity。
+- **Control daemon process**：control daemon 负责启动和停止 server，并协调 client 与 server 之间的连接。
+- **Client runtime**：MPS client runtime 内置在 CUDA Driver library 中，任何 CUDA 应用都可以透明地使用它。
+- **Server process**：server 是多个 client 共享的 GPU 连接，并负责在 client 之间提供并发执行能力。
+
+**MPS 的典型场景是：多个 MPI 进程或多个 CUDA 进程单独都无法占满 GPU 时，通过共享同一块 GPU 并发执行 kernel 来提高 GPU 利用率。** 单个训练或推理进程已经长期打满 GPU 时，MPS 不会让计算超过 100% 利用率，通常也不会带来收益。
 
 <Accordion title="MPS 配置示例">
 
