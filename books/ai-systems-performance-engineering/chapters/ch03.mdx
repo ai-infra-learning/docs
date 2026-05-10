@@ -1523,7 +1523,9 @@ MPS 由以下几个组件组成：
 - **Client runtime**：MPS client runtime 内置在 CUDA Driver library 中，任何 CUDA 应用都可以透明地使用它。
 - **Server process**：server 是多个 client 共享的 GPU 连接，并负责在 client 之间提供并发执行能力。
 
-**MPS 的典型场景是：多个 MPI 进程或多个 CUDA 进程单独都无法占满 GPU 时，通过共享同一块 GPU 并发执行 kernel 来提高 GPU 利用率。** 单个训练或推理进程已经长期打满 GPU 时，MPS 不会让计算超过 100% 利用率，通常也不会带来收益。
+**MPS 的典型场景是：多个 MPI 进程或多个 CUDA 进程单独都无法占满 GPU 时，通过共享同一块 GPU 并发执行 kernel 来提高 GPU 利用率。** 如果某个程序本身就将 GPU 完全占满到 100%，MPS 并不能让它变得更快，因为利用率无法超过 100%。
+
+**请注意，MPS 并不对 GPU 内存进行分区，因此所有进程将共享整个 GPU 内存空间。MPS 主要负责计算共享和调度。** 问题在于，某个进程可能会申请大量 GPU 内存，导致 GPU 上出现 OOM 错误，从而终止在该 GPU 上运行的所有其他进程。
 
 <Accordion title="MPS 配置示例">
 
