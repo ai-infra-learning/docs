@@ -1698,11 +1698,95 @@ GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2        -     28   
 
 </Accordion>
 
+<Accordion title="GPU Operator 中使用 MPS">
+
+GPU Operator 通过 NVIDIA device plugin 暴露 MPS 共享 GPU 资源。GPU Operator 的 [GPU sharing 文档](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html#applying-one-cluster-wide-configuration)使用 `devicePlugin.config` 指定 device plugin 的 ConfigMap；MPS 使用同一个配置入口，但 ConfigMap 里的共享字段是 `sharing.mps`。
+
+[NVIDIA device plugin 文档](https://github.com/NVIDIA/k8s-device-plugin#with-cuda-mps)说明，MPS 支持仍是 experimental，并且 MPS 共享当前不支持启用 MIG 的 device。
+
+下面示例把每张完整 GPU 切成 `4` 个 MPS 共享访问入口，并用 `renameByDefault: true` 暴露为 `nvidia.com/gpu.shared`：
+
+```yaml
+# mps-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mps-config
+  namespace: gpu-operator
+data:
+  mps-4: |-
+    version: v1
+    sharing:
+      mps:
+        renameByDefault: true
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4
+```
+
+`renameByDefault: true` 表示共享后的资源会改名暴露。原始资源名是 `nvidia.com/gpu`，开启后会变成 `nvidia.com/gpu.shared`；Pod 也需要申请 `nvidia.com/gpu.shared`。
+
+```bash
+# 创建 device plugin 配置
+kubectl apply -f mps-config.yaml
+
+# 让 GPU Operator 的 device plugin 使用 mps-config 里的 mps-4 配置
+# 这里沿用 GPU sharing 文档里的 devicePlugin.config 配置入口
+kubectl patch clusterpolicies.nvidia.com/cluster-policy \
+  -n gpu-operator \
+  --type merge \
+  -p '{"spec":{"devicePlugin":{"config":{"name":"mps-config","default":"mps-4"}}}}'
+
+# 查看节点是否暴露了 nvidia.com/gpu.shared
+kubectl describe node <node-name> | grep -A8 -E "Capacity|Allocatable"
+```
+
+工作负载申请 `nvidia.com/gpu.shared` 即可使用启用 MPS 共享的 GPU：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mps-vectoradd
+spec:
+  # 启动 4 个 Pod，对应前面每张 GPU 暴露的 4 个 MPS 共享访问入口
+  replicas: 4
+  selector:
+    matchLabels:
+      app: mps-vectoradd
+  template:
+    metadata:
+      labels:
+        app: mps-vectoradd
+    spec:
+      containers:
+        - name: cuda-sample-vectoradd
+          # CUDA sample 镜像，用来持续运行 vectorAdd 作为示例工作负载
+          image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda11.7.1-ubuntu20.04
+          command: ["/bin/bash", "-c"]
+          args:
+            # 循环执行 vectorAdd，方便持续观察 MPS client
+            - while true; do /cuda-samples/vectorAdd; sleep 1; done
+          resources:
+            limits:
+              # renameByDefault: true 后，Pod 需要申请 nvidia.com/gpu.shared
+              # 这里的 1 表示申请一个 MPS 共享访问入口
+              nvidia.com/gpu.shared: 1
+```
+
+GPU Operator 不会监控 GPU sharing ConfigMap 的内容变化。后续如果修改 `mps-config` 这个 ConfigMap，需要手动重启 device plugin DaemonSet 让新配置生效：
+
+```bash
+kubectl rollout restart -n gpu-operator daemonset/nvidia-device-plugin-daemonset
+```
+</Accordion>
+
 参考资料：
 
 - [NVIDIA MPS Introduction](https://docs.nvidia.com/deploy/mps/introduction.html)
 - [NVIDIA MPS Common Tasks](https://docs.nvidia.com/deploy/mps/appendix-common-tasks.html)
 - [NVIDIA MPS Tools and Interface Reference](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)
+- [NVIDIA Kubernetes Device Plugin: With CUDA MPS](https://github.com/NVIDIA/k8s-device-plugin#with-cuda-mps)
 
 #### 3.3 Multi-Instance GPU (MIG)
 
