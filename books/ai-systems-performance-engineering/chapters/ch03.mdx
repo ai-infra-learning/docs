@@ -1532,21 +1532,20 @@ MPS 由以下几个组件组成：
 常用的 MPS 配置和查看命令如下：
 
 ```bash
-# CUDA_VISIBLE_DEVICES 控制当前进程可见的 GPU；0 表示只看到 GPU 0。
-# 如果要设置多个 GPU，可以用逗号分隔，例如 0,1。
-# 启动 MPS control daemon，并让它只绑定 GPU 0。
-# CUDA client 连接时，会按需拉起 nvidia-cuda-mps-server。
+# CUDA_VISIBLE_DEVICES 控制当前进程可见的 GPU；0 表示只看到 GPU 0
+# 如果要设置多个 GPU，可以用逗号分隔，例如 0,1
+# 启动 MPS control daemon，并让它只绑定 GPU 0
+# CUDA client 连接时，会按需拉起 nvidia-cuda-mps-server
 sudo env CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d
 
-# 查看当前 MPS client 和 server。
+# 查看当前 MPS client 和 server
 echo ps | sudo nvidia-cuda-mps-control
-
-# 多个 client 的 SERVER 相同，表示它们连接到同一个 MPS server。
+# 多个 client 的 SERVER 相同，表示它们连接到同一个 MPS server
 PID       ID        SERVER         DEVICE                    NAMESPACE      COMMAND
 3817508   1         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
 3817500   2         3817822        GPU-f707b56f-f3ae-f293    4026531836     .../.venv/bin/python3
 
-# 关闭 MPS。
+# 关闭 MPS
 echo quit | sudo nvidia-cuda-mps-control
 ```
 
@@ -1558,10 +1557,10 @@ echo quit | sudo nvidia-cuda-mps-control
 # 进入 ch03 代码目录
 cd books/ai-systems-performance-engineering/chapters/ch03
 
-# 默认使用 GPU 0、4 个 worker、运行 30 秒、矩阵大小 1024。
+# 默认使用 GPU 0、4 个 worker、运行 30 秒、矩阵大小 1024
 ./mps/run_basic_comparison.sh
 
-# 也可以通过环境变量调整参数。
+# 也可以通过环境变量调整参数
 GPU_INDEX=0 WORKERS=4 RUN_SECONDS=60 N=1024 ./mps/run_basic_comparison.sh
 ```
 
@@ -1707,38 +1706,491 @@ GPU-74d43ed3  Bx4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  -       2        -     28   
 
 #### 3.3 Multi-Instance GPU (MIG)
 
-[NVIDIA MIG User Guide](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/)说明，MIG 会把支持的 GPU 划分为最多 7 个隔离实例，每个实例拥有专用计算和内存资源。应用通常把每个 MIG compute instance 看作一张较小的 CUDA GPU。
+[MIG](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/) 会把支持的 GPU 划分为最多 7 个隔离实例，每个实例拥有专用计算和 GPU 内存资源。MIG 从 NVIDIA Ampere 架构开始支持，也就是 compute capability `>= 8.0` 的部分数据中心 GPU；具体型号以 NVIDIA 的 [Supported GPUs](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-gpus.html) 列表为准。
+
+##### **MIG 的资源隔离**
+
+**MIG 适合多租户场景**，不同用户、容器、虚拟机或进程可以运行在不同 GPU 实例上，一个进程不会直接影响另一个进程的调度和资源边界。对云服务和共享集群来说，这种隔离能把一张大 GPU 切成多个可独立分配的小 GPU。
+
+每个 MIG 实例在 GPU 内部访问内存时都有独立路径，包括内部互连、L2 缓存分区、内存控制器和 DRAM 地址总线。这样即使其他实例的任务占满自己的缓存或 DRAM 接口，当前实例仍能获得更稳定的吞吐和延迟。MIG 也可以切分 SM、数据拷贝引擎、解码器等 GPU 引擎，为不同进程提供确定的服务质量（QoS）和故障隔离。
 
 <Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-mig-partitioning.png" alt="MIG profile 通过不同数量的计算切片和显存切片组合成 1g、2g、3g、7g 等 GPU instance" />
+  <img src="/books/ai-systems-performance-engineering/images/ch03-mig.jpg" alt="MIG 将一张 GPU 划分为多个彼此隔离的 GPU Instance" />
 </Frame>
 
-图源：[NVIDIA Multi-Instance GPU User Guide：MIG Profiles on A100](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/concepts.html#partitioning)
+##### **GPU Instance 和 Compute Instance**
+
+MIG 配置分两层：先创建 GPU Instance（GI），再创建 Compute Instance（CI）。
+
+- **GPU Instance（GI）**：GI 由一组 GPU 切片和 GPU 引擎组成，决定这个 MIG 实例的 GPU 内存容量、带宽和 QoS。
+- **Compute Instance（CI）**：CI 是在某个 GI 内继续划分出的计算实例，使用父 GI 的一部分 SM 切片。**CI 主要隔离计算资源，也就是 SM；它不提供独立的 GPU 内存隔离。** 多个 CI 可以共享同一个 GI 的 GPU 内存切片和 DMA、NVDEC 等引擎，但各自拥有独立的 SM 资源。
+
+CUDA 应用会把 CI 及其所属 GI 视为一个 CUDA device；多数场景可以用 `-C` 参数直接创建覆盖整个 GI 的默认 CI。
+
+##### **MIG 设备命名规则**
+
+[MIG 设备名称](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/mig-device-names.html) 描述了实例的资源形态。`xg.ygb` 表示一个 GPU Instance：`xg` 表示使用 `x` 份 GPU 计算切片，`ygb` 表示 GPU 内存容量档位。例如 `3g.40gb` 表示使用 3 份 GPU 计算切片和 40GB 档位的 GPU 内存。如果一个 GI 继续拆成多个 CI，名称会带上 `c`，格式为 `xc.xg.ygb`；例如 `1c.3g.40gb` 表示在 `3g.40gb` GI 内使用 1 份计算切片的 CI。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-mig-partitioning.png" alt="MIG profile 通过不同数量的计算切片和显存切片组合成 1g、2g、3g、7g 等 GPU Instance" />
+</Frame>
+
+<Accordion title="MIG 配置示例">
 
 ```bash
-# 查看支持的 GPU instance profile
-nvidia-smi mig -lgip
+# 查看 GPU 0 当前 MIG 状态
+# nvidia-smi 主表中的 MIG M. 会显示 Disabled 或 Enabled
+nvidia-smi -i 0
 
-# 启用 MIG 模式
+# 也可以只查询 MIG mode 字段
+nvidia-smi -i 0 --query-gpu=pci.bus_id,mig.mode.current --format=csv
+
+# 开启 GPU 0 的 MIG mode
+# A100 / A30 等 Ampere GPU 可能触发 GPU reset；执行前应确认该 GPU 上没有生产任务
 sudo nvidia-smi -i 0 -mig 1
 
-# 创建实例，profile ID 以 nvidia-smi mig -lgip 输出为准
-sudo nvidia-smi mig -cgi <profile_id> -C
+# 查看可创建的 GPU Instance profile
+# profile ID、显存大小和 SM 数以这条命令输出为准
+nvidia-smi mig -lgip
+
+# 示例输出：A100 40GB 上，profile ID 9 对应 MIG 3g.20gb
++-----------------------------------------------------------------------------+
+| GPU instance profiles:                                                      |
+| GPU   Name             ID    Instances   Memory     P2P    SM    DEC   ENC  |
+|                              Free/Total   GiB              CE    JPEG  OFA  |
+|=============================================================================|
+|   0  MIG 1g.5gb        19     7/7        4.75       No     14     0     0   |
+|                                                             1     0     0   |
++-----------------------------------------------------------------------------+
+|   0  MIG 1g.5gb+me     20     1/1        4.75       No     14     1     0   |
+|                                                             1     1     1   |
++-----------------------------------------------------------------------------+
+|   0  MIG 1g.10gb       15     4/4        9.62       No     14     1     0   |
+|                                                             1     0     0   |
++-----------------------------------------------------------------------------+
+|   0  MIG 2g.10gb       14     3/3        9.62       No     28     1     0   |
+|                                                             2     0     0   |
++-----------------------------------------------------------------------------+
+|   0  MIG 3g.20gb        9     2/2        19.50      No     42     2     0   |
+|                                                             3     0     0   |
++-----------------------------------------------------------------------------+
+|   0  MIG 4g.20gb        5     1/1        19.50      No     56     2     0   |
+|                                                             4     0     0   |
++-----------------------------------------------------------------------------+
+|   0  MIG 7g.40gb        0     1/1        39.25      No     98     5     0   |
+|                                                             7     1     1   |
++-----------------------------------------------------------------------------+
+
+# 查看这些 profile 可以放在 GPU 的哪些位置
+# {0,4}:4 表示该 profile 占 4 个 GPU slice，可以从位置 0 或 4 开始放置
+nvidia-smi mig -lgipp
+GPU  0 Profile ID 19 Placements: {0,1,2,3,4,5,6}:1
+GPU  0 Profile ID 20 Placements: {0,1,2,3,4,5,6}:1
+GPU  0 Profile ID 15 Placements: {0,2,4,6}:2
+GPU  0 Profile ID 14 Placements: {0,2,4}:2
+GPU  0 Profile ID  9 Placements: {0,4}:4
+GPU  0 Profile ID  5 Placement : {0}:4
+GPU  0 Profile ID  0 Placement : {0}:8
+
+# 创建两个 GPU Instance，并同时创建默认 Compute Instance
+# -cgi 可以接收 profile ID、短名称或完整 profile 名，例如 9、3g.20gb、MIG 3g.20gb
+# -cgi 里的 9 是 profile ID，来自 -lgip 输出的 ID 列
+# -cgi 里的 3g.20gb 是 profile 名称，来自 -lgip 输出的 Name 列
+# -C 表示为每个 GI 创建默认 CI；没有 CI 时，CUDA 程序还不能使用 MIG device
+# 如果创建 GI 时没有带 -C，需要后续用 -lcip 查看 CI profile，再用 -cci 创建 CI
+# 例如 sudo nvidia-smi mig -cci 0,0,0 -gi 1 表示在 GI 1 中创建 3 个 profile ID 为 0 的 CI
+sudo nvidia-smi mig -cgi 9,3g.20gb -C
+Successfully created GPU instance ID  2 on GPU  0 using profile MIG 3g.20gb (ID  9)
+Successfully created compute instance ID  0 on GPU  0 GPU instance ID  2 using profile MIG 3g.20gb (ID  2)
+Successfully created GPU instance ID  1 on GPU  0 using profile MIG 3g.20gb (ID  9)
+Successfully created compute instance ID  0 on GPU  0 GPU instance ID  1 using profile MIG 3g.20gb (ID  2)
+
+# 查看已经创建的 GI
+sudo nvidia-smi mig -lgi
++----------------------------------------------------+
+| GPU instances:                                     |
+| GPU   Name          Profile  Instance   Placement  |
+|                       ID       ID       Start:Size |
+|====================================================|
+|   0  MIG 3g.20gb       9        1          4:4     |
++----------------------------------------------------+
+|   0  MIG 3g.20gb       9        2          0:4     |
++----------------------------------------------------+
+
+# 查看 CUDA 可以使用的 MIG device UUID
+nvidia-smi -L
+GPU 0: A100-SXM4-40GB (UUID: GPU-e86cb44c-6756-fd30-cd4a-1e6da3caf9b0)
+  MIG 3g.20gb Device 0: (UUID: MIG-c7384736-a75d-5afc-978f-d2f1294409fd)
+  MIG 3g.20gb Device 1: (UUID: MIG-a28ad590-3fda-56dd-84fc-0a0b96edc58d)
+
+# 通过 CUDA_VISIBLE_DEVICES 指定某个 MIG device
+# <script> 表示要运行的 CUDA 程序，例如推理服务、训练脚本或 benchmark
+CUDA_VISIBLE_DEVICES=MIG-c7384736-a75d-5afc-978f-d2f1294409fd <script> &
+CUDA_VISIBLE_DEVICES=MIG-a28ad590-3fda-56dd-84fc-0a0b96edc58d <script> &
+
+# nvidia-smi 可以看到进程分别运行在不同 GI / CI 上
+nvidia-smi
++-----------------------------------------------------------------------------+
+| MIG devices:                                                                |
++------------------+----------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |         Memory-Usage |        Vol|         Shared        |
+|      ID  ID  Dev |                      | SM     Unc| CE  ENC  DEC  OFA  JPG|
+|                  |                      |        ECC|                       |
+|==================+======================+===========+=======================|
+|  0    1   0   0  |     11MiB / 20224MiB | 42      0 |  3   0    2    0    0 |
++------------------+----------------------+-----------+-----------------------+
+|  0    2   0   1  |     11MiB / 20096MiB | 42      0 |  3   0    2    0    0 |
++------------------+----------------------+-----------+-----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|  No running processes found                                                 |
++-----------------------------------------------------------------------------+
+
+# 清理 MIG 配置前，先停止正在使用这些 MIG device 的进程
+sudo nvidia-smi mig -dci && sudo nvidia-smi mig -dgi
+
+# 关闭 GPU 0 的 MIG mode
+sudo nvidia-smi -i 0 -mig 0
 ```
 
-MIG profile 名称通常包含计算切片和 HBM 容量，例如 `1g.10gb`、`2g.20gb`、`3g.40gb`。不同 GPU 代际和显存容量对应的 profile 不同，生产配置应以官方 [Supported MIG Profiles](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html) 和 `nvidia-smi mig -lgip` 输出为准。
+如果想进一步提升并发，可以将一个 GI 拆成多个 Compute Instance（CI），把 SM 分配给多个 CUDA 程序。每个 CI 拥有独立的 SM 资源，适合多个小任务共享同一个 GI。
 
-| 维度 | MPS | MIG |
-| --- | --- | --- |
-| 资源模型 | 动态共享 | 固定硬分区 |
-| 隔离 | 软件协作，不是强租户隔离 | 硬件资源隔离，适合多租户 |
-| 空闲资源 | 可被其他 client 使用 | 空闲切片不能被其他实例借用 |
-| 通信 | 仍使用完整 GPU 的 P2P 能力 | MIG 模式下 GPU-to-GPU P2P 受限 |
-| 调整成本 | 启停 daemon 和 client 即可 | 需要排空 workload，变更 profile |
+```bash
+# 查看 GPU Instance ID 1 支持的 Compute Instance profile（由 sudo nvidia-smi mig -cgi 9 创建得到）
+# 这里的 GPU Instance ID 1 来自前面的 sudo nvidia-smi mig -lgi 输出
+sudo nvidia-smi mig -lcip -gi 1
++--------------------------------------------------------------------------------------+
+| Compute instance profiles:                                                           |
+| GPU     GPU       Name             Profile  Instances   Exclusive       Shared       |
+|       Instance                       ID     Free/Total     SM       DEC   ENC   OFA  |
+|         ID                                                          CE    JPEG       |
+|======================================================================================|
+|   0      1       MIG 1c.3g.20gb       0      3/3           14        2     0     0   |
+|                                                                      3     0         |
++--------------------------------------------------------------------------------------+
+|   0      1       MIG 2c.3g.20gb       1      1/1           28        2     0     0   |
+|                                                                      3     0         |
++--------------------------------------------------------------------------------------+
+|   0      1       MIG 3g.20gb          2*     1/1           42        2     0     0   |
+|                                                                      3     0         |
++--------------------------------------------------------------------------------------+
 
-<Warning>
-MIG 适合隔离小推理和多租户作业，不适合依赖 NVLink/NVSwitch P2P 的大规模训练。NVIDIA MIG 文档明确列出 GPU-to-GPU P2P 支持限制；张量并行、MoE expert 并行和 NCCL-heavy 训练通常需要完整 GPU。
-</Warning>
+# Profile ID 0 对应 MIG 1c.3g.20gb，可以用 -cci 0 创建
+# Profile ID 2* 里的 * 表示默认 CI profile，-C 会创建这个完整 CI
+# Free/Total 显示 3/3 表示当前还能创建 3 个，理论最多 3 个
+
+# 如果创建 GI 时带了 -C，需要先查看并删除默认 CI
+sudo nvidia-smi mig -lci -gi 1
+sudo nvidia-smi mig -dci -ci <compute_instance_id> -gi 1
+
+# 如果创建 GI 时没有带 -C，或者已经删除默认 CI，可以在 GI 1 里创建一个或多个 1c CI
+# -gi 1 表示目标 GPU Instance ID 是 1
+# -cci 0,0,0 是创建 3 个 1c CI 的例子，使用的 CI profile ID 都是 0
+sudo nvidia-smi mig -cci 0,0,0 -gi 1
+Successfully created compute instance ID  0 on GPU  0 GPU instance ID  1 using profile MIG 1c.3g.20gb (ID  0)
+Successfully created compute instance ID  1 on GPU  0 GPU instance ID  1 using profile MIG 1c.3g.20gb (ID  0)
+Successfully created compute instance ID  2 on GPU  0 GPU instance ID  1 using profile MIG 1c.3g.20gb (ID  0)
+
+# 创建后可以用 -lci 查看 GI 1 下的 CI
+sudo nvidia-smi mig -lci -gi 1
++-------------------------------------------------------+
+| Compute instances:                                    |
+| GPU     GPU       Name             Profile   Instance |
+|       Instance                       ID        ID     |
+|         ID                                            |
+|=======================================================|
+|   0      1       MIG 1c.3g.20gb       0         0     |
++-------------------------------------------------------+
+|   0      1       MIG 1c.3g.20gb       0         1     |
++-------------------------------------------------------+
+|   0      1       MIG 1c.3g.20gb       0         2     |
++-------------------------------------------------------+
+
+# nvidia-smi 会把 3 个 CI 枚举成 3 个 MIG device
+nvidia-smi
++-----------------------------------------------------------------------------+
+| MIG devices:                                                                |
++------------------+----------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |         Memory-Usage |        Vol|         Shared        |
+|      ID  ID  Dev |                      | SM     Unc| CE  ENC  DEC  OFA  JPG|
+|                  |                      |        ECC|                       |
+|==================+======================+===========+=======================|
+|  0    1   0   0  |     11MiB / 20224MiB | 14      0 |  3   0    2    0    0 |
++------------------+                      +-----------+-----------------------+
+|  0    1   1   1  |                      | 14      0 |  3   0    2    0    0 |
++------------------+                      +-----------+-----------------------+
+|  0    1   2   2  |                      | 14      0 |  3   0    2    0    0 |
++------------------+----------------------+-----------+-----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|  No running processes found                                                 |
++-----------------------------------------------------------------------------+
+
+# 分别指定 3 个 MIG device，启动 3 个 CUDA 程序
+CUDA_VISIBLE_DEVICES=MIG-c7384736-a75d-5afc-978f-d2f1294409fd <script> &
+CUDA_VISIBLE_DEVICES=MIG-c376546e-7559-5610-9721-124e8dbb1bc8 <script> &
+CUDA_VISIBLE_DEVICES=MIG-928edfb0-898f-53bd-bf24-c7e5d08a6852 <script> &
+
+# 再次查看 nvidia-smi，可以看到进程分别运行在 3 个 CI 上
+nvidia-smi
++-----------------------------------------------------------------------------+
+| MIG devices:                                                                |
++------------------+----------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |         Memory-Usage |        Vol|         Shared        |
+|      ID  ID  Dev |                      | SM     Unc| CE  ENC  DEC  OFA  JPG|
+|                  |                      |        ECC|                       |
+|==================+======================+===========+=======================|
+|  0    1   0   0  |    476MiB / 20224MiB | 14      0 |  3   0    2    0    0 |
++------------------+                      +-----------+-----------------------+
+|  0    1   1   1  |                      | 14      0 |  3   0    2    0    0 |
++------------------+                      +-----------+-----------------------+
+|  0    1   2   2  |                      | 14      0 |  3   0    2    0    0 |
++------------------+----------------------+-----------+-----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|    0    1    0      59785      C   <script>                         153MiB |
+|    0    1    1      59796      C   <script>                         153MiB |
+|    0    1    2      59885      C   <script>                         153MiB |
++-----------------------------------------------------------------------------+
+```
+
+</Accordion>
+
+<Accordion title="MIG 配置持久化">
+
+GI/CI 配置本身不会跨系统重启保留。生产环境通常使用 [`mig-parted`](https://github.com/NVIDIA/mig-parted) 重建固定的 MIG 切分形态。
+
+下面示例以 A100-SXM4-40GB 为例保存多套候选配置。`mig-devices` 里的 profile 名称来自 `nvidia-smi mig -lgip` 输出的 `Name` 列，例如 `MIG 3g.20gb` 对应配置里的 `"3g.20gb"`。
+
+```yaml
+# config.yaml
+version: v1
+mig-configs:
+  all-disabled:
+    - devices: all
+      mig-enabled: false
+
+  all-enabled:
+    - devices: all
+      mig-enabled: true
+      mig-devices: {}
+
+  2-3g-20gb:
+    - devices: [0]
+      mig-enabled: true
+      mig-devices:
+        "3g.20gb": 2
+
+  all-balanced:
+    - devices: all
+      mig-enabled: true
+      mig-devices:
+        "1g.5gb": 2
+        "2g.10gb": 1
+        "3g.20gb": 1
+```
+
+配置含义：
+
+- `mig-configs` 下面可以保存多套候选配置。每次执行 `nvidia-mig-parted apply -c <config-name>` 时，只会应用 `-c` 指定的那一套配置
+- `all-disabled`、`all-enabled`、`2-3g-20gb` 和 `all-balanced` 都是配置名称，后续 `apply` 时通过 `-c` 引用
+- `devices: [0]` 表示只配置 GPU 0
+- `devices: all` 表示配置节点上的所有 GPU
+- `mig-enabled: true` 表示启用 MIG mode
+- `mig-devices` 表示要创建的 GPU Instance profile 和数量，例如 `"3g.20gb": 2` 表示创建两个 `3g.20gb`
+
+常用操作如下：
+
+```bash
+# 应用固定的 MIG 切分形态
+sudo nvidia-mig-parted apply \
+  -f config.yaml \
+  -c 2-3g-20gb
+
+# 校验当前节点是否已经符合这个配置
+sudo nvidia-mig-parted assert \
+  -f config.yaml \
+  -c 2-3g-20gb
+
+# 导出当前 MIG 配置，方便生成初始 YAML
+sudo nvidia-mig-parted export
+
+# 验证 CUDA 可见的 MIG device
+nvidia-smi -L
+GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+  MIG 3g.20gb Device 0: (UUID: MIG-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa)
+  MIG 3g.20gb Device 1: (UUID: MIG-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb)
+```
+
+</Accordion>
+
+<Accordion title="MIG 与 MPS 结合使用">
+
+CUDA Multi-Process Service（MPS）可以让多个 CUDA 进程在 GPU 上并发执行。**MPS 和 MIG 可以结合使用，进一步提高某些 workload 的 GPU 利用率。** 具体做法是：先用 MIG 把一张 GPU 划分成多个隔离的 GPU Instance，再在某个 MIG device 内使用 MPS，让多个 CUDA 进程通过同一个 MPS server 并发提交任务。
+
+整体流程分三步：
+
+- 配置目标 MIG 切分形态，例如两个 `3g.40gb` MIG device
+- 为每个 MIG device 设置独立的 `CUDA_MPS_PIPE_DIRECTORY`，并启动一个独立的 MPS control daemon
+- 启动 CUDA 程序时，用 `CUDA_VISIBLE_DEVICES=<MIG_UUID>` 指定目标 MIG device
+
+MPS 文档通常建议使用 `EXCLUSIVE_PROCESS`，确保一张 GPU 只有一个 MPS server。MIG mode 下不使用这个模式，因为每个 MIG GPU Instance 需要独立的 MPS server。
+
+```bash
+# 创建两个 GPU Instance，并同时创建默认 Compute Instance
+# 这里以 GPU 0 上的两个 MIG 3g.40gb 为例；profile ID 以 -lgip 输出为准
+sudo nvidia-smi mig -i 0 -cgi 9,9 -C
+Successfully created GPU instance ID  2 on GPU  0 using profile MIG 3g.40gb (ID  9)
+Successfully created compute instance ID  0 on GPU  0 GPU instance ID  2 using profile MIG 3g.40gb (ID  2)
+Successfully created GPU instance ID  1 on GPU  0 using profile MIG 3g.40gb (ID  9)
+Successfully created compute instance ID  0 on GPU  0 GPU instance ID  1 using profile MIG 3g.40gb (ID  2)
+
+# 查看 MIG device UUID，后面会传给 CUDA_VISIBLE_DEVICES
+nvidia-smi -L
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-c08d91cb-e324-655c-71ba-7570956445bc)
+  MIG 3g.40gb Device 0: (UUID: MIG-405bbda1-6b05-535f-af26-79ccdc267be0)
+  MIG 3g.40gb Device 1: (UUID: MIG-b0a55a70-b1b0-529f-af26-79ccdc267be0)
+```
+
+下面是一个完整脚本。它会在两个 MIG device 上运行一个 demo 程序：每个 MIG device 启动一个独立的 MPS control daemon，并在对应 MIG device 上启动 workload。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-c08d91cb-e324-655c-71ba-7570956445bc)
+#   MIG 3g.40gb     Device  0: (UUID: MIG-405bbda1-6b05-535f-af26-79ccdc267be0)
+#   MIG 3g.40gb     Device  1: (UUID: MIG-b0a55a70-b1b0-529f-af26-79ccdc267be0)
+
+# MIG_DEVICES 保存要使用的 MIG device UUID
+# 每个 MIG UUID 对应一个独立的 MIG device
+MIG_DEVICES=(
+  "MIG-405bbda1-6b05-535f-af26-79ccdc267be0"
+  "MIG-b0a55a70-b1b0-529f-af26-79ccdc267be0"
+)
+
+for mig_device in "${MIG_DEVICES[@]}"; do
+  # CUDA_MPS_PIPE_DIRECTORY 指定 MPS control daemon 和 client 通信使用的 pipe directory
+  # 每个 MIG device 必须使用独立目录，避免不同 MPS server 混在一起
+  export CUDA_MPS_PIPE_DIRECTORY=/tmp/$mig_device
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY"
+
+  # CUDA_VISIBLE_DEVICES 指定当前 MPS control daemon 绑定哪个 MIG device
+  sudo CUDA_VISIBLE_DEVICES=$mig_device \
+       CUDA_MPS_PIPE_DIRECTORY=/tmp/$mig_device \
+       nvidia-cuda-mps-control -d
+
+  # 启动 demo 程序，并连接到同一个 MIG device 对应的 MPS server
+  CUDA_VISIBLE_DEVICES=$mig_device \
+  CUDA_MPS_PIPE_DIRECTORY=/tmp/$mig_device \
+  ./demo_cuda_app &
+done
+```
+
+脚本运行后，可以用 `nvidia-smi` 看到每个 MIG device 上各有一个 MPS server，以及对应的 CUDA client：
+
+```text
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0    1    0             3805    M+C   ./demo_cuda_app                         326MiB |
+|    0    1    0             3809      C   nvidia-cuda-mps-server                   60MiB |
+|    0    2    0             3817    M+C   ./demo_cuda_app                         326MiB |
+|    0    2    0             3819      C   nvidia-cuda-mps-server                   60MiB |
++-----------------------------------------------------------------------------------------+
+```
+
+</Accordion>
+
+
+<Accordion title="在 GPU Operator 中使用 MIG">
+
+[NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html) 通过 MIG Manager 管理 Kubernetes 节点上的 MIG 配置。安装 GPU Operator 时需要启用 MIG strategy，常见取值是 `single` 和 `mixed`：
+
+- `single` 适合节点上使用同一种 MIG profile 的场景，MIG device 通常继续通过 `nvidia.com/gpu` 这类资源暴露
+- `mixed` 适合同一节点上混合使用多种 MIG profile 的场景，资源会按 profile 暴露，例如 `nvidia.com/mig-1g.5gb`
+
+```bash
+# 安装时启用 MIG strategy
+helm install --wait --generate-name \
+  -n gpu-operator --create-namespace \
+  nvidia/gpu-operator \
+  --set mig.strategy=single
+
+# 已安装后也可以修改 ClusterPolicy
+kubectl patch clusterpolicies.nvidia.com/cluster-policy \
+  --type='json' \
+  -p='[{"op":"replace","path":"/spec/mig/strategy","value":"single"}]'
+```
+
+MIG Manager 使用 `mig-parted` 配置文件。默认配置来源由 `migManager.config` 指定：
+
+```yaml
+migManager:
+  config:
+    default: all-disabled
+    name: default-mig-parted-config
+```
+
+这里的含义是：
+
+- `name: default-mig-parted-config` 表示 MIG Manager 读取这个 ConfigMap 里的 `config.yaml`
+- `default: all-disabled` 表示默认使用 `mig-configs` 里的 `all-disabled` 这套配置
+- 节点上的 `nvidia.com/mig.config=<config-name>` label 会从这个 ConfigMap 里选择一套配置并应用
+
+如果想要自定义 MIG 配置，可以参考 [Example custom MIG configuration](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html#example-custom-mig-configuration)。
+
+可以用下面的命令查看当前配置：
+
+```bash
+# 查看 ClusterPolicy 中 MIG Manager 使用哪个默认配置和 ConfigMap
+kubectl get clusterpolicy cluster-policy -o yaml | grep -A5 migManager:
+
+# 查看 default-mig-parted-config 这个 ConfigMap 里的 config.yaml
+kubectl get cm -n gpu-operator default-mig-parted-config \
+  -o jsonpath='{.data.config\.yaml}'
+```
+
+配置 MIG 时，只需要在节点打上 `nvidia.com/mig.config` label，MIG Manager 会监听到 node label 变化，然后调用 `mig-parted` 应用目标配置。
+
+```bash
+# profile 名称来自 default-mig-parted-config 里的 mig-configs
+kubectl label nodes <node-name> \
+  nvidia.com/mig.config=all-1g.5gb \
+  --overwrite
+```
+
+工作负载申请资源时，根据 MIG strategy 使用对应的资源名：
+
+```yaml
+# single strategy: MIG device 通常作为 nvidia.com/gpu 暴露
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
+```yaml
+# mixed strategy: 按 MIG profile 申请资源
+resources:
+  limits:
+    nvidia.com/mig-1g.5gb: 1
+```
+
+</Accordion>
 
 #### 3.4 GPU 时钟与 ECC
 
