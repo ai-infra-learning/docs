@@ -112,7 +112,7 @@ GPU 规格表里会出现多种数值精度格式，它们决定了每个数字�
 低精度格式（FP8、FP4）的刻度很粗，需要 scaling factor 来补偿。
 
 <Frame caption="FP8、MXFP8、NVFP4 缩放策略对比。E = exponent（指数），M = mantissa（尾数）">
-  <img src="/books/ai-systems-performance-engineering/images/comparison-fp8-mxfp8-nvfp4.png" alt="Comparison of FP8, MXFP8, and NVFP4 low-precision formats" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-comparison-fp8-mxfp8-nvfp4.png" alt="Comparison of FP8, MXFP8, and NVFP4 low-precision formats" />
 </Frame>
 
 用称重类比：秤的刻度很粗，要称一批大小差别很大的物品——
@@ -144,7 +144,7 @@ GPU 规格表里会出现多种数值精度格式，它们决定了每个数字�
 - Tensor Core 根据索引从 B 矩阵的 K 个元素中选出对应的 K/2 个元素，只对它们做乘累加。
 
 <Frame caption="NVIDIA GPU 上 2:4（稀疏）矩阵乘法的示意图">
-  <img src="/books/ai-systems-performance-engineering/images/sparse-vs-dense-matrix-multiplication.png" alt="Illustration of 2:4 (sparse) matrix multiplication on NVIDIA GPUs" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-sparse-vs-dense-matrix-multiplication.png" alt="Illustration of 2:4 (sparse) matrix multiplication on NVIDIA GPUs" />
 </Frame>
 
 **参考资料**
@@ -249,13 +249,13 @@ Dense 模型（如早期 GPT 系列）对每个 token 使用全部 FFN 参数，
 **MoE 的核心做法是把每层的 FFN 替换为 N 个并列的独立 FFN（每个叫一个"专家"），由路由器（gating network）为每个 token 选出少量专家执行，将它们的输出加权合并后传入下一层，其余专家不参与计算。** 每个 token 只需经过少量专家的计算，而模型整体因为拥有 N 个专家，总知识容量远超同等计算量的 dense 模型。
 
 <Frame caption="4 个专家中只有 Expert 4 被激活（高亮），其余 3 个不参与当前 token 的计算">
-  <img src="/books/ai-systems-performance-engineering/images/moe.png" alt="MoE sparse model illustration showing only one expert activated out of four" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-moe.png" alt="MoE sparse model illustration showing only one expert activated out of four" />
 </Frame>
 
 LLM 由多层 Transformer 堆叠而成，每一层都有自己独立的一组专家和路由器。一个 token 从输入到输出会逐层经过所有层，每层的路由器独立为它选择不同的专家：
 
 <Frame caption="每层的路由器独立选择专家：Layer 1 选中 Expert 1，Layer 2 选中 Expert 3，Layer n 选中 Expert 2n">
-  <img src="/books/ai-systems-performance-engineering/images/moe-layer.png" alt="MoE layers showing different experts activated at each layer" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-moe-layer.png" alt="MoE layers showing different experts activated at each layer" />
 </Frame>
 
 ##### 2.3.1 从 Switch Transformer 到 DeepSeek MoE
@@ -268,7 +268,7 @@ LLM 由多层 Transformer 堆叠而成，每一层都有自己独立的一组专
 2. **细粒度专家**：把每个专家的粒度做细、数量做多（DeepSeek-V3 用 256 个 routed expert 选 8 个），让专业分工更精细。
 
 <Frame caption="左：dense 架构，每层使用单个 FFN。右：DeepSeek V3/R1 的 MoE 架构，MoE 层包含 1 个 shared expert + 256 个 routed expert，每个 token 只激活 9 个专家（1 个 shared + 8 个 routed），总参数 671B，活跃参数仅 37B。">
-  <img src="/books/ai-systems-performance-engineering/images/deepseek-moe.png" alt="Comparison of dense architecture vs DeepSeek V3/R1 MoE architecture" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-deepseek-moe.png" alt="Comparison of dense architecture vs DeepSeek V3/R1 MoE architecture" />
 </Frame>
 
 ##### 2.3.2 MoE 推理优化
@@ -295,7 +295,7 @@ LLM 由多层 Transformer 堆叠而成，每一层都有自己独立的一组专
 下面是一段 DeepSeek decode workload 的 profiling trace。未启用 DBO 时，MoE Dispatch/Combine 部分占据了大量时间，尽管实际计算负载很小。
 
 <Frame caption="未启用 DBO：MoE Dispatch/Combine 的 collective communication 耗时远超实际计算。">
-  <img src="/books/ai-systems-performance-engineering/images/dbo-before.png" alt="GPU profiling trace before DBO showing sequential execution with idle GPU during MoE communication" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-dbo-before.png" alt="GPU profiling trace before DBO showing sequential execution with idle GPU during MoE communication" />
 </Frame>
 
 启用 DBO 后，两个 micro-batch 线程交替执行：
@@ -308,7 +308,7 @@ LLM 由多层 Transformer 堆叠而成，每一层都有自己独立的一组专
 在通信开销较高的场景（如 Wide EP 部署）中，这种交替执行显著提升了 GPU 利用率。
 
 <Frame caption="启用 DBO：两个 micro-batch 线程交替执行 dispatch 和 combine，通信与计算重叠，GPU 利用率显著提升。">
-  <img src="/books/ai-systems-performance-engineering/images/dbo-after.png" alt="GPU profiling trace after DBO showing interleaved execution of two microbatches with overlapped communication and computation" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-dbo-after.png" alt="GPU profiling trace after DBO showing interleaved execution of two microbatches with overlapped communication and computation" />
 </Frame>
 
 <Accordion title="MoE 在 Expert Parallelism 下的通信流程">
@@ -326,7 +326,7 @@ LLM 由多层 Transformer 堆叠而成，每一层都有自己独立的一组专
 下图展示了两个 DP group 和 4 个专家之间的完整 dispatch → 专家计算 → combine 流程：
 
 <Frame caption="MoE Dispatch/Combine 流程：左侧 token 根据路由分发到各专家，中间专家独立计算，右侧结果发回来源并加权求和（⊕）">
-  <img src="/books/ai-systems-performance-engineering/images/moe-dispatch-combine.png" alt="MoE dispatch and combine flow across two DP groups and four experts" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-moe-dispatch-combine.png" alt="MoE dispatch and combine flow across two DP groups and four experts" />
 </Frame>
 
 - **左侧 DISPATCH**：DP #0 有 3 个 token（0, 1, 2），DP #1 有 2 个 token（0, 1）。根据路由结果，token 被分发到 4 个专家（E #0 ~ E #3），一个 token 可能被发给多个专家
@@ -344,7 +344,7 @@ Expert Parallelism（EP）将 MoE 模型中的专家分配到多块 GPU 上，�
 [Wide EP](https://developer.nvidia.com/blog/scaling-large-moe-models-with-wide-expert-parallelism-on-nvl72-rack-scale-systems/) 将 EP 与 DP（Data Parallelism）结合，把专家分布到数十甚至上百块 GPU 上，每块 GPU 只持有少量专家。**来自多个 DP group 的 token 都路由到这些专家，每个专家服务更多 token，读一次权重服务更多计算，算术强度提升。**
 
 <Frame caption="左：小规模 EP，每块 GPU 部署多个专家。右：Wide EP，专家分散到更多 GPU 上，每块 GPU 只持有少量专家">
-  <img src="/books/ai-systems-performance-engineering/images/wide-ep.gif" alt="Comparison of small scale EP with multiple experts per GPU vs large scale Wide EP with fewer experts distributed across more GPUs" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-wide-ep.gif" alt="Comparison of small scale EP with multiple experts per GPU vs large scale Wide EP with fewer experts distributed across more GPUs" />
 </Frame>
 
 实测数据：[NVIDIA 在 GB200 NVL72 上的基准测试](https://developer.nvidia.com/blog/scaling-large-moe-models-with-wide-expert-parallelism-on-nvl72-rack-scale-systems/)显示，EP32 比 EP8 的每 GPU 吞吐量提升 **1.8 倍**。
@@ -356,7 +356,7 @@ Wide EP 下，某些 EP rank 可能空闲，而其他 rank 在处理大量 token
 工作方式：每次 MoE 前向传播记录每个 token 的负载分布，通过滑动窗口在各 EP rank 之间聚合统计数据。当达到重新均衡间隔时，负载均衡器计算新的逻辑-物理专家映射，并执行权重迁移（weight shuffle），使新的分配方案生效，无需重启模型。**对于被频繁选中的热门专家（hot expert），EPLB 会将其 clone 到多个 rank 上，让多块 GPU 共同分担该专家的负载。**
 
 <Frame caption="EPLB：4 个 rank 各持有 2 个专家，MoE 层通过 All2All 通信协作。当某个专家成为热门专家时，EPLB 将其 clone 到多个 rank 上分担负载，避免单个 GPU 过载">
-  <img src="/books/ai-systems-performance-engineering/images/eplb.gif" alt="Expert Parallel Load Balancing animation showing expert distribution across 4 ranks with All2All communication" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-eplb.gif" alt="Expert Parallel Load Balancing animation showing expert distribution across 4 ranks with All2All communication" />
 </Frame>
 
 #### 2.4 开源 MoE 模型一览
@@ -392,7 +392,7 @@ NVIDIA 正在将 AI 基础设施从单块 GPU、单台服务器演进为**机架
 [GB200 NVL72](https://developer.nvidia.com/blog/nvidia-gb200-nvl72-delivers-trillion-parameter-llm-training-and-real-time-inference/) 是基于 Blackwell 架构的机架级 AI 超级计算系统，在单机架内提供 exaFLOP 级算力。它将 **36 颗 Grace CPU** 和 **72 块 Blackwell GPU** 整合在一个液冷机柜中，72 GPU 组成一个 NVLink 域，如同一块巨型 GPU。其核心构建单元是 GB200 Grace Blackwell Superchip——通过 NVLink-C2C 将两块 Blackwell Tensor Core GPU 与一颗 Grace CPU 互连。
 
 <Frame caption="GB200 NVL72 机柜。左：正面（18 个计算托盘 + 9 个 NVLink switch 托盘）和背面。右：背面特写，NVLink 铜缆脊柱连接所有 72 块 GPU">
-  <img src="/books/ai-systems-performance-engineering/images/gb200-nvl72.png" alt="NVIDIA GB200 NVL72 rack front and back view showing compute trays and NVLink cable spine" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-gb200-nvl72.png" alt="NVIDIA GB200 NVL72 rack front and back view showing compute trays and NVLink cable spine" />
 </Frame>
 
 72 个通过 NVLink 连接的 Blackwell GPU 与 30 TB 统一内存集成在 130 TB/s 的计算架构中，在单个机架内构成一台 exaFLOP 级 AI 超级计算机。
@@ -458,13 +458,13 @@ MGX（Modular GPU Accelerated）是 NVIDIA 的开放标准化机架架构，定�
 Vera Rubin POD 通过横跨计算、网络和存储的 7 种芯片极致协同设计，构建了最先进的 POD 级 AI 平台：**40 个机柜、1.2 × 10¹⁵ 个晶体管、近 20,000 块 NVIDIA 芯片、1,152 块 Rubin GPU、60 exaFLOPS、10 PB/s 总 scale-up 带宽**。
 
 <Frame caption="Vera Rubin POD：40 个机柜组成一台 AI 超级计算机，包含 5 种专用机柜（NVL72、LPX、Vera CPU、BlueField-4 STX、Spectrum-6 SPX）">
-  <img src="/books/ai-systems-performance-engineering/images/vera-rubin-pod.png" alt="NVIDIA Vera Rubin POD consisting of 40 racks forming one AI supercomputer" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-vera-rubin-pod.png" alt="NVIDIA Vera Rubin POD consisting of 40 racks forming one AI supercomputer" />
 </Frame>
 
 Vera Rubin POD 引入了 5 种全新的专用机架级系统，面向需要高吞吐、极低延迟推理、密集 CPU 沙箱和大规模上下文内存存储的 Agentic AI 工作负载。
 
 <Frame caption="NVIDIA Vera Rubin POD：5 种机架级系统、1 台 AI 超级计算机、1 套 MGX 机架架构和生态系统">
-  <img src="/books/ai-systems-performance-engineering/images/vera-rubin-pod-5-racks.png" alt="Five rack types in Vera Rubin POD: NVL72, Groq 3 LPX, Vera CPU, BlueField-4 STX, Spectrum-6 SPX" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-vera-rubin-pod-5-racks.png" alt="Five rack types in Vera Rubin POD: NVL72, Groq 3 LPX, Vera CPU, BlueField-4 STX, Spectrum-6 SPX" />
 </Frame>
 
 
@@ -507,7 +507,7 @@ Vera Rubin Ultra 引入了一种全新的两层全互连 NVLink 拓扑，使开�
 作为这一大规模多机柜 NVLink 拓扑的演示系统，Polyphe 是 NVIDIA 内部一个基于 GB200 的全功能原型，用于验证多机柜 NVL576 scale-up 架构。
 
 <Frame caption="NVIDIA Polyphe 原型：一个基于 GB200 的全功能多机柜 NVL576 scale-up 系统">
-  <img src="/books/ai-systems-performance-engineering/images/vera-rubin-ultra.png" alt="NVIDIA Polyphe 原型，多机柜 NVL576 scale-up 系统" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-vera-rubin-ultra.png" alt="NVIDIA Polyphe 原型，多机柜 NVL576 scale-up 系统" />
 </Frame>
 
 #### 3.6 Feynman (2028)
@@ -515,7 +515,7 @@ Vera Rubin Ultra 引入了一种全新的两层全互连 NVLink 拓扑，使开�
 为了扩展到 NVL576 之上，NVIDIA 将引入一款新的 MGX 机柜：NVIDIA Kyber。NVIDIA Kyber 是下一代 MGX NVL 机柜设计，**可将每个机柜内的 NVLink 域规模翻倍，容纳 144 块 GPU**。
 
 <Frame caption="NVIDIA Kyber NVL1152">
-  <img src="/books/ai-systems-performance-engineering/images/feynman.png" alt="NVIDIA Kyber NVL1152 机架架构示意图" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-feynman.png" alt="NVIDIA Kyber NVL1152 机架架构示意图" />
 </Frame>
 
 NVIDIA Kyber 将使用类似的机柜间直连光互连，**扩展为大规模全互连的 NVL1152 超级计算机**。Kyber 为基于 NVIDIA Feynman 的下一代极致 scale-up AI 计算奠定基础。
@@ -545,7 +545,7 @@ Kyber 将首先随 Vera Rubin Ultra 以独立 NVL144 系统的形式推出，为
 要理解 FlashAttention 在优化什么，先看 GPU 内部的数据流动方式。
 
 <Frame caption="GPU 内存层级与数据流：输入从 HBM 出发，搬入 SM 的 SRAM 进行计算，结果写回 HBM（A100 数据）">
-  <img src="/books/ai-systems-performance-engineering/images/hbm-sram.png" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-hbm-sram.png" />
 </Frame>
 
 GPU 有两级存储：**HBM**（High Bandwidth Memory）容量大（A100 为 40 GB）但带宽相对有限（1.5 TB/s）；**SRAM**（片上共享内存）容量很小（A100 约 20 MB）但带宽极高（19 TB/s）。每个 CUDA kernel 的执行流程都是：从 HBM 读入数据 → 搬到 SRAM 计算 → 把结果写回 HBM。计算本身很快，瓶颈往往在 HBM 的读写上。
@@ -553,7 +553,7 @@ GPU 有两级存储：**HBM**（High Bandwidth Memory）容量大（A100 为 40 
 **标准 attention 的 I/O 瓶颈**
 
 <Frame caption="Kernel fusion 前后对比：上方是标准实现，每步 kernel 之间 GPU 都在等 HBM 读写；下方融合后，计算连续执行，省掉了中间的 I/O 等待和 N×N 中间矩阵的 HBM 存储">
-  <img src="/books/ai-systems-performance-engineering/images/flashattention-kernel-fusion.png" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-flashattention-kernel-fusion.png" />
 </Frame>
 
 这张图上半部分展示的是标准 attention 的核心计算流程 $O = softmax(QK^T)V$。按图中的执行顺序，可以把标准 attention 理解成下面几步：
@@ -572,7 +572,7 @@ GPU 有两级存储：**HBM**（High Bandwidth Memory）容量大（A100 为 40 
 
 <Accordion title="N×N 中间矩阵的 I/O 开销">
 <Frame caption="矩阵形状一目了然：Q、K、V、O 都是 N×d，而中间的分数矩阵 S 和概率矩阵 P 都是 N×N。当 N 远大于 d 时，S 和 P 会比输入输出大得多。">
-  <img src="/books/ai-systems-performance-engineering/images/attention-read-write.png" alt="Attention matrix shapes showing Q, K, V, O as N by d and S, P as N by N" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-attention-read-write.png" alt="Attention matrix shapes showing Q, K, V, O as N by d and S, P as N by N" />
 </Frame>
 
 在 attention 的核心计算流程里，我们真正需要的输入和输出都是 $N \times d$ 的矩阵（Q、K、V、O），但中间会额外产生两个 $N \times N$ 的矩阵：分数矩阵 $S$ 和概率矩阵 $P$。**$N$ 是序列长度，$d$ 是单个 attention head 的维度（通常为 64 或 128；例如 hidden size = 4096、num heads = 32 时，$d_{head} = 4096 / 32 = 128$）。当 $N$ 远大于 $d$ 时，这两个中间矩阵会比输入输出大得多**：
@@ -588,7 +588,7 @@ GPU 有两级存储：**HBM**（High Bandwidth Memory）容量大（A100 为 40 
 但直接融合有一个核心障碍：**softmax 无法分块计算**。
 
 <Frame caption="计算 softmax 矩阵 P 的单个元素 p_ij，需要读取 S 矩阵中的整行向量 s_i 来算分母">
-  <img src="/books/ai-systems-performance-engineering/images/softmax.png" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-softmax.png" />
 </Frame>
 
 **Softmax 是按行计算的：每个元素 $p_{ij}$ 的分母 $\sum_j e^{s_{ij}}$ 需要该行所有元素。** 这意味着 softmax kernel 需要一次读到整行数据，无法像 matmul 那样用 block tiling 分块处理。Matmul 每次只需要一小块数据就能算出部分结果，softmax 却必须看到整行，两个 kernel 需要的数据粒度不同，所以无法直接融合。
@@ -669,7 +669,7 @@ $\ell_1 / \ell_2 = 0.731$ 是这个例子里的 **rescaling 系数**。它把 $O
 **算法流程**
 
 <Frame caption="FlashAttention forward pass 的 tiling 动画：外层循环遍历 K、V 的分块（列方向），内层循环遍历 Q 的分块（行方向），每次迭代在 SRAM 内完成局部计算并滚动更新 O、m(x)、l(x)。蓝色 = 输入，黄色 = 中间结果（仅在 SRAM 中），绿色 = 输出">
-  <img src="/books/ai-systems-performance-engineering/images/flashattention-animation.gif" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-flashattention-animation.gif" />
 </Frame>
 
 Forward pass 用两层嵌套循环：外层遍历 K、V 的分块（索引 $j$），内层遍历 Q 的分块（索引 $i$）。每次迭代在 SRAM 内完成局部 $QK^T$、softmax、$PV$ 的融合计算，滚动更新输出 $O$ 和统计量 $m$、$\ell$。全程不把任何 $N \times N$ 矩阵写到 HBM，最终只写回 $O$（$N \times d$）和两个长度为 $N$ 的向量。
@@ -695,7 +695,7 @@ for j in range(K 的块数):      # 外层：每次换一块 K_j, V_j
 **性能结果**
 
 <Frame caption="左：FlashAttention 将 5 个 kernel 融合为 1 个 fused kernel，速度提升 7.6 倍。右：显存占用对比，标准 PyTorch 在 4K 序列长度即 OOM，FlashAttention 在 64K 时仍比近似方法 LinFormer 省一半显存">
-  <img src="/books/ai-systems-performance-engineering/images/flashattention-improvement.png" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-flashattention-improvement.png" />
 </Frame>
 
 FlashAttention 带来的收益非常直接：
@@ -736,7 +736,7 @@ FlashAttention 带来的收益非常直接：
 DeepSeek 的 MLA 算法以 NVIDIA GPU kernel 的形式实现，并于 2025 年开源，是软硬件协同设计的另一个例子。与 FlashAttention 类似，MLA 重新组织了 attention 计算，以更好地利用 NVIDIA 的内存层级和专用的 GPU Tensor Cores。这些优化使 MLA 能够更充分地利用受限的 H800 GPU 架构，以更低的成本实现更高的吞吐量，甚至在同样的 H800 系统上超过了 FlashAttention 的性能。
 
 <Frame caption="MHA、GQA、MQA 和 MLA 的 KV cache 组织方式对比：MHA 每个 head 独立缓存 K/V，GQA 按组共享 K/V，MQA 所有 heads 共享一组 K/V，MLA 则缓存压缩后的 latent KV，并在使用时投影回各个 head。">
-  <img src="/books/ai-systems-performance-engineering/images/mha-gqa-mqa-mla.png" alt="Comparison of MHA, GQA, MQA, and MLA showing different KV cache organizations during inference" />
+  <img src="/books/ai-systems-performance-engineering/images/ch01-mha-gqa-mqa-mla.png" alt="Comparison of MHA, GQA, MQA, and MLA showing different KV cache organizations during inference" />
 </Frame>
 
 **MHA (Multi-Head Attention)** 是标准 Transformer 里的注意力形式。每个 head 都有独立的 `W_Q^(i)`、`W_K^(i)`、`W_V^(i)`，每个头各自计算注意力，最后把所有头的输出拼接再投影回去。它的表达能力最完整，但 decode 阶段也必须为每个 head 缓存完整 K/V，因此 KV cache 最大。
