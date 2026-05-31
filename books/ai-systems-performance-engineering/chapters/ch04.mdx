@@ -6,53 +6,345 @@ title: "第四章：分布式网络通信调优"
 
 分布式 AI 系统的核心瓶颈经常不是 GPU 算得慢，而是 GPU 在等数据。训练时，梯度、参数分片和激活值需要在多张 GPU 之间同步；推理时，KV cache、请求状态和模型分片需要在不同 worker 之间移动。规模越大，通信路径、同步时机和网络拓扑越影响整体吞吐。
 
-本章重点保留三条主线。第一，建立通信优化的基本判断：什么时候是框架通信模式的问题，什么时候该减少同步频率或传输数据量，什么时候该把通信隐藏在计算背后。第二，理解 RDMA 和 GPUDirect RDMA 为什么能绕过慢路径。第三，理解 NCCL 如何建立在 NVLink、NVSwitch、InfiniBand/RoCE、SHARP 等 NVIDIA 通信栈之上，完成训练中的 all-reduce、reduce-scatter 和 all-gather。
+本章以一个梯度 tensor 在分布式训练中的完整旅程为主线：从 `loss.backward()` 产生梯度开始，经过 DDP bucket、NCCL collective、NVLink/InfiniBand 硬件路径，到最终所有 GPU 拿到全局平均梯度。Part 1 先用直觉建立全貌——为什么 GPU 之间需要通信、通信在做什么、怎么判断通信是不是瓶颈，并用实验验证这些判断。Part 2 沿着同一条旅程深入每一段的底层原理：RDMA 和 GPUDirect RDMA 怎么绕过慢路径，NCCL 怎么在 NVLink、NVSwitch、InfiniBand/RoCE 等硬件之上完成 collective 通信。Part 3 是更多动手实验，把原理落到可观察的操作上。
 
 ---
 
-## 章节详解
+## Part 1: 为什么 GPU 之间需要通信
 
-### 1. 通信优化的基本判断
+### 一个直觉：8 个人合算全班平均分
 
-通信优化先看一个问题：**GPU 是在计算，还是在等通信**。如果 GPU 大部分时间在跑 kernel，通信优化收益有限；如果 timeline 中有明显的 all-reduce、copy、socket 或 network wait，通信路径和同步策略就会成为主要瓶颈。
+假设一次考试有 800 个学生，分给 8 位老师批改，每人批 100 份。每位老师算出自己那 100 份的平均分后，怎么得到全班 800 人的平均分？
 
-这一节先按现象建立判断框架。看到 GPU 等待后，不要直接套环境变量模板，而是先判断等待来自框架通信模式、同步频率、传输数据量、跨节点路径，还是 collective 拓扑。不同现象对应的优化手段不同。
+最笨的办法：每位老师把自己的平均分喊给其他 7 个人，每个人都收到 7 份数据，自己算一遍全班平均。通信量是 N×(N-1) 次——8 个人就是 56 次传话，80 个人就是 6320 次，规模一大就爆了。
 
-| 现象 | 可能原因 | 优先考虑的优化 | 直觉 |
+聪明的办法：8 个人排成一圈，每人只跟左右邻居交换和累加，转一圈就够了。这就是 **ring all-reduce** 的直觉——不需要每个人跟所有人通信，只需要跟邻居交换，经过足够多的步骤，所有人都能拿到全局结果。
+
+分布式训练里 GPU 之间同步梯度就是这件事：
+
+| 考试类比 | 分布式训练 |
+| --- | --- |
+| 每位老师批改 100 份试卷 | 每张 GPU 处理一份 mini-batch |
+| 每位老师算出的平均分 | 每张 GPU 算出的本地梯度 |
+| 合算全班平均分 | all-reduce 得到全局平均梯度 |
+| 8 个人排成一圈传递 | 8 张 GPU 组成逻辑环通信 |
+| 每人最终拿到相同的全班平均分 | 每张 GPU 最终拿到相同的全局梯度 |
+
+### 一个梯度 tensor 的宏观旅程
+
+理解了"为什么"之后，来看一个具体的训练步骤里发生了什么。假设 8 张 GPU 做数据并行训练，每张 GPU 持有完整模型副本，处理不同的 mini-batch：
+
+```
+① loss.backward()
+   PyTorch autograd 逐层计算梯度，写入每个参数的 .grad
+
+② 梯度同步
+   所有 GPU 把各自算出的梯度"合算平均"
+   同步完成后，8 张 GPU 上的梯度完全相同
+
+③ optimizer.step()
+   用相同的平均梯度更新参数
+   因为梯度相同 + 参数相同 → 更新后参数仍然相同
+   8 张 GPU 的模型保持一致
+```
+
+这就是一个梯度 tensor 的完整旅程：**从 backward 产生，经过同步变成全局平均，最终被 optimizer 消费**。
+
+关键问题是第 ② 步：梯度同步要花时间，GPU 在等同步的时候就没在算东西。聪明的做法是**边算边同步**——不等所有层的梯度都算完，某一层算完就立刻开始同步，同时继续算下一层的梯度：
+
+```
+GPU timeline（时间从左到右）:
+
+backward:  |-- layer N --|-- layer N-1 --|-- layer N-2 --|
+                         |                              |
+comm:                    |== 同步 layer N 的梯度 ========|== 同步 N-1 ==...
+                         ↑
+                    layer N 的梯度一算完
+                    同步立即启动，和后续计算并行
+
+理想情况：总耗时 ≈ max(计算时间, 通信时间)
+最差情况：总耗时 ≈ 计算时间 + 通信时间
+```
+
+这就是 PyTorch DDP 的 bucket 机制——把梯度分成若干桶，每个桶一满就发起同步，不等所有层算完。Part 2 会展开 DDP bucket 和 NCCL 的具体实现。
+
+### 不只是梯度：分布式 AI 系统需要通信什么
+
+刚才追踪的是**梯度 tensor 的同步**——数据并行训练中最常见的通信。但分布式系统中需要通信的远不止梯度。
+
+| 传输内容 | 出现场景 | 通信模式 | 大小量级 |
 | --- | --- | --- | --- |
-| 单机多卡时 GPU0 更忙，其他 GPU 等待 | 使用 `DataParallel`，主 GPU 负责聚合 | 换成 `DistributedDataParallel` | 避免 GPU0 聚合瓶颈，让 NCCL 负责同步 |
-| backward 结束后出现一大段 all-reduce | 梯度同步启动太晚 | DDP bucket、CUDA streams、通信计算重叠 | 边算边同步，减少 GPU 空转 |
-| 每个 step 都有固定同步开销 | 同步频率太高 | 梯度累积 | 多个 micro-batch 后再同步一次 |
-| 网络链路持续打满，GPU 等通信 | 每次传输数据量太大 | 梯度压缩、量化、稀疏化 | 少传数据，但要关注收敛影响 |
-| all-reduce 时 CPU 很忙，GPU 通信慢 | 后端误用 Gloo 或 socket 路径 | 使用 NCCL，并确认走 GPU 通信路径 | GPU collective 不应主要靠 CPU 搬数据 |
-| 跨节点吞吐远低于预期 | NCCL 走 TCP 或 CPU staging 慢路径 | RDMA / GPUDirect RDMA | 让 NIC 直接访问注册内存或 GPU HBM |
-| GPU 数量增加后 all-reduce 扩展性变差 | collective 没有匹配硬件拓扑 | NCCL 拓扑感知、SHARP、NVLS | 让节点内、节点间和网络内计算各走合适路径 |
-| 某个 rank 经常拖慢整轮迭代 | straggler、NUMA 绑定不当或网络局部拥塞 | 检查 rank 级 timeline、CPU affinity 和网卡计数器 | collective 的总耗时由最慢参与者决定 |
-| 分离式推理中 decode 等 KV cache | KV cache 点对点迁移成为瓶颈 | NIXL | 大块点对点数据异步移动 |
+| **梯度** ← 刚才追踪的 | DDP / ZeRO 训练 | all-reduce / reduce-scatter | 整个模型参数量（GB 级）|
+| **参数分片** | FSDP — 每层 forward 前 all-gather 完整权重 | all-gather | 单层参数（数百 MB） |
+| **激活值** | Pipeline parallelism — stage 间传递 | point-to-point send/recv | per-microbatch per-layer（MB~GB）|
+| **KV cache** | Disaggregated inference — prefill → decode | point-to-point 异步传输 | per-request（MB~百 MB，长上下文可达 GB）|
+| **Expert tokens** | MoE all-to-all — token dispatch 和 combine | all-to-all | 动态，取决于路由分布 |
+| **控制信号** | NCCL bootstrap、barrier、health check | TCP / gRPC | 极小（KB 级）|
 
-下面沿着这些现象展开。
+几个观察：
 
-**框架通信模式问题。** 单机多卡训练中，如果仍在使用 `DataParallel`，GPU0 往往会更忙。`DataParallel` 是单进程控制多张 GPU，主 GPU 负责 scatter 输入、gather 输出和聚合梯度，容易形成主卡瓶颈。`DistributedDataParallel` 通常是一进程一 GPU，用 NCCL 做梯度 all-reduce，并在 backward 过程中按 bucket 发起异步通信，因此更适合多 GPU 训练。
+1. **所有性能敏感的通信都是 tensor/buffer**，走 GPU 间的高速链路。控制面走 TCP，数据量小，不是瓶颈。
+2. **训练通信以 collective 为主**（all-reduce, reduce-scatter, all-gather, all-to-all）——所有参与者必须同步推进，最慢的 rank 决定整体速度。
+3. **推理通信以 point-to-point 为主**（KV cache 迁移、pipeline 激活传递）——不需要全员参与，但对延迟极度敏感，每一毫秒直接加到用户感知的响应时间上。
+4. **通信路径相同，优化目标不同**：训练追求吞吐（把通信藏在计算背后），推理追求延迟（让单次传输尽可能快）。
 
-**通信启动太晚。** 数据并行训练中，每张 GPU 持有一份模型副本，处理不同 mini-batch，backward 后需要同步梯度。朴素做法是所有 backward 结束后再统一 all-reduce，这会把通信时间直接加到每轮迭代上。更好的做法是把梯度切成 bucket，某个 bucket 一准备好就发起 NCCL all-reduce，同时继续计算后续层的梯度。
+这张表就是本章后续所有内容的作用对象。Part 2 围绕三个问题展开：怎么让每一跳更快（RDMA、GPUDirect RDMA、NVLink/NVSwitch），怎么让 collective 更高效（NCCL 算法、SHARP、NVLS），怎么把通信时间藏起来（overlap、bucket、异步传输）。
 
-<Frame caption="通信与计算重叠：同步模式会让 GPU 等待 all-reduce；DDP bucket 可以在 backward 过程中提前启动通信">
-  <img src="../images/ch04-figure-4-1-overlap.png" alt="Overlapping host-to-device and device-to-host communication with computation on multiple CUDA streams" />
+---
+
+## Part 2: 通信原理详解
+
+### DDP 代码架构
+
+<Frame caption="DDP 分层架构：Python 入口层（distributed.py）→ C++ 梯度同步与广播（reducer.h / comm.h）→ 通信后端抽象（ProcessGroup.hpp）→ 具体实现（NCCL / Gloo / MPI / RCCL / XCCL）">
+  <img src="../images/ch04-figure-ddp-architecture.png" alt="DDP architecture: distributed.py → reducer.h + comm.h → ProcessGroup → NCCL/Gloo/MPI/RR/XCCL" />
 </Frame>
 
-需要避免的常见同步点包括 `torch.cuda.synchronize()` 和 `tensor.item()`。前者会等待当前设备上的工作全部完成，后者会把 GPU 标量搬回 CPU，也可能触发同步。计时或日志统计应尽量放在迭代末尾，避免打断重叠流水线。
+DDP 的核心逻辑在三层之间分工：`distributed.py` 是 Python 入口，负责初始化和 forward；`reducer.h` 是 C++ 核心，负责 bucket 分配、autograd hook 注册和梯度同步调度；`ProcessGroup.hpp` 是通信抽象层，把 broadcast 和 allreduce 等操作分发给具体的后端实现（NCCL 用于 NVIDIA GPU，RCCL 用于 AMD GPU，Gloo 用于 CPU）。
 
-**同步频率太高。** 如果每个 step 都有固定通信开销，可以用梯度累积减少同步次数。多个 micro-batch 先在本地累积梯度，再做一次 all-reduce，相当于用更多本地计算换更少的跨 GPU 同步。代价是有效 batch size 变大，可能需要重新调学习率和内存预算。
+<Frame caption="DDP 梯度同步：参数按 reverse 顺序分到 bucket 里（bucket1 = grad0+grad1，bucket0 = grad2+grad3），每个 bucket 就绪后独立发起 allreduce，两个 Process 的 bucket 结构完全对称">
+  <img src="../images/ch04-figure-ddp-bucket-allreduce.png" alt="DDP bucket allreduce: Process 0 and Process 1 each have params grouped into buckets, with allreduce between corresponding buckets" />
+</Frame>
 
-**传输数据量太大。** 如果网络链路持续打满，压缩、量化或稀疏化可以减少每次通信的数据量。这类方法直接作用在“传多少”上，但会改变梯度信息，需要关注收敛稳定性和最终精度。
+#### DDP backward 全流程：CPU 调度 + GPU 执行
 
-**跨节点路径太慢。** 如果跨节点吞吐远低于预期，先确认通信后端是否正确。GPU 训练应优先使用 NCCL；如果误用 Gloo，或者 NCCL 因配置问题退回 socket/TCP，通信就会变成 CPU 和内核网络栈主导。RDMA 和 GPUDirect RDMA 解决的是数据路径问题，下一节单独展开。
+Bucket 按 reverse parameter 顺序排列——backward 先算完的梯度排在前面的 bucket，使通信尽早开始、与计算 overlap。
 
-**collective 拓扑不匹配。** 如果 GPU 数量增加后 all-reduce 扩展性变差，问题可能不在单条链路，而在 collective 算法和硬件拓扑没有匹配。还要检查是否存在 straggler：一个 rank 的 CPU 线程、网卡或远端内存访问变慢，就会拖住整个 collective。NCCL、NVLink/NVSwitch、InfiniBand/RoCE、SHARP 和 NVLS 属于第三节的重点。
+```
+CPU 侧（调度）                          GPU 侧（执行）
+─────────────────                       ─────────────────────────────────────
+                                        Compute Stream    Comm Stream
+                                        ──────────────    ───────────
 
-实践中的第一步仍然是看 profiler。Nsight Systems 或 PyTorch profiler 里如果看到计算和通信串行排列，就先检查 DDP bucket、同步点和通信后端；如果通信已经被计算覆盖，再继续调 NCCL 算法或网络参数，收益通常会变小。
+1. autograd 引擎驱动                     layer4 backward
+   backward 图执行                       grad_4 算完 ↓
 
-### 2. RDMA 与 GPUDirect RDMA
+2. grad_4 的 post hook 触发     ←─────  （CPU 被通知）
+   reducer 标记 grad_4 ready
+   检查 bucket_0：还差 grad_3
+
+                                        layer3 backward
+                                        grad_3 算完 ↓
+
+3. grad_3 的 post hook 触发     ←─────  （CPU 被通知）
+   reducer 标记 grad_3 ready
+   bucket_0 满了！
+   提交 ncclAllReduce 到        ─────→                    AllReduce bucket_0
+   comm stream                                            （GPU 执行通信）
+
+                                        layer2 backward        ↕ 并行！
+                                        grad_2 算完 ↓          ↕
+
+4. grad_2 的 post hook 触发                                AllReduce 完成
+   ...bucket_1 检查...                                         ↓
+                                        layer1 backward    cudaEventRecord
+                                        grad_1 算完 ↓      （纯 GPU 同步）
+
+5. bucket_1 满了                                               ↓
+   提交 AllReduce             ─────→                    AllReduce bucket_1
+
+6. 所有 AllReduce 完成                                         ↓
+                                        ← cudaEventWait ──────┘
+                                        optimizer.step()
+                                        （用同步后的梯度更新参数）
+```
+
+CPU 只做轻量调度（hook 触发、bucket 检查、提交 NCCL 调用），重活全在 GPU 上。通信完成后通知 compute stream 用的是 CUDA Event——GPU 到 GPU 的 stream 同步，不需要 CPU 介入。
+
+### NCCL 与 NVIDIA 通信栈
+
+NCCL 是训练侧最重要的 GPU collective 通信库。PyTorch DDP、FSDP、Megatron、Horovod 等框架中的 all-reduce、reduce-scatter、all-gather、broadcast，通常都由 NCCL 在底层完成。与 MPI 等传统库不同，NCCL 把每个 collective 实现在**单个 GPU kernel** 中，通信和计算操作在同一个 kernel 内完成，从而实现快速同步并最小化达到峰值带宽所需的资源开销。
+
+NCCL 不单独存在，它位于 NVIDIA Magnum IO 通信栈里。Magnum IO 把存储 I/O、网络 I/O、网络内计算和 I/O 管理放在同一套性能优化框架下：NCCL 负责 collective，GPUDirect RDMA 负责跨节点 GPU 数据路径，SHARP/NVLS 负责把部分 reduction 下沉到网络或 NVSwitch fabric。
+
+<Frame caption="Magnum IO 把 storage、network、in-network compute 和 I/O management 组合成 NVIDIA 的 I/O 加速栈；NCCL 属于其中的 Network I/O / collective 通信路径">
+  <img src="../images/ch04-figure-4-2-magnum-io.png" alt="Four components of NVIDIA Magnum IO acceleration platform" />
+</Frame>
+
+<!-- TODO: 手动下载此图到 ../images/ch04-figure-nccl-architecture.png -->
+<!-- 来源: https://developer-blogs.nvidia.com/wp-content/uploads/2020/10/nccl-architecture-1.png -->
+<Frame caption="NCCL 架构：上层 collective 算法（Ring/Tree/PAT）通过 channel 抽象调用下层传输（NVLink P2P、SHM、NET/IB），每层可独立扩展">
+  <img src="https://developer-blogs.nvidia.com/wp-content/uploads/2020/10/nccl-architecture-1.png" alt="NCCL architecture showing algorithms, channels, and transport layers" />
+</Frame>
+
+NCCL 的性能来自两层能力：上层是 collective 算法，下层是 NVIDIA 通信栈。
+
+| 层次 | 组件 | 作用 |
+| --- | --- | --- |
+| Collective 算法 | Ring、Tree、CollNet、PAT | 根据消息大小和 GPU 数量组织通信 |
+| 节点内互联 | NVLink、NVSwitch、NVLS | 提供 GPU 间高带宽低延迟链路 |
+| 跨节点互联 | InfiniBand、RoCE、GPUDirect RDMA | 让 GPU 跨服务器高速交换数据 |
+| 网络内计算 | SHARP | 在交换机中做部分 reduction，降低端点压力 |
+| 管理与诊断 | NCCL 日志、拓扑文件、UFM/NetQ、Nsight Systems | 验证链路、算法和瓶颈 |
+
+#### Ring 与 Tree 算法
+
+最典型的 collective 是梯度 all-reduce。每张 GPU 先算出本地梯度，然后 collective 让所有 GPU 得到全局平均梯度。Ring all-reduce 会把梯度切块，每张 GPU 只和相邻 GPU 通信，通过 reduce-scatter 和 all-gather 两个阶段完成同步。
+
+##### Ring All-Reduce 具体过程
+
+以 **2 节点 × 4 GPU/节点** 为例，512 MB 梯度（BF16），NCCL 切成 8 块（每块 64 MB），在逻辑环上完成同步：
+
+```
+逻辑环（NCCL 根据拓扑自动构建）：
+
+Node 0:  GPU0 ──→ GPU1 ──→ GPU2 ──→ GPU3
+                                       │
+                              InfiniBand NDR（跨节点链路）
+                                       │
+Node 1:  GPU7 ←── GPU6 ←── GPU5 ←── GPU4
+```
+
+**阶段一：Reduce-Scatter（7 步）** — 让每张 GPU 最终持有一块全局归约后的 chunk。
+
+```
+初始状态：每张 GPU 持有完整 512 MB 本地梯度（8 个 chunk）
+
+Step 1: 每张 GPU 把 chunk[(rank+1) % 8] 发给下一跳
+        GPU0 发 chunk1 → GPU1，同时 GPU7 发 chunk0 → GPU0
+        GPU1 收到后执行：local_chunk1 += incoming_chunk1（累加）
+
+Step 2: 继续传递和累加...
+
+        节点内的跳（GPU0→GPU1）：走 NVSwitch，64 MB / 900 GB/s ≈ 0.07 ms
+        跨节点的跳（GPU3→GPU4）：走 InfiniBand，64 MB / 50 GB/s ≈ 1.3 ms
+
+Step 7: 完成。GPU k 持有 chunk k 的全局 sum（已包含 8 张 GPU 的贡献）
+```
+
+**阶段二：All-Gather（7 步）** — 把每张 GPU 持有的已归约 chunk 广播给所有 GPU。
+
+```
+Step 1~7: 和 reduce-scatter 路径相同，但不做累加，只是传播
+
+完成后：所有 8 张 GPU 都持有完整的 512 MB 全局平均梯度
+```
+
+**理论通信量（每张 GPU）：**
+
+```
+单向发送 = 2 × (N-1)/N × data_size
+         = 2 × (7/8) × 512 MB
+         = 896 MB
+
+瓶颈链路耗时（假设跨节点 IB 是瓶颈）：
+  Ring 中有 2 条跨节点链路（GPU3→GPU4 和 GPU7→GPU0）
+  有效跨节点带宽 ≈ 50 GB/s per direction（单 NIC）
+  每步跨节点传输 64 MB：64 MB / 50 GB/s ≈ 1.3 ms
+  14 步（7 reduce-scatter + 7 all-gather）中有 14 次跨节点跳
+  但 pipeline 化后，耗时 ≈ 14 × 1.3 ms ≈ 18 ms（理论下界）
+```
+
+##### 每一跳的硬件数据路径
+
+**节点内一跳：GPU0 → GPU1（NVSwitch）**
+
+```
+GPU0 HBM                    NVSwitch                    GPU1 HBM
+┌──────────┐              ┌──────────┐              ┌──────────┐
+│ sendbuff │─── NVLink ──→│  Switch  │─── NVLink ──→│ recvbuff │
+│ (64 MB)  │   Engine     │ crossbar │   Engine     │ += 累加   │
+└──────────┘              └──────────┘              └──────────┘
+    ↑                                                    ↑
+ NCCL kernel                                        NCCL kernel
+ 从 HBM 读数据                                      写入并做 reduce
+```
+
+| 步骤 | 发生了什么 | 耗时 |
+| --- | --- | --- |
+| NCCL kernel 启动 | GPU0 的 SM 执行 NCCL 内部 copy+reduce kernel | ~μs |
+| NVLink 传输 | 数据从 GPU0 NVLink Engine → NVSwitch → GPU1 NVLink Engine | 64 MB / 900 GB/s ≈ **0.07 ms** |
+| 远端 reduce | GPU1 SM 执行 `recvbuff[i] += incoming[i]` | ~μs |
+
+CPU 完全不参与，整个过程在 GPU 硬件内完成。
+
+**跨节点一跳：GPU3 → GPU4（GPUDirect RDMA over InfiniBand）**
+
+```
+Node 0                                              Node 1
+┌────────┐    ┌─────┐    ┌────────┐    ┌─────┐    ┌────────┐
+│ GPU3   │    │ NIC │    │   IB   │    │ NIC │    │ GPU4   │
+│ HBM    │──→│ DMA │──→│ Switch │──→│ DMA │──→│ HBM    │
+│sendbuff│PCIe│read │ IB │        │ IB │write│PCIe│recvbuff│
+└────────┘    └─────┘    └────────┘    └─────┘    └────────┘
+```
+
+| 步骤 | 发生了什么 | 耗时 |
+| --- | --- | --- |
+| 1. NCCL kernel 触发传输 | GPU3 SM 通知 NIC "数据在 HBM 这个地址，发出去" | ~μs |
+| 2. NIC DMA 读 GPU3 HBM | ConnectX-7 NIC 通过 PCIe Gen5 直接读 GPU 显存 | 64 MB / 64 GB/s ≈ 1.0 ms |
+| 3. InfiniBand 传输 | NDR 400 Gb/s = 50 GB/s | 64 MB / 50 GB/s ≈ 1.3 ms |
+| 4. 远端 NIC DMA 写 GPU4 HBM | 对端 NIC 通过 PCIe 直接写入 GPU4 显存 | ~1.0 ms |
+| 5. GPU4 SM 累加 | reduce kernel 执行 | ~μs |
+
+CPU 不在数据路径上——仅在初始化时注册内存区域（`ibv_reg_mr` / `nvidia_peermem`）。
+
+<Warning>
+如果 `nvidia_peermem` 模块没加载，或容器没暴露 `/dev/infiniband/*`，NIC 无法直接访问 GPU HBM。NCCL 会静默退回 **CPU staging 路径**：GPU3 → cudaMemcpy D2H → CPU 内存 → NIC → 网络 → NIC → CPU 内存 → cudaMemcpy H2D → GPU4。多了两次 PCIe 拷贝和 CPU 内存中转，延迟增加 **2–3×**，且业务代码不报错。
+</Warning>
+
+| 路径 | 步骤数 | 单跳延迟（64 MB）| CPU 参与 |
+| --- | --- | --- | --- |
+| GPUDirect RDMA | GPU→NIC→网络→NIC→GPU | ~3.3 ms | 仅初始化 |
+| CPU staging | GPU→CPU→NIC→网络→NIC→CPU→GPU | ~6–8 ms | 每次传输 |
+| 纯 TCP/IP | GPU→CPU→内核栈→NIC→网络→NIC→内核栈→CPU→GPU | ~10+ ms | 全程 |
+
+##### 不同算法适合不同场景
+
+| 算法 | 适合场景 | 直觉 |
+| --- | --- | --- |
+| **Ring** | 大消息、高带宽场景 | 把大张量切块，持续喂满链路 |
+| **Tree** | 小消息、低延迟场景 | 通信步数少，启动快 |
+| **CollNet / CollTree** | 多节点训练 | 节点内和节点间分层通信 |
+| **PAT** | 大规模 collective | 兼顾 tree 的低延迟和 ring 的带宽利用 |
+| **SHARP / NVLS** | 支持网络内计算的硬件 | 把部分 reduction 下沉到交换设备或 NVSwitch fabric |
+
+大多数时候，NCCL 的自动选择已经足够好。手动设置 `NCCL_ALGO`、`NCCL_PROTO` 之前，先用日志和 profiler 确认默认选择确实有问题。更常见、更实际的排障是确认 NCCL 是否选对网卡、是否走 RDMA、是否识别到 NVLink/NVSwitch 拓扑。
+
+#### Simple / LL / LL128 协议
+
+算法（`NCCL_ALGO`）决定数据走什么拓扑路径，协议（`NCCL_PROTO`）决定数据在这条路径上怎么传输和同步。两者是独立的选择维度：
+
+| 协议 | 核心思路 | 比喻 |
+| --- | --- | --- |
+| **Simple** | 大块传输，GPU 线程做 memory copy，高吞吐 | 海运集装箱——装满再发，单次运量大 |
+| **LL** (Low Latency) | 每 4 字节数据附带 4 字节 flag 做内联同步，无需额外同步原语，延迟极低但带宽浪费 50% | 电动车闪送——每个小件立刻发，零等待但运力浪费大 |
+| **LL128** | 每 128 字节附带少量 flag，在吞吐和延迟之间折中 | 小箱快发——介于集装箱和闪送之间 |
+
+选择逻辑和 Ring/Tree 一致——**大消息优化吞吐（Simple），小消息优化延迟（LL/LL128）**。NCCL 会根据消息大小自动在协议之间切换，通常不需要手动干预。
+
+算法 × 协议的组合构成 NCCL 的完整决策空间：
+
+```
+决策 1: NCCL_ALGO  → Ring / Tree / CollNet / PAT     （拓扑路径）
+决策 2: NCCL_PROTO → Simple / LL / LL128              （传输方式）
+```
+
+例如，一个 512 MB 的梯度 all-reduce 可能走 `Ring + Simple`（大消息，集装箱海运走环形航线），而一个 8 KB 的 bias 梯度走 `Tree + LL`（小消息，电动车闪送走树形快递网络）。
+
+#### PXN（PCIe × NVLink）
+
+没有直连网卡的 GPU，通过 NVLink 借邻居 GPU 的网卡发数据（NCCL 2.12）。对 MoE all-to-all（消息聚合降 8 倍）和 Model Parallel 子通信器闭环收益最大。
+
+#### NCCL 排查入口
+
+常用排查入口：
+
+| 目标 | 工具 / 环境变量 |
+| --- | --- |
+| 查看初始化、拓扑和网络路径 | `NCCL_DEBUG=INFO` |
+| 聚焦网络和 collective | `NCCL_DEBUG_SUBSYS=INIT,NET,COLL` |
+| 指定网卡，避免走错接口 | `NCCL_SOCKET_IFNAME=<iface>` |
+| 验证 RDMA 路径 | NCCL 日志、RDMA perftest、网卡计数器 |
+| 看通信是否覆盖计算 | Nsight Systems timeline |
+
+调优 NCCL 时不要把环境变量当作固定模板。先回答三个问题：通信是否真的成为瓶颈，NCCL 是否走了最快链路，collective 是否已经和计算重叠。只有这些问题有明确证据后，算法和环境变量调优才有意义。
+
+#### NCCL 生命周期原则
+
+还有两个生命周期原则值得保留。第一，不要在每个 step 里创建和销毁 NCCL communicator；初始化和拓扑发现应放在训练或服务启动阶段，并在生命周期内复用。第二，不要忽略 NCCL warning。很多 warning 指向的不是"日志噪音"，而是版本不匹配、端口耗尽、网络 fallback、异步错误或 rank 卡死。
+
+### RDMA 与 GPUDirect RDMA
 
 RDMA 解决的是跨节点数据传输路径过长的问题。普通 TCP/IP 通信通常需要数据经过 CPU 内存和内核网络栈，带来多次拷贝、上下文切换和 CPU 开销。RDMA 让网卡直接读写远端已注册内存，绕开内核数据路径；GPUDirect RDMA 进一步让网卡直接访问 GPU 显存。
 
@@ -72,9 +364,25 @@ RDMA 解决的是跨节点数据传输路径过长的问题。普通 TCP/IP 通�
 | **RDMA** | 应用内存 -> NIC -> 网络 -> NIC -> 远端应用内存 | 绕过内核数据路径，降低延迟和 CPU 开销 |
 | **GPUDirect RDMA** | GPU HBM -> NIC -> InfiniBand/RoCE -> NIC -> GPU HBM | 多节点 GPU 训练和推理的关键快路径 |
 
-对 AI 训练来说，RDMA 的价值不只是“网络更快”，而是减少 CPU 参与，让 GPU 间大块数据传输更接近硬件极限。多节点 DDP、FSDP、张量并行、专家并行都会受益，尤其是梯度或参数分片很大时。
+对 AI 训练来说，RDMA 的价值不只是"网络更快"，而是减少 CPU 参与，让 GPU 间大块数据传输更接近硬件极限。多节点 DDP、FSDP、张量并行、专家并行都会受益，尤其是梯度或参数分片很大时。
 
-容器和 Kubernetes 环境中最容易出现“看起来能跑，但其实走慢路径”的问题。常见原因包括 `/dev/infiniband` 没有暴露给容器、`nvidia_peermem` 没加载、GID/权限不匹配、NCCL 选错网卡，或者 RoCE 网络没有正确配置。结果是 NCCL 悄悄退回 socket/TCP，吞吐明显下降，但业务代码不一定报错。
+#### InfiniBand、RoCE 与普通以太网
+
+这三者不是同一层级的概念，容易混淆。从物理层到 NCCL 层的关系如下：
+
+| 层级 | InfiniBand | RoCE | 普通以太网 |
+| --- | --- | --- | --- |
+| **物理网络** | 专用 IB 交换机 | 普通以太网交换机 | 普通以太网交换机 |
+| **协议** | RDMA 原生 | RDMA over 以太网 | TCP/IP |
+| **Linux 设备名** | `ib0` | `eth0` / `bond0` | `eth0` / `bond0` |
+| **NCCL 识别为** | NET/IB | NET/IB（需要插件） | NET/Socket |
+| **性能** | 最快 | 接近 IB | 慢 10–50× |
+
+注意 RoCE 网卡和普通以太网卡在 Linux 层面可能有相同的设备名（`eth0` 或 `bond0`），但 RoCE 网卡具备 RDMA 能力。NCCL 能否识别出这一能力取决于是否安装了正确的网络插件（如 `libnccl-net.so`）。如果插件缺失，NCCL 会把 RoCE 网卡当成普通以太网，静默退回 TCP Socket 慢路径。
+
+Bond 本身不是一种网络技术，而是 Linux 把多张物理网卡捆绑成一个逻辑接口的机制（提高带宽或做冗余），InfiniBand 和以太网卡都可以做 bond。
+
+容器和 Kubernetes 环境中最容易出现"看起来能跑，但其实走慢路径"的问题。常见原因包括 `/dev/infiniband` 没有暴露给容器、`nvidia_peermem` 没加载、GID/权限不匹配、NCCL 选错网卡，或者 RoCE 网络没有正确配置。结果是 NCCL 悄悄退回 socket/TCP，吞吐明显下降，但业务代码不一定报错。
 
 <Frame caption="直接连接 NIC 可以绕过 CPU 到 PCIe switch 的瓶颈，让 GPU 与 NIC 之间获得更完整的链路吞吐">
   <img src="../images/ch04-figure-4-4-direct-nic.png" alt="Bypassing CPU bottlenecks with direct connectivity between GPUs and NICs" />
@@ -87,57 +395,148 @@ RDMA 解决的是跨节点数据传输路径过长的问题。普通 TCP/IP 通�
 - RDMA perftest：使用 GPU buffer，例如带 `--use_cuda` 的测试。
 - Nsight Systems / 网卡计数器：确认网络传输和 GPU 计算能够并行发生。
 
-### 3. NCCL 与 NVIDIA 通信栈
+### 通信优化的基本判断
 
-NCCL 是训练侧最重要的 GPU collective 通信库。PyTorch DDP、FSDP、Megatron、Horovod 等框架中的 all-reduce、reduce-scatter、all-gather、broadcast，通常都由 NCCL 在底层完成。
+通信优化先看一个问题：**GPU 是在计算，还是在等通信**。如果 GPU 大部分时间在跑 kernel，通信优化收益有限；如果 timeline 中有明显的 all-reduce、copy、socket 或 network wait，通信路径和同步策略就会成为主要瓶颈。
 
-NCCL 不单独存在，它位于 NVIDIA Magnum IO 通信栈里。Magnum IO 把存储 I/O、网络 I/O、网络内计算和 I/O 管理放在同一套性能优化框架下：NCCL 负责 collective，GPUDirect RDMA 负责跨节点 GPU 数据路径，SHARP/NVLS 负责把部分 reduction 下沉到网络或 NVSwitch fabric。
+先按现象建立判断框架。看到 GPU 等待后，不要直接套环境变量模板，而是先判断等待来自框架通信模式、同步频率、传输数据量、跨节点路径，还是 collective 拓扑。不同现象对应的优化手段不同。
 
-<Frame caption="Magnum IO 把 storage、network、in-network compute 和 I/O management 组合成 NVIDIA 的 I/O 加速栈；NCCL 属于其中的 Network I/O / collective 通信路径">
-  <img src="../images/ch04-figure-4-2-magnum-io.png" alt="Four components of NVIDIA Magnum IO acceleration platform" />
+| 现象 | 可能原因 | 优先考虑的优化 | 直觉 |
+| --- | --- | --- | --- |
+| 单机多卡时 GPU0 更忙，其他 GPU 等待 | 使用 `DataParallel`，主 GPU 负责聚合 | 换成 `DistributedDataParallel` | 避免 GPU0 聚合瓶颈，让 NCCL 负责同步 |
+| backward 结束后出现一大段 all-reduce | 梯度同步启动太晚 | DDP bucket、CUDA streams、通信计算重叠 | 边算边同步，减少 GPU 空转 |
+| 每个 step 都有固定同步开销 | 同步频率太高 | 梯度累积 | 多个 micro-batch 后再同步一次 |
+| 网络链路持续打满，GPU 等通信 | 每次传输数据量太大 | 梯度压缩、量化、稀疏化 | 少传数据，但要关注收敛影响 |
+| all-reduce 时 CPU 很忙，GPU 通信慢 | 后端误用 Gloo 或 socket 路径 | 使用 NCCL，并确认走 GPU 通信路径 | GPU collective 不应主要靠 CPU 搬数据 |
+| 跨节点吞吐远低于预期 | NCCL 走 TCP 或 CPU staging 慢路径 | RDMA / GPUDirect RDMA | 让 NIC 直接访问注册内存或 GPU HBM |
+| GPU 数量增加后 all-reduce 扩展性变差 | collective 没有匹配硬件拓扑 | NCCL 拓扑感知、SHARP、NVLS | 让节点内、节点间和网络内计算各走合适路径 |
+| 某个 rank 经常拖慢整轮迭代 | straggler、NUMA 绑定不当或网络局部拥塞 | 检查 rank 级 timeline、CPU affinity 和网卡计数器 | collective 的总耗时由最慢参与者决定 |
+| 分离式推理中 decode 等 KV cache | KV cache 点对点迁移成为瓶颈 | NIXL | 大块点对点数据异步移动 |
+
+**框架通信模式问题。** 单机多卡训练中，如果仍在使用 `DataParallel`，GPU0 往往会更忙。`DataParallel` 是单进程控制多张 GPU，主 GPU 负责 scatter 输入、gather 输出和聚合梯度，容易形成主卡瓶颈。`DistributedDataParallel` 通常是一进程一 GPU，用 NCCL 做梯度 all-reduce，并在 backward 过程中按 bucket 发起异步通信，因此更适合多 GPU 训练。
+
+**通信启动太晚。** 朴素做法是所有 backward 结束后再统一 all-reduce，这会把通信时间直接加到每轮迭代上。更好的做法是把梯度切成 bucket，某个 bucket 一准备好就发起 NCCL all-reduce，同时继续计算后续层的梯度。
+
+<Frame caption="通信与计算重叠：同步模式会让 GPU 等待 all-reduce；DDP bucket 可以在 backward 过程中提前启动通信">
+  <img src="../images/ch04-figure-4-1-overlap.png" alt="Overlapping host-to-device and device-to-host communication with computation on multiple CUDA streams" />
 </Frame>
 
-NCCL 的性能来自两层能力：上层是 collective 算法，下层是 NVIDIA 通信栈。
+需要避免的常见同步点包括 `torch.cuda.synchronize()` 和 `tensor.item()`。前者会等待当前设备上的工作全部完成，后者会把 GPU 标量搬回 CPU，也可能触发同步。计时或日志统计应尽量放在迭代末尾，避免打断重叠流水线。
 
-| 层次 | 组件 | 作用 |
+**同步频率太高。** 如果每个 step 都有固定通信开销，可以用梯度累积减少同步次数。多个 micro-batch 先在本地累积梯度，再做一次 all-reduce，相当于用更多本地计算换更少的跨 GPU 同步。代价是有效 batch size 变大，可能需要重新调学习率和内存预算。
+
+**传输数据量太大。** 如果网络链路持续打满，压缩、量化或稀疏化可以减少每次通信的数据量。这类方法直接作用在"传多少"上，但会改变梯度信息，需要关注收敛稳定性和最终精度。
+
+**跨节点路径太慢。** 如果跨节点吞吐远低于预期，先确认通信后端是否正确。GPU 训练应优先使用 NCCL；如果误用 Gloo，或者 NCCL 因配置问题退回 socket/TCP，通信就会变成 CPU 和内核网络栈主导。
+
+**collective 拓扑不匹配。** 如果 GPU 数量增加后 all-reduce 扩展性变差，问题可能不在单条链路，而在 collective 算法和硬件拓扑没有匹配。还要检查是否存在 straggler：一个 rank 的 CPU 线程、网卡或远端内存访问变慢，就会拖住整个 collective。
+
+实践中的第一步仍然是看 profiler。Nsight Systems 或 PyTorch profiler 里如果看到计算和通信串行排列，就先检查 DDP bucket、同步点和通信后端；如果通信已经被计算覆盖，再继续调 NCCL 算法或网络参数，收益通常会变小。
+
+### 推理通信：从 NCCL 到 NIXL
+
+训练通信的核心是 NCCL collective（all-reduce 同步梯度），推理通信的核心是**点对点 KV cache 传输**——没有 backward，没有梯度，不需要 all-reduce。
+
+#### 为什么要 PD 分离
+
+传统推理系统把 prefill（计算 KV cache）和 decode（逐 token 生成）放在同一组 GPU 上，两个阶段互相干扰：
+
+| | Prefill | Decode |
 | --- | --- | --- |
-| Collective 算法 | Ring、Tree、CollNet、PAT | 根据消息大小和 GPU 数量组织通信 |
-| 节点内互联 | NVLink、NVSwitch、NVLS | 提供 GPU 间高带宽低延迟链路 |
-| 跨节点互联 | InfiniBand、RoCE、GPUDirect RDMA | 让 GPU 跨服务器高速交换数据 |
-| 网络内计算 | SHARP | 在交换机中做部分 reduction，降低端点压力 |
-| 管理与诊断 | NCCL 日志、拓扑文件、UFM/NetQ、Nsight Systems | 验证链路、算法和瓶颈 |
+| 特征 | compute-bound，大矩阵乘 | memory-bound，逐 token 读 KV cache |
+| 关键指标 | TTFT（首 token 延迟） | TPOT（每 token 延迟） |
 
-最典型的 collective 是梯度 all-reduce。每张 GPU 先算出本地梯度，然后 collective 让所有 GPU 得到全局平均梯度。Ring all-reduce 会把梯度切块，每张 GPU 只和相邻 GPU 通信，通过 reduce-scatter 和 all-gather 两个阶段完成同步。
+放在一起时，prefill 抢算力导致 decode 变慢，为保 decode 又让 prefill 排队。DistServe（OSDI 2024）和 Splitwise（Microsoft）的解法：**拆到不同 GPU 上，各自独立优化资源和并行策略。** DistServe 在同样 GPU 预算下服务 7.4x 更多请求。
 
-不同算法适合不同场景：
+```
+Prefill 集群（少量 GPU，高算力，TP=4）
+    ↓ KV cache 传输（RDMA / NVLink）
+Decode 集群（大量 GPU，高带宽，TP=2）
+```
 
-| 算法 | 适合场景 | 直觉 |
+#### NIXL：推理的数据搬运层
+
+PD 分离后，KV cache 必须从 prefill GPU 搬到 decode GPU。搬运目标可能是 GPU HBM、CPU DRAM、甚至 NVMe SSD（显存不够时把冷请求的 KV cache 换出，用户回来再换入）。
+
+NIXL（NVIDIA Inference Xfer Library）是推理场景的数据搬运抽象层，屏蔽内存类型和传输协议的复杂性，自动选择最快路径：NVLink > IB/RoCE > PCIe > GDS/NVMe。
+
+| | NCCL | NIXL |
 | --- | --- | --- |
-| **Ring** | 大消息、高带宽场景 | 把大张量切块，持续喂满链路 |
-| **Tree** | 小消息、低延迟场景 | 通信步数少，启动快 |
-| **CollNet / CollTree** | 多节点训练 | 节点内和节点间分层通信 |
-| **PAT** | 大规模 collective | 兼顾 tree 的低延迟和 ring 的带宽利用 |
-| **SHARP / NVLS** | 支持网络内计算的硬件 | 把部分 reduction 下沉到交换设备或 NVSwitch fabric |
+| 场景 | 训练 | 推理 |
+| 操作 | collective（多对多） | point-to-point（一对一） |
+| 参与者 | 固定 N 个 rank | 动态 worker 池 |
+| 数据 | 梯度 | KV cache / tensor |
+| 抽象层级 | 同层，都在框架和硬件之间 | 同层 |
 
-大多数时候，NCCL 的自动选择已经足够好。手动设置 `NCCL_ALGO`、`NCCL_PROTO` 之前，先用日志和 profiler 确认默认选择确实有问题。更常见、更实际的排障是确认 NCCL 是否选对网卡、是否走 RDMA、是否识别到 NVLink/NVSwitch 拓扑。
+三者关系：DistServe/Splitwise 定义了为什么要拆（架构设计），NIXL 解决拆了之后数据怎么搬（通信实现），NVIDIA Dynamo 把两者整合成完整的推理框架。
 
-常用排查入口：
+> **注意区分：** NVIDIA Dynamo（github.com/ai-dynamo/dynamo）是分布式推理 serving 框架，负责 prefill/decode worker 调度和 NIXL 数据搬运编排。TorchDynamo（`torch.compile` 的前端）是 PyTorch 编译器组件，负责捕获 Python 计算图并交给 TorchInductor 优化。两者完全无关，只是撞名。
 
-| 目标 | 工具 / 环境变量 |
-| --- | --- |
-| 查看初始化、拓扑和网络路径 | `NCCL_DEBUG=INFO` |
-| 聚焦网络和 collective | `NCCL_DEBUG_SUBSYS=INIT,NET,COLL` |
-| 指定网卡，避免走错接口 | `NCCL_SOCKET_IFNAME=<iface>` |
-| 验证 RDMA 路径 | NCCL 日志、RDMA perftest、网卡计数器 |
-| 看通信是否覆盖计算 | Nsight Systems timeline |
+### 其他通信组件
 
-调优 NCCL 时不要把环境变量当作固定模板。先回答三个问题：通信是否真的成为瓶颈，NCCL 是否走了最快链路，collective 是否已经和计算重叠。只有这些问题有明确证据后，算法和环境变量调优才有意义。
+GDS 面向 GPU 与 NVMe 存储之间的数据路径，更多属于下一章存储 I/O 优化。
 
-还有两个生命周期原则值得保留。第一，不要在每个 step 里创建和销毁 NCCL communicator；初始化和拓扑发现应放在训练或服务启动阶段，并在生命周期内复用。第二，不要忽略 NCCL warning。很多 warning 指向的不是“日志噪音”，而是版本不匹配、端口耗尽、网络 fallback、异步错误或 rank 卡死。
+---
 
-### 4. 其他通信组件
+## Part 3: 实验
 
-NIXL 和 GDS 本章只需要建立概念。NIXL 面向分布式推理中的点对点大块数据传输，典型场景是 prefill/decode 分离后迁移 KV cache。GDS 面向 GPU 与 NVMe 存储之间的数据路径，更多属于下一章存储 I/O 优化。
+### bucket_cap_mb 调参（MI300X × 8，XGMI 896 GB/s，ROCm 6.2）
+
+```bash
+# 扫描不同 bucket_cap_mb，记录每个配置的 ms/step
+for bucket in 1 5 10 25 50 100 200; do
+  RCCL_DEBUG=INFO torchrun --nproc_per_node=8 ddp_bench.py \
+    --bucket_cap_mb $bucket \
+    --num_layers 6 --hidden_size 2048 \
+    2>&1 | tee log_bucket_${bucket}.txt
+done
+```
+
+#### 小模型（88 MB，6 层 2048-hidden）
+
+| bucket_cap_mb | ms/step | 相对最优 |
+|---|---|---|
+| 1 | 12.87 | +108% |
+| 5 | 10.55 | +71% |
+| 10 | 7.90 | +28% |
+| 25（默认） | 9.82 | +59% |
+| **50** | **6.18** | **基准** |
+| 100 | 7.78 | +26% |
+| 200 | 7.32 | +18% |
+
+小模型最优 bucket = 50 MB，远大于默认值。模型只有 88 MB，bucket 太小导致通信启动次数多、每次数据量小，启动开销占比大。
+
+#### 大模型（1628 MB，24 层 4096-hidden）
+
+| bucket_cap_mb | ms/step | 相对最优 |
+|---|---|---|
+| 1 | 28.57 | +6% |
+| **5** | **26.95** | **基准** |
+| 10 | 27.36 | +2% |
+| 25（默认） | 28.35 | +5% |
+| 50 | 36.83 | +37% |
+| 100 | 35.73 | +33% |
+| 200 | 35.90 | +33% |
+
+大模型最优 bucket = 5 MB，远小于默认值。模型大、backward 时间长，小 bucket 能更早发起通信，overlap 更充分。
+
+#### Profiler 通信/计算分解（大模型 1628 MB）
+
+```bash
+# 用 torch.profiler 采集 kernel 级耗时，按名称分类为通信和计算
+torchrun --nproc_per_node=8 ddp_bench.py \
+  --bucket_cap_mb 5 --num_layers 24 --hidden_size 4096 \
+  --profile
+```
+
+| bucket_cap_mb | 通信 (ms) | 计算 (ms) | 通信占比 |
+|---|---|---|---|
+| 5 | 128.97 | 119.36 | 43.8% |
+| 25 | 113.72 | 107.20 | 39.0% |
+| 50 | 142.41 | 126.25 | 40.9% |
+| 100 | 119.59 | 114.86 | 38.6% |
+
+通信和计算接近 1:1，梯度同步已是显著瓶颈，这解释了为什么小 bucket（更早 overlap）在大模型上表现最好。
 
 ---
 
@@ -152,14 +551,14 @@ NIXL 和 GDS 本章只需要建立概念。NIXL 面向分布式推理中的点�
 
 ## FAQ
 
-<Accordion title="正常通信和 RDMA 的核心区别是什么？">
-普通 TCP/IP 路径通常需要 CPU 内存和内核网络栈参与。RDMA 让 NIC 直接访问注册内存，GPUDirect RDMA 进一步让 NIC 直接读写 GPU HBM。
-</Accordion>
+## References
 
-<Accordion title="为什么 DDP 通常比 DataParallel 更适合训练？">
-DDP 一般是一进程一 GPU，使用 NCCL all-reduce 同步梯度，并能在 backward 过程中按 bucket 异步通信。DataParallel 由单进程控制多 GPU，主 GPU 聚合容易成为瓶颈。
-</Accordion>
-
-<Accordion title="NCCL 调优先看什么？">
-先看 `NCCL_DEBUG=INFO` 和 Nsight Systems。确认 NCCL 是否走了正确网卡、是否使用 RDMA、是否识别 NVLink/NVSwitch，以及通信是否已经和计算重叠。
-</Accordion>
+- [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/) — NCCL 官方文档，涵盖安装、环境变量、拓扑配置和调优指南
+- [NVIDIA Magnum IO Developer Guide](https://docs.nvidia.com/networking/display/magnum-io-dev-guide/) — Magnum IO 通信栈总览，包括 GPUDirect RDMA、NCCL 和 SHARP 的协同
+- [GPUDirect RDMA Documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/) — GPUDirect RDMA 的内核模块要求、内存注册和验证方法
+- [NCCL Tests (GitHub)](https://github.com/NVIDIA/nccl-tests) — NCCL 官方 benchmark 工具，用于测量 all-reduce、reduce-scatter 等 collective 的带宽和延迟
+- [PyTorch DDP Design Note](https://pytorch.org/docs/stable/notes/ddp.html) — DDP 的 bucket 机制、autograd hook 和通信计算重叠的设计文档
+- [PyTorch DDP Tutorial](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html) — DDP 入门教程，从单机多卡到多节点训练
+- [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving (OSDI 2024)](https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin) — PD 分离架构的原始论文
+- [NIXL: NVIDIA Inference Xfer Library (GitHub)](https://github.com/ai-dynamo/nixl) — 推理场景的点对点数据搬运库
+- [Splitwise: Efficient generative LLM inference with model splitting](https://arxiv.org/abs/2311.18677) — Microsoft 的 PD 分离方案
