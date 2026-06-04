@@ -10,9 +10,9 @@ title: "第四章：分布式网络通信调优"
 
 ---
 
-## Part 1: 为什么 GPU 之间需要通信
+## 1. 为什么 GPU 之间需要通信
 
-### 一个直觉：8 个人合算全班平均分
+### 1.1 一个直觉：8 个人合算全班平均分
 
 假设一次考试有 800 个学生，分给 8 位老师批改，每人批 100 份。每位老师算出自己那 100 份的平均分后，怎么得到全班 800 人的平均分？
 
@@ -34,7 +34,7 @@ title: "第四章：分布式网络通信调优"
 | 8 个人排成一圈传递 | 8 张 GPU 组成逻辑环通信 |
 | 每人最终拿到相同的全班平均分 | 每张 GPU 最终拿到相同的全局梯度 |
 
-### 一个梯度 tensor 的宏观旅程
+### 1.2 一个梯度 tensor 的宏观旅程
 
 理解了"为什么"之后，来看一个具体的训练步骤里发生了什么。假设 8 张 GPU 做数据并行训练，每张 GPU 持有完整模型副本，处理不同的 mini-batch：
 
@@ -54,13 +54,13 @@ title: "第四章：分布式网络通信调优"
 
 这就是 PyTorch DDP 的 bucket 机制——把梯度分成若干桶，每个桶一满就发起同步，不等所有层算完。接下来看 DDP 在代码层面具体怎么实现这件事。
 
-### DDP：PyTorch 如何组织梯度同步
+### 1.3 DDP：PyTorch 如何组织梯度同步
 
 DDP（DistributedDataParallel）是 PyTorch 里最常用的数据并行训练封装。它的基本假设是：每个进程控制一张 GPU，每张 GPU 上都有一份完整模型副本，但每个进程处理不同的 mini-batch。forward 和 backward 都在本地 GPU 上独立执行；真正需要跨 GPU 协作的是 backward 产生的梯度同步。
 
 DDP 要保证两件事：第一，每张 GPU 最终看到相同的全局平均梯度；第二，梯度同步尽量不要阻塞后续 backward 计算。为此，DDP 会在初始化时把参数预先分进 bucket，并给参数梯度注册 autograd hook。backward 过程中，某个 bucket 里的梯度都 ready 后，DDP 就通过通信后端发起 all-reduce，而不是等整个 backward 全部结束。
 
-#### 代码：DataParallel vs DistributedDataParallel
+#### 1.3.1 代码：DataParallel vs DistributedDataParallel
 
 理解了 DDP 的核心思想后，先看它和旧式 `DataParallel` 在使用上的区别：
 
@@ -117,7 +117,7 @@ for data, target in dataloader:
 | 进程模型 | 单进程多线程（GIL 限制） | 多进程（无 GIL，每进程一卡） |
 | 扩展性 | 单机 | 单机 + 多机 |
 
-#### DDP 代码架构
+#### 1.3.2 DDP 代码架构
 
 DDP 的核心逻辑在三层之间分工：`distributed.py` 是 Python 入口，负责初始化和 forward；`reducer.h` 是 C++ 核心，负责 bucket 分配、autograd hook 注册和梯度同步调度；`ProcessGroup.hpp` 是通信抽象层，把 broadcast 和 allreduce 等操作分发给具体的后端实现（NCCL 用于 NVIDIA GPU，RCCL 用于 AMD GPU，Gloo 用于 CPU）。
 
@@ -133,7 +133,7 @@ DDP 的核心逻辑在三层之间分工：`distributed.py` 是 Python 入口，
   <img src="../images/ch04-generated-gradient-bucket-before-allreduce.png" alt="Gradient blocks are grouped into buckets first, then completed buckets launch all-reduce before optimizer step" />
 </Frame>
 
-#### DDP backward 全流程：CPU 调度 + GPU 执行
+#### 1.3.3 DDP backward 全流程：CPU 调度 + GPU 执行
 
 Bucket 按 reverse parameter 顺序排列——backward 先算完的梯度尽量排在更早 ready 的 bucket，使通信尽早开始、与计算 overlap。为了保证所有 rank 发起 collective 的顺序一致，DDP 会按 bucket index 顺序调度 all-reduce；bucket 是预先划分好的分组，all-reduce 作用在已经 ready 的 bucket 上。
 
@@ -143,7 +143,7 @@ Bucket 按 reverse parameter 顺序排列——backward 先算完的梯度尽量
 
 CPU 只做轻量调度（hook 触发、bucket 检查、提交 NCCL 调用），重活全在 GPU 上。通信完成后通知 compute stream 用的是 CUDA Event——GPU 到 GPU 的 stream 同步，不需要 CPU 介入。
 
-### 不只是梯度：分布式 AI 系统需要通信什么
+### 1.4 不只是梯度：分布式 AI 系统需要通信什么
 
 到这里，我们已经完整追踪了一个梯度 tensor 的旅程——从 `loss.backward()` 到 DDP bucket 到 NCCL all-reduce。但分布式系统中需要通信的远不止梯度。
 
@@ -167,7 +167,7 @@ CPU 只做轻量调度（hook 触发、bucket 检查、提交 NCCL 调用），�
 
 ---
 
-## Part 2: NCCL 与 NVIDIA 通信栈
+## 2. NCCL 与 NVIDIA 通信栈
 
 NCCL 是训练侧最重要的 GPU collective 通信库。PyTorch DDP、FSDP、Megatron、Horovod 等框架中的 all-reduce、reduce-scatter、all-gather、broadcast，通常都由 NCCL 在底层完成。与 MPI 等传统库不同，NCCL 把每个 collective 实现在**单个 GPU kernel** 中，通信和计算操作在同一个 kernel 内完成，从而实现快速同步并最小化达到峰值带宽所需的资源开销。
 
@@ -191,11 +191,11 @@ NCCL 的性能来自两层能力：上层是 collective 算法，下层是 NVIDI
 | 网络内计算 | SHARP | 在交换机中做部分 reduction，降低端点压力 |
 | 管理与诊断 | NCCL 日志、拓扑文件、UFM/NetQ、Nsight Systems | 验证链路、算法和瓶颈 |
 
-### 1. Collective 算法：Ring、Tree 与协议
+### 2.1 Collective 算法：Ring、Tree 与协议
 
 最典型的 collective 是梯度 all-reduce。每张 GPU 先算出本地梯度，然后 collective 让所有 GPU 得到全局平均梯度。
 
-#### Ring All-Reduce
+#### 2.1.1 Ring All-Reduce
 
 以 **2 节点 × 4 GPU/节点** 为例，512 MB 梯度（BF16），NCCL 切成 8 块（每块 64 MB），在逻辑环上完成同步：
 
@@ -228,7 +228,7 @@ All-gather 继续沿同一条 ring 路径传播已归约的 chunk，但不再做
 
 Ring 的优势是带宽最优——每个 GPU 发送和接收的数据量都逼近理论下界。但它的弱点在延迟：步数随 GPU 数量**线性增长**，24,576 张卡就需要数万步，规模越大越不可接受。
 
-#### Tree All-Reduce: Double Binary Tree
+#### 2.1.2 Tree All-Reduce: Double Binary Tree
 
 朴素 binary tree 能把步数压到 **O(log N)**——8 张卡只需 3 步。但朴素 tree 有带宽问题：根节点需要处理所有数据，而叶子节点大部分时间闲着。
 
@@ -265,7 +265,7 @@ NCCL 2.4 引入的 **double binary tree**（双互补二叉树）同时解决了
 
 实测中 tree 的带宽在跨 L3 交换机时略有下降（InfiniBand 路由算法与 tree 通信模式的匹配问题），但整体优势明显。与分层 2D ring（节点内 reduce-scatter → 跨节点 all-reduce → 节点内 all-gather）相比，2D ring 的优势随规模保持恒定，而 tree 的优势**随 GPU 数量持续增长**。
 
-#### 不同算法适合不同场景
+#### 2.1.3 不同算法适合不同场景
 
 | 算法 | 适合场景 | 直觉 |
 | --- | --- | --- |
@@ -276,7 +276,7 @@ NCCL 2.4 引入的 **double binary tree**（双互补二叉树）同时解决了
 
 **NCCL 会自动在两种算法间切换**：大消息且 ring 带宽更高时用 ring，小/中消息或大规模集群时用 tree。大多数时候自动选择已经足够好。
 
-#### Simple / LL / LL128 协议
+#### 2.1.4 Simple / LL / LL128 协议
 
 算法（`NCCL_ALGO`）决定数据走什么拓扑路径，协议（`NCCL_PROTO`）决定数据在这条路径上怎么传输和同步。两者是独立的选择维度：
 
@@ -294,7 +294,7 @@ NCCL 2.4 引入的 **double binary tree**（双互补二叉树）同时解决了
 
 例如，一个 512 MB 的梯度 all-reduce 可能走 `Ring + Simple`（大消息，集装箱海运走环形航线），而一个 8 KB 的 bias 梯度走 `Tree + LL`（小消息，电动车闪送走树形快递网络）。
 
-#### NCCL Device API（2.28）：去掉 CPU 中间人
+#### 2.1.5 NCCL Device API（2.28）：去掉 CPU 中间人
 
 传统 NCCL 流程中，每个 bucket ready 后需要 CPU 介入提交 NCCL kernel。NCCL 2.28 Device API 让 GPU kernel 直接发起通信，去掉 CPU round-trip。
 
@@ -312,7 +312,7 @@ NCCL 2.4 引入的 **double binary tree**（双互补二叉树）同时解决了
 | **Multimem** | NVLink SHARP 硬件 multicast | 节点内 reduction |
 | **GIN**（GPU-Initiated Networking） | GPU 直接操作网卡，不经 CPU | 跨节点通信 |
 
-### 2. 节点内互联：NVLink、NVSwitch 与 NVLS
+### 2.2 节点内互联：NVLink、NVSwitch 与 NVLS
 
 节点内 GPU 之间通过 NVLink 和 NVSwitch 互联，提供远高于 PCIe 的带宽。
 
@@ -340,7 +340,7 @@ NVLS 在 NVSwitch fabric 中做 multicast + reduction。利用 NVSwitch 的硬�
 
 用 GPU 上专用的 Copy Engine 硬件代替 SM 做 NVLink 数据搬运。传统 NCCL 通信占用 SM/CTA 资源，和用户计算抢算力；CE collectives 实现 **zero-SM 通信**，让通信和计算完全不争资源。适用于只需数据搬运的 collective（AllGather、AlltoAll），不适用于需要计算的 AllReduce（reduce 阶段仍需 SM）。
 
-### 3. 跨节点互联：InfiniBand、RoCE 与 GPUDirect RDMA
+### 2.3 跨节点互联：InfiniBand、RoCE 与 GPUDirect RDMA
 
 RDMA 解决的是跨节点数据传输路径过长的问题。传统 socket 通信中，数据从应用层出发，要经过 Socket API → TCP/UDP → IP → NIC Driver 整个内核协议栈，到达对端后再逆序走一遍。每一层都意味着一次数据拷贝和上下文切换。
 
@@ -370,7 +370,7 @@ GPUDirect RDMA 在此基础上更进一步：不仅绕过内核，还绕过 CPU 
 
 对 AI 训练来说，RDMA 的价值不只是"网络更快"，而是减少 CPU 参与，让 GPU 间大块数据传输更接近硬件极限。多节点 DDP、FSDP、张量并行、专家并行都会受益，尤其是梯度或参数分片很大时。
 
-#### 跨节点一跳的硬件数据路径
+#### 2.3.1 跨节点一跳的硬件数据路径
 
 <Frame caption="跨节点一跳：GPUDirect RDMA 让 NIC 通过 DMA 直接读写 GPU HBM，数据路径绕过 host memory 和内核网络栈">
   <img src="../images/ch04-generated-gpudirect-rdma-hop.png" alt="Cross-node GPUDirect RDMA path from GPU3 HBM through NICs and IB or RoCE network to GPU4 HBM, bypassing host memory" />
@@ -396,7 +396,7 @@ CPU 不在数据路径上——仅在初始化时注册内存区域（`ibv_reg_m
 | CPU staging | GPU→CPU→NIC→网络→NIC→CPU→GPU | ~6–8 ms | 每次传输 |
 | 纯 TCP/IP | GPU→CPU→内核栈→NIC→网络→NIC→内核栈→CPU→GPU | ~10+ ms | 全程 |
 
-#### 先分清层级：InfiniBand、RoCE 与以太网
+#### 2.3.2 先分清层级：InfiniBand、RoCE 与以太网
 
 这里最容易混淆的是把 InfiniBand、RoCE 和普通以太网当成同一层的三个名字。更准确的看法是：先看物理网络和网卡能力，再看上面跑的是 RDMA 还是 TCP/IP，最后看 NCCL 选择了哪个通信后端。
 
@@ -419,7 +419,7 @@ Bond 本身不是一种网络技术，而是 Linux 把多张物理网卡捆绑�
   <img src="../images/ch04-figure-4-4-direct-nic.png" alt="Bypassing CPU bottlenecks with direct connectivity between GPUs and NICs" />
 </Frame>
 
-### 4. 网络内计算：SHARP
+### 2.4 网络内计算：SHARP
 
 传统 all-reduce 中，每张 GPU 要收发 `2(N-1)/N × data_size` 的数据，reduction 运算（求和/平均）在 GPU 端点完成。SHARP 的思路是：**把 reduction 下沉到 InfiniBand Quantum 交换机里做，端点只收最终结果。**
 
@@ -433,9 +433,9 @@ GPU 把本地梯度发到交换机，交换机直接求和后把结果返回。�
 
 效果：大规模训练（数百~千卡）下 all-reduce 加速 2×–5×，且不需要改用户代码——NCCL 检测到硬件支持后自动启用。
 
-### 5. 管理与诊断
+### 2.5 管理与诊断
 
-#### 排查入口
+#### 2.5.1 排查入口
 
 常用排查入口：
 
@@ -456,11 +456,11 @@ GPU 把本地梯度发到交换机，交换机直接求和后把结果返回。�
 - RDMA perftest：使用 GPU buffer，例如带 `--use_cuda` 的测试。
 - Nsight Systems / 网卡计数器：确认网络传输和 GPU 计算能够并行发生。
 
-#### 生命周期原则
+#### 2.5.2 生命周期原则
 
 不要在每个 step 里创建和销毁 NCCL communicator；初始化和拓扑发现应放在训练或服务启动阶段，并在生命周期内复用。不要忽略 NCCL warning——很多 warning 指向的不是"日志噪音"，而是版本不匹配、端口耗尽、网络 fallback、异步错误或 rank 卡死。
 
-### 通信优化的基本判断
+### 2.6 通信优化的基本判断
 
 通信优化先看一个问题：**GPU 是在计算，还是在等通信**。如果 GPU 大部分时间在跑 kernel，通信优化收益有限；如果 timeline 中有明显的 all-reduce、copy、socket 或 network wait，通信路径和同步策略就会成为主要瓶颈。
 
@@ -528,11 +528,11 @@ for i, (data, target) in enumerate(dataloader):
 
 实践中的第一步仍然是看 profiler。Nsight Systems 或 PyTorch profiler 里如果看到计算和通信串行排列，就先检查 DDP bucket、同步点和通信后端；如果通信已经被计算覆盖，再继续调 NCCL 算法或网络参数，收益通常会变小。
 
-### 推理通信：从 NCCL 到 NIXL
+### 2.7 推理通信：从 NCCL 到 NIXL
 
 训练通信的核心是 NCCL collective（all-reduce 同步梯度），推理通信的核心是**点对点 KV cache 传输**——没有 backward，没有梯度，不需要 all-reduce。
 
-#### 为什么要 PD 分离
+#### 2.7.1 为什么要 PD 分离
 
 传统推理系统把 prefill（计算 KV cache）和 decode（逐 token 生成）放在同一组 GPU 上，两个阶段互相干扰：
 
@@ -547,7 +547,7 @@ for i, (data, target) in enumerate(dataloader):
   <img src="../images/ch04-generated-pd-kv-cache-transfer.png" alt="Disaggregated inference with prefill workers sending KV cache blocks point-to-point to decode workers across a high-speed network" />
 </Frame>
 
-#### NIXL：推理的数据搬运层
+#### 2.7.2 NIXL：推理的数据搬运层
 
 PD 分离后，KV cache 必须从 prefill GPU 搬到 decode GPU。搬运目标可能是 GPU HBM、CPU DRAM、甚至 NVMe SSD（显存不够时把冷请求的 KV cache 换出，用户回来再换入）。
 
@@ -565,15 +565,15 @@ NIXL（NVIDIA Inference Xfer Library）是推理场景的数据搬运抽象层�
 
 > **注意区分：** NVIDIA Dynamo（github.com/ai-dynamo/dynamo）是分布式推理 serving 框架，负责 prefill/decode worker 调度和 NIXL 数据搬运编排。TorchDynamo（`torch.compile` 的前端）是 PyTorch 编译器组件，负责捕获 Python 计算图并交给 TorchInductor 优化。两者完全无关，只是撞名。
 
-### 其他通信组件
+### 2.8 其他通信组件
 
 GDS 面向 GPU 与 NVMe 存储之间的数据路径，更多属于下一章存储 I/O 优化。
 
 ---
 
-## Part 3: 实验
+## 3. 实验
 
-### bucket_cap_mb 调参（MI300X × 8，XGMI 896 GB/s，ROCm 6.2）
+### 3.1 bucket_cap_mb 调参（MI300X × 8，XGMI 896 GB/s，ROCm 6.2）
 
 ```bash
 # 扫描不同 bucket_cap_mb，记录每个配置的 ms/step
@@ -585,7 +585,7 @@ for bucket in 1 5 10 25 50 100 200; do
 done
 ```
 
-#### 小模型（88 MB，6 层 2048-hidden）
+#### 3.1.1 小模型（88 MB，6 层 2048-hidden）
 
 | bucket_cap_mb | ms/step | 相对最优 |
 |---|---|---|
@@ -599,7 +599,7 @@ done
 
 小模型最优 bucket = 50 MB，远大于默认值。模型只有 88 MB，bucket 太小导致通信启动次数多、每次数据量小，启动开销占比大。
 
-#### 大模型（1628 MB，24 层 4096-hidden）
+#### 3.1.2 大模型（1628 MB，24 层 4096-hidden）
 
 | bucket_cap_mb | ms/step | 相对最优 |
 |---|---|---|
@@ -613,7 +613,7 @@ done
 
 大模型最优 bucket = 5 MB，远小于默认值。模型大、backward 时间长，小 bucket 能更早发起通信，overlap 更充分。
 
-#### Profiler 通信/计算分解（大模型 1628 MB）
+#### 3.1.3 Profiler 通信/计算分解（大模型 1628 MB）
 
 ```bash
 # 用 torch.profiler 采集 kernel 级耗时，按名称分类为通信和计算
@@ -635,7 +635,7 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
 ## 核心要点
 
-### 核心思想：先判断等待在哪里
+### 4.1 核心思想：先判断等待在哪里
 
 1. 如果 GPU 在等 backward 后的梯度同步，优先看 DDP、bucket 和通信计算重叠。
 2. 如果跨节点通信慢，优先确认 RDMA / GPUDirect RDMA 是否走通。
