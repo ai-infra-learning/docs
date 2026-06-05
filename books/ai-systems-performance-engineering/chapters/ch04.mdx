@@ -386,9 +386,7 @@ GPUDirect RDMA 在此基础上更进一步：不仅绕过内核，还绕过 CPU 
 
 CPU 不在数据路径上——仅在初始化时注册内存区域（`ibv_reg_mr` / `nvidia_peermem`）。
 
-<Warning>
-如果 `nvidia_peermem` 模块没加载，或容器没暴露 `/dev/infiniband/*`，NIC 无法直接访问 GPU HBM。NCCL 会静默退回 **CPU staging 路径**：GPU3 → cudaMemcpy D2H → CPU 内存 → NIC → 网络 → NIC → CPU 内存 → cudaMemcpy H2D → GPU4。多了两次 PCIe 拷贝和 CPU 内存中转，延迟增加 **2–3×**，且业务代码不报错。
-</Warning>
+> **⚠️ 注意：** 如果 `nvidia_peermem` 模块没加载，或容器没暴露 `/dev/infiniband/*`，NIC 无法直接访问 GPU HBM。NCCL 会静默退回 **CPU staging 路径**：GPU3 → cudaMemcpy D2H → CPU 内存 → NIC → 网络 → NIC → CPU 内存 → cudaMemcpy H2D → GPU4。多了两次 PCIe 拷贝和 CPU 内存中转，延迟增加 **2–3×**，且业务代码不报错。
 
 | 路径 | 步骤数 | 单跳延迟（64 MB）| CPU 参与 |
 | --- | --- | --- | --- |
