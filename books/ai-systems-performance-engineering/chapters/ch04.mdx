@@ -573,6 +573,94 @@ GDS 面向 GPU 与 NVMe 存储之间的数据路径，更多属于下一章存�
 
 ### 3.1 bucket_cap_mb 调参（MI300X × 8，XGMI 896 GB/s，ROCm 6.2）
 
+下面是实验用的 `ddp_bench.py` 脚本，构建一个可配置层数和 hidden size 的 Transformer 模型，用 DDP 运行若干 step 并记录平均耗时：
+
+```python
+# ddp_bench.py — DDP bucket_cap_mb benchmark
+import argparse, os, time, torch, torch.distributed as dist, torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--bucket_cap_mb", type=int, default=25)
+    p.add_argument("--num_layers", type=int, default=6)
+    p.add_argument("--hidden_size", type=int, default=2048)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--seq_len", type=int, default=128)
+    p.add_argument("--warmup_steps", type=int, default=5)
+    p.add_argument("--bench_steps", type=int, default=20)
+    p.add_argument("--profile", action="store_true")
+    return p.parse_args()
+
+class SimpleTransformer(nn.Module):
+    def __init__(self, num_layers, hidden_size):
+        super().__init__()
+        self.embed = nn.Linear(hidden_size, hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=8, dim_feedforward=hidden_size * 4, batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        return self.head(self.encoder(self.embed(x)))
+
+def main():
+    args = parse_args()
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
+    model = SimpleTransformer(args.num_layers, args.hidden_size).cuda()
+    model = DDP(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    if local_rank == 0:
+        param_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1e6
+        print(f"Model: {param_mb:.0f} MB | bucket_cap_mb={args.bucket_cap_mb}")
+
+    data = torch.randn(args.batch_size, args.seq_len, args.hidden_size, device="cuda")
+    target = torch.randn_like(data)
+
+    def run_step():
+        optimizer.zero_grad()
+        loss = nn.functional.mse_loss(model(data), target)
+        loss.backward()
+        optimizer.step()
+
+    # warmup
+    for _ in range(args.warmup_steps):
+        run_step()
+    torch.cuda.synchronize()
+
+    if args.profile:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            for _ in range(args.bench_steps):
+                run_step()
+            torch.cuda.synchronize()
+        if local_rank == 0:
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+    else:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(args.bench_steps):
+            run_step()
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - t0) / args.bench_steps * 1000
+        if local_rank == 0:
+            print(f"bucket_cap_mb={args.bucket_cap_mb}  ms/step={elapsed:.2f}")
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+```
+
+用下面的脚本扫描不同的 bucket_cap_mb 配置：
+
 ```bash
 # 扫描不同 bucket_cap_mb，记录每个配置的 ms/step
 for bucket in 1 5 10 25 50 100 200; do
