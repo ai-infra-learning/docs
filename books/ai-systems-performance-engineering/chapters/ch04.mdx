@@ -793,6 +793,12 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   timeline，比较同一个 all-reduce 中各 rank 的到达时间）；网卡计数器（`ethtool -S` / InfiniBand
   `perfquery`，看错误数、丢包、重传）；CPU affinity 检查（`numactl --show` 确认进程绑在正确的 NUMA node）；排除法（每次同一个 rank
   慢 → 查硬件，随机漂移 → 网络拥塞或 OS 抖动）。
+
+  **线上不方便挂 profiler 时**，可以用轻量方式定位：在 all-reduce 前后各插一个 `torch.cuda.synchronize()` +
+  `time.perf_counter()`，每个 rank 把耗时写到各自的日志文件，跑几十个 step 后离线比较哪个 rank 的 skew（最大值 - 最小值）最大。
+  也可以不改代码，直接看 `nvidia-smi dmon -s u` 的 GPU 利用率波动——straggler 所在节点的 GPU util
+  会周期性出现短暂低谷（在等上游计算完成），而其他节点的低谷出现在 collective 等待阶段。网卡侧用 `ethtool -S` 或 InfiniBand
+  `perfquery` 看重传和错误计数，不需要 profiler 也能发现链路级问题。
   </Accordion>
 
   <Accordion title="NCCL_MAX_NCHANNELS 怎么调？">
