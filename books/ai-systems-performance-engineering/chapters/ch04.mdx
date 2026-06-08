@@ -742,6 +742,11 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
   Backward 从最后一层往前算，最后几层的梯度凑满一个 bucket 后，这个 bucket 的 all-reduce 立即启动，同时 backward
   继续计算前面的层。通信和计算流水线式重叠。这就是为什么 bucket 大小很重要——太大则通信启动太晚，太小则启动次数多、开销大。
+
+  Bucket 和层不是一一对应的。一个层通常有多个参数（如 FFN 的 `W1`、`b1`、`W2`、`b2`），这些参数可能分属不同
+  bucket；反过来，多个小层的参数也可能合并进同一个 bucket。DDP 按参数的 reverse 顺序依次填充 bucket，填满一个再开下一个，不关心层边界。但**单个参数的梯度不会被拆到多个 bucket**——如果某个参数超过 `bucket_cap_mb`，它独占一个
+  bucket。Autograd 对每个参数一次性算完整个 grad tensor，算完才标记 ready；bucket 内所有参数都 ready 后才触发
+  all-reduce。所以不存在"梯度算了一半就被 all-reduce 走"的情况。
   </Accordion>
 
   <Accordion title="互补树好构造吗？能把带宽用满吗？">
