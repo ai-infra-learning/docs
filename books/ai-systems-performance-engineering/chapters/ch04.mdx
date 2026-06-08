@@ -730,6 +730,115 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
 ## FAQ
 
+  <Accordion title="推理时，请求状态为什么也需要移动？">
+  PD 分离架构下，prefill 和 decode 运行在不同 GPU 上。请求交给 decode worker 继续生成时，不仅要搬 KV
+  cache，还要搬请求的元信息——当前生成到第几个 token、sampling 参数、stop conditions、已生成的 token ids。没有这些状态，decode
+  worker 不知道从哪接着生成。
+  </Accordion>
+
+  <Accordion title="DDP 的 bucket 是什么？梯度同步必须所有 GPU 一起完成吗？">
+  Bucket 是 DDP 对参数梯度的预分组（默认每桶上限 25 MB）。单个 bucket 的 all-reduce 确实是 collective——所有 rank 必须共同完成。但
+  DDP 不是对整个模型做一次 all-reduce，而是按 bucket 拆成多次独立的 all-reduce。
+
+  Backward 从最后一层往前算，最后几层的梯度凑满一个 bucket 后，这个 bucket 的 all-reduce 立即启动，同时 backward
+  继续计算前面的层。通信和计算流水线式重叠。这就是为什么 bucket 大小很重要——太大则通信启动太晚，太小则启动次数多、开销大。
+  </Accordion>
+
+  <Accordion title="互补树好构造吗？能把带宽用满吗？">
+  构造方法来自 Sanders, Speck & Träff (2009)，对 2^k 个 rank
+  有确定性构造——把第一棵树的叶子和内部节点角色翻转即可。两棵树各走一半数据，叠加后每个 rank 收发量与 ring
+  一致，接近带宽最优。唯一的例外是 root 在单棵树中负载略低，但因为两棵树互补，整体接近满带宽。
+  </Accordion>
+
+  <Accordion title="Ring 和 Tree 有没有卡数判断基线？单机八卡多机还有必要走 Tree 吗？">
+  没有固定卡数阈值，取决于消息大小 × GPU 数量。大消息 + 少量 GPU 倾向
+  Ring（带宽打满，步数少时延迟不是问题）；小消息或大规模集群倾向 Tree（O(log N) 步，启动快）。
+
+  单机八卡或小规模多机（2-4 台），Ring 通常够用。64+ 卡时 Tree 的 O(log N) 优势开始显现。实际中 NCCL 会对不同 collective
+  自动选择——大 bucket 走 Ring 吃带宽，小 bucket 走 Tree 低延迟，通常不需要手动指定。
+  </Accordion>
+
+  <Accordion title="有了 GPUDirect 之后，还有哪些操作在 CPU？Autograd hook 能移到 GPU 吗？">
+  核心数据路径（梯度/参数/KV cache 搬运）已不需要 CPU。CPU 仍负责：初始化与拓扑发现（communicator
+  创建、内存注册）、控制面操作（bootstrap、barrier、health check，走 TCP，数据量极小）、传统模式下的 NCCL kernel 调度（2.28 Device
+  API 可消除）、数据加载与预处理。
+
+  DDP 的 autograd hook 也在 CPU 上，但它做的是轻量调度（标记梯度 ready、检查 bucket、提交 NCCL
+  调用），微秒级开销。理论上，在静态图场景下（torch.compile / CUDA Graphs），backward 执行顺序和 bucket
+  映射都是固定的，可以把就绪判断做成 GPU 端原子计数、通信发起走 Device API，完全不需要 CPU 介入。但动态图（eager mode）下 autograd
+  图遍历本身依赖 CPU 调度，无法消除。实际中这部分开销是微秒级，不是性能瓶颈。
+
+  数据面是 NVLink/InfiniBand 上实际搬运 tensor 的路径，追求高带宽；控制面是协调"谁跟谁通信、何时开始"的信令，走 TCP，KB
+  级，不是瓶颈。
+  </Accordion>
+
+  <Accordion title="Registered host memory 和普通 CPU memory 一样吗？">
+  不一样。Registered（pinned）memory 通过 `cudaHostRegister()` 注册后页锁定——OS 不会 swap 到磁盘，GPU DMA 和 NIC
+  可以直接访问，物理地址已知，硬件可以直接 DMA。普通 CPU 内存（pageable）随时可能被换出，需要先拷贝到 pinned buffer
+  再传输，多一次拷贝。
+  </Accordion>
+
+  <Accordion title="NCCL 的算法/协议自动选择需要手动开启吗？">
+  不需要，默认行为。NCCL 根据消息大小、GPU 数量和拓扑自动选 Ring/Tree 和 Simple/LL/LL128。手动覆盖用 `NCCL_ALGO` 和
+  `NCCL_PROTO`，但一般不建议，除非 profiler 显示自动选择不是最优。DDP 层面的 `bucket_cap_mb` 需要手动调。
+  </Accordion>
+
+  <Accordion title="可以把 TCP 路径禁掉吗？">
+  不建议。NCCL bootstrap（进程发现和初始化握手）必须走 TCP。应该做的是确保数据面不走 TCP：正确配置 RDMA 环境，用 `NCCL_DEBUG=INFO`
+  确认日志中数据传输走 `NET/IB` 而非 `NET/Socket`。如果看到后者，排查 RDMA 配置而不是禁 TCP。
+  </Accordion>
+
+  <Accordion title="Straggler 怎么找？所有 rank 都卡住了，很难定位">
+  Collective 让所有 rank 等最慢的那个，表面上"全卡了"。排查方法：Per-rank profiling（Nsight Systems 对每个 rank 分别采集
+  timeline，比较同一个 all-reduce 中各 rank 的到达时间）；网卡计数器（`ethtool -S` / InfiniBand
+  `perfquery`，看错误数、丢包、重传）；CPU affinity 检查（`numactl --show` 确认进程绑在正确的 NUMA node）；排除法（每次同一个 rank
+  慢 → 查硬件，随机漂移 → 网络拥塞或 OS 抖动）。
+  </Accordion>
+
+  <Accordion title="NCCL_MAX_NCHANNELS 怎么调？">
+  Channel 是 NCCL 的并行通信流水线。更多 channel = 更高带宽利用，但占更多 SM 资源。默认值通常够用。调之前先看 Nsight Systems
+  确认瓶颈在通信带宽——带宽没打满且 SM 有余量可以调大；通信 kernel 抢 SM 影响计算，应调小或改用 Copy Engine Collectives。
+  </Accordion>
+
+  <Accordion title="Profiling 是不是要一直开着？">
+  不需要，profiling 本身有 5-15% 开销。发现异常后下一次运行中加 profiler，采集几个 step 即可（`nsys profile --duration 30` 或
+  PyTorch Profiler 指定步数）。如果问题是卡死（hang）而非"慢"，需要不同工具：`NCCL_DEBUG=WARN` 看异步错误、`py-spy`
+  看调用栈、`nvidia-smi` 看 GPU 利用率是否归零。
+  </Accordion>
+
+  <Accordion title="NIXL 和 NCCL 有什么区别？NCCL group 只有 2 个节点就是 NIXL 吗？">
+  不是。即使 NCCL group 只有 2 个节点，做的仍然是 collective 语义——双方必须同步到达同步点。NIXL 是异步点对点语义：发送方 put
+  数据到接收方指定地址，不需要接收方同时参与；支持多种内存类型（GPU HBM / CPU DRAM / NVMe）任意组合；worker
+  动态加入离开；自动选最快路径。NCCL 为训练设计（固定 rank、collective），NIXL 为推理设计（动态 worker、point-to-point）。
+  </Accordion>
+
+  <Accordion title="Inference 数据是动态的，NCCL 能很好处理吗？">
+  NCCL 假设固定数量的 rank、固定的 communicator、重复执行相同的 collective，不匹配推理场景（动态 worker 池、点对点 KV cache
+  传输、连接随请求建立/销毁）。这正是 NIXL 存在的原因——专为推理场景的异步点对点传输设计。
+  </Accordion>
+
+  <Accordion title="除了数据并行按 GPU 数量均分 mini-batch，其他并行策略如何切分数据？能否不按单卡均分？">
+  数据并行（DDP）按 GPU 数量均分 mini-batch，这是最直观的切法。但其他并行策略切的不是数据，而是模型或计算本身，且不一定均分：
+
+  - **张量并行（TP）**：切层内权重矩阵。例如一个 `[4096, 4096]` 的线性层，TP=4 时每张 GPU 持有 `[4096,
+  1024]`，按矩阵维度切分，不依赖 GPU 总数。
+  - **流水线并行（PP）**：按层分段。各段的层数可以不同——如果前几层计算量更大，可以分给更多 GPU（不均匀切分）。
+  - **专家并行（EP）**：MoE 的 expert 分散到不同 GPU。每张 GPU 上的 expert 数量可以不同，且每个 token 只路由到少数
+  expert，负载天然不均匀。
+  - **ZeRO / FSDP**：切参数 + 优化器状态 + 梯度。切分粒度由 ZeRO stage 决定（Stage 1 只切优化器状态，Stage 3 切所有），与 GPU
+  数量无关。
+  - **序列并行（SP）**：切长序列。每张 GPU 处理序列的一个片段，片段长度可以按计算量调整。
+
+  实践中多种策略组合使用（3D/4D 并行），同一组 GPU
+  可能在不同维度上用不同的切法和不同的并行度。切分方式的选择取决于模型结构、硬件拓扑和通信开销的权衡。
+  </Accordion>
+
+  <Accordion title="用真实请求做推理 replay profiling，会有用户数据隐私问题吗？">
+  有潜在风险。Nsight Systems trace 通常只记录 kernel 名称、时长和内存地址，不记录 tensor 内容，PII 风险相对低。但自定义日志或
+  debug print 可能泄漏实际数据。建议用合成数据或脱敏数据做性能 benchmark；如果必须用真实数据，确保在安全环境中操作，trace
+  文件按敏感数据处理。
+  </Accordion>
+
 ## References
 
 - [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/) — NCCL 官方文档，涵盖安装、环境变量、拓扑配置和调优指南
