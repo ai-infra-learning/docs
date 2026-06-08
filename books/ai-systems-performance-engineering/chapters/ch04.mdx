@@ -824,19 +824,18 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   </Accordion>
 
   <Accordion title="除了数据并行按 GPU 数量均分 mini-batch，其他并行策略如何切分数据？能否不按单卡均分？">
-  数据并行（DDP）按 GPU 数量均分 mini-batch，这是最直观的切法。但其他并行策略切的不是数据，而是模型或计算本身，且不一定均分：
+  先澄清：**训练数据的切分只发生在数据并行维度**。其他并行策略（TP、PP、EP）切的是模型，不是数据——同一份输入数据会被所有参与计算的
+  GPU 共同处理，只是每张卡负责模型的不同部分。
 
-  - **张量并行（TP）**：切层内权重矩阵。例如一个 `[4096, 4096]` 的线性层，TP=4 时每张 GPU 持有 `[4096,
-  1024]`，按矩阵维度切分，不依赖 GPU 总数。
-  - **流水线并行（PP）**：按层分段。各段的层数可以不同——如果前几层计算量更大，可以分给更多 GPU（不均匀切分）。
-  - **专家并行（EP）**：MoE 的 expert 分散到不同 GPU。每张 GPU 上的 expert 数量可以不同，且每个 token 只路由到少数
-  expert，负载天然不均匀。
-  - **ZeRO / FSDP**：切参数 + 优化器状态 + 梯度。切分粒度由 ZeRO stage 决定（Stage 1 只切优化器状态，Stage 3 切所有），与 GPU
-  数量无关。
-  - **序列并行（SP）**：切长序列。每张 GPU 处理序列的一个片段，片段长度可以按计算量调整。
+  具体来说，训练数据在各策略下的去向：
 
-  实践中多种策略组合使用（3D/4D 并行），同一组 GPU
-  可能在不同维度上用不同的切法和不同的并行度。切分方式的选择取决于模型结构、硬件拓扑和通信开销的权衡。
+  - **数据并行（DDP/FSDP/ZeRO）**：每张 GPU 拿到不同的 mini-batch 子集，独立做 forward/backward，最后同步梯度。这是唯一真正"切数据"的维度。
+  - **张量并行（TP）**：同一份输入数据广播到 TP group 内所有 GPU，每张卡只算权重矩阵的一部分，结果再 all-reduce/all-gather 拼回来。数据没切，切的是矩阵乘法。
+  - **流水线并行（PP）**：同一份 mini-batch 被切成若干 micro-batch，依次流过各 stage。每个 stage 看到完整的 micro-batch，只是在时间上错开。数据没在空间上切分，而是在时间上流水。
+  - **专家并行（EP）**：每个 token 被路由到少数 expert，all-to-all 把 token 发给对应 GPU。这里切的是"哪些 token 给哪个 expert"，由 router 动态决定，不是预先均分。
+
+  所以"能否不按单卡均分"——在数据并行维度，PyTorch `DistributedSampler` 默认均分，但可以自定义不均匀采样（比如按 GPU
+  显存大小分配不同 batch size）。代价是梯度聚合时需要按实际 sample 数加权平均，否则大 batch 的 GPU 对梯度贡献被低估。
   </Accordion>
 
   <Accordion title="用真实请求做推理 replay profiling，会有用户数据隐私问题吗？">
