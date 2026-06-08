@@ -765,12 +765,11 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
   <Accordion title="有了 GPUDirect 之后，还有哪些操作在 CPU？Autograd hook 能移到 GPU 吗？">
   核心数据路径（梯度/参数/KV cache 搬运）已不需要 CPU。CPU 仍负责：初始化与拓扑发现（communicator
-  创建、内存注册）、控制面操作（bootstrap、barrier、health check，走 TCP，数据量极小）、传统模式下的 NCCL kernel 调度（2.28 Device
-  API 可消除）、数据加载与预处理。
+  创建、内存注册）、控制面操作（bootstrap、barrier、health check，走 TCP，数据量极小）、传统模式下每次 collective 的 CPU 端提交（NVSHMEM
+  的 device-side API 或 CUDA Graphs 可消除这一步）、数据加载与预处理。
 
   DDP 的 autograd hook 也在 CPU 上，但它做的是轻量调度（标记梯度 ready、检查 bucket、提交 NCCL
-  调用），微秒级开销。理论上，在静态图场景下（torch.compile / CUDA Graphs），backward 执行顺序和 bucket
-  映射都是固定的，可以把就绪判断做成 GPU 端原子计数、通信发起走 Device API，完全不需要 CPU 介入。但动态图（eager mode）下 autograd
+  调用），微秒级开销。在静态图场景下（torch.compile / CUDA Graphs），整个 backward + NCCL 调用可以被捕获为 graph 一次性 replay，消除每轮迭代的 CPU 提交开销。但动态图（eager mode）下 autograd
   图遍历本身依赖 CPU 调度，无法消除。实际中这部分开销是微秒级，不是性能瓶颈。
 
   数据面是 NVLink/InfiniBand 上实际搬运 tensor 的路径，追求高带宽；控制面是协调"谁跟谁通信、何时开始"的信令，走 TCP，KB
@@ -801,14 +800,17 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
   **线上不方便挂 profiler 时**，可以用轻量方式定位：在 all-reduce 前后各插一个 `torch.cuda.synchronize()` +
   `time.perf_counter()`，每个 rank 把耗时写到各自的日志文件，跑几十个 step 后离线比较哪个 rank 的 skew（最大值 - 最小值）最大。
-  也可以不改代码，直接看 `nvidia-smi dmon -s u` 的 GPU 利用率波动——straggler 所在节点的 GPU util
-  会周期性出现短暂低谷（在等上游计算完成），而其他节点的低谷出现在 collective 等待阶段。网卡侧用 `ethtool -S` 或 InfiniBand
+  也可以不改代码，直接看 `nvidia-smi dmon -s u` 的 GPU 利用率波动——straggler 通常是计算慢的那个（GPU util
+  持续高），而其他节点因为提前算完、在 collective 里等 straggler，会出现周期性的 util 低谷。如果某个节点每轮迭代都比别人多一段
+  idle gap，说明它在等别人（它不是 straggler）；如果某个节点几乎没有 idle gap 但别人都在等，它就是 straggler。网卡侧用 `ethtool -S` 或 InfiniBand
   `perfquery` 看重传和错误计数，不需要 profiler 也能发现链路级问题。
   </Accordion>
 
   <Accordion title="NCCL_MAX_NCHANNELS 怎么调？">
   Channel 是 NCCL 的并行通信流水线。更多 channel = 更高带宽利用，但占更多 SM 资源。默认值通常够用。调之前先看 Nsight Systems
   确认瓶颈在通信带宽——带宽没打满且 SM 有余量可以调大；通信 kernel 抢 SM 影响计算，应调小或改用 Copy Engine Collectives。
+
+  注意：NCCL 2.21+ 将 `NCCL_MAX_NCHANNELS` 改名为 `NCCL_MAX_CTAS`（对应 `NCCL_MIN_CTAS`）。旧名称在部分版本仍兼容，但新部署建议用新名称。
   </Accordion>
 
   <Accordion title="Profiling 是不是要一直开着？">
