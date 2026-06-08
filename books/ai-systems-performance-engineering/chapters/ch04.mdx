@@ -843,11 +843,6 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   显存大小分配不同 batch size）。代价是梯度聚合时需要按实际 sample 数加权平均，否则大 batch 的 GPU 对梯度贡献被低估。
   </Accordion>
 
-  <Accordion title="用真实请求做推理 replay profiling，会有用户数据隐私问题吗？">
-  有潜在风险。Nsight Systems trace 通常只记录 kernel 名称、时长和内存地址，不记录 tensor 内容，PII 风险相对低。但自定义日志或
-  debug print 可能泄漏实际数据。建议用合成数据或脱敏数据做性能 benchmark；如果必须用真实数据，确保在安全环境中操作，trace
-  文件按敏感数据处理。
-  </Accordion>
 
 ## References
 
