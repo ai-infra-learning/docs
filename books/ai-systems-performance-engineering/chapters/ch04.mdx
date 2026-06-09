@@ -750,9 +750,10 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   </Accordion>
 
   <Accordion title="互补树好构造吗？能把带宽用满吗？">
-  构造方法来自 Sanders, Speck & Träff (2009)，对 2^k 个 rank
+  构造方法来自 [Sanders, Speck & Träff (2009)]https://www.sciencedirect.com/science/article/abs/pii/S0167819109000957），对 2^k 个 rank
   有确定性构造——把第一棵树的叶子和内部节点角色翻转即可。两棵树各走一半数据，叠加后每个 rank 收发量与 ring
   一致，接近带宽最优。唯一的例外是 root 在单棵树中负载略低，但因为两棵树互补，整体接近满带宽。
+  具体也可以看NV的这个博客 [Massively Scale Your Deep Learning Training with NCCL 2.4]（https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/#ref3）
   </Accordion>
 
   <Accordion title="Ring 和 Tree 有没有卡数判断基线？单机八卡多机还有必要走 Tree 吗？">
@@ -862,3 +863,4 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 - [Scaling Deep Learning Training with NVSHMEM](https://developer.nvidia.com/blog/scaling-deep-learning-training-nvshmem/) — NVSHMEM GPU-initiated 通信模型，MPI 与 NVSHMEM 通信模式对比
 - [到底什么是All-Reduce、All-to-All？](https://zhuanlan.zhihu.com/p/1976642212977713852) - 图解各种通信原语
 - [Ring Allreduce并行计算优化](https://www.deeplearn.me/2649.html) - 图解Ring Allreduce
+- [Massively Scale Your Deep Learning Training with NCCL 2.4](https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/#ref3) - 图解Double Binaty Tree 
