@@ -2,6 +2,17 @@
 title: "第四章：分布式网络通信调优"
 ---
 
+## 录屏回看
+
+<iframe
+  src="https://player.bilibili.com/player.html?bvid=BV1HTEK6qEak&autoplay=0&high_quality=1"
+  width="100%"
+  height="480"
+  scrolling="no"
+  frameBorder="0"
+  allowFullScreen
+/>
+
 ## 本章概要
 
 分布式 AI 系统的核心瓶颈经常不是 GPU 算得慢，而是 GPU 在等数据。训练时，梯度、参数分片和激活值需要在多张 GPU 之间同步；推理时，KV cache、请求状态和模型分片需要在不同 worker 之间移动。规模越大，通信路径、同步时机和网络拓扑越影响整体吞吐。
@@ -719,9 +730,7 @@ torchrun --nproc_per_node=8 ddp_bench.py \
 
 ---
 
-## 核心要点
-
-### 4.1 核心思想：先判断等待在哪里
+## 核心思想：先判断等待在哪里
 
 1. 如果 GPU 在等 backward 后的梯度同步，优先看 DDP、bucket 和通信计算重叠。
 2. 如果跨节点通信慢，优先确认 RDMA / GPUDirect RDMA 是否走通。
@@ -847,7 +856,7 @@ torchrun --nproc_per_node=8 ddp_bench.py \
   </Accordion>
 
 
-## References
+## 参考资料
 
 - [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/) — NCCL 官方文档，涵盖安装、环境变量、拓扑配置和调优指南
 - [NVIDIA Magnum IO Developer Guide](https://docs.nvidia.com/networking/display/magnum-io-dev-guide/) — Magnum IO 通信栈总览，包括 GPUDirect RDMA、NCCL 和 SHARP 的协同
