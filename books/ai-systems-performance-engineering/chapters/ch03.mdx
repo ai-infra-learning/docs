@@ -2276,69 +2276,71 @@ resources:
 
 </Accordion>
 
-#### 3.4 GPU 时钟与 ECC
+#### 3.4 GPU 时钟频率与 ECC
 
-GPU Boost 会根据功耗、温度和负载动态调频。benchmark 或容量规划时，动态时钟会让相同脚本在不同 run 之间出现假差异。[`nvidia-smi` 文档](https://docs.nvidia.com/deploy/nvidia-smi/)提供了 `--lock-gpu-clocks`、`--lock-memory-clocks`、`--power-limit` 和 ECC 查询接口。
+NVIDIA GPU 的 GPU Boost 会在功耗和温度限制内自动调整核心频率。大多数时候，让 GPU 按默认策略动态调频即可。
+
+**需要确定性、可重复的结果时，比如做 benchmark，可以把核心频率锁到固定档位**。日常训练和推理建议保持 auto-boost 开启；只有观察到明显的性能波动或 GPU throttling 时，再考虑锁频排查。
+
+锁频前先查看 GPU 支持的频率档位。这里关注 `Graphics`，它对应核心频率：
 
 ```bash
-# 查看支持的频率和当前 throttle reason
-nvidia-smi -q -d SUPPORTED_CLOCKS,PERFORMANCE,POWER,TEMPERATURE
+nvidia-smi -q -d SUPPORTED_CLOCKS
 
-# 锁定核心时钟，Volta+ 支持
-sudo nvidia-smi -lgc <min_clock>,<max_clock>
+# 输出结果
+==============NVSMI LOG==============
 
-# 锁定显存时钟，不同架构支持情况不同
-sudo nvidia-smi -lmc <min_mem_clock>,<max_mem_clock>
+Timestamp                                              : Sun Jun 21 03:34:51 2026
+Driver Version                                         : 590.48.01
+CUDA Version                                           : 13.1
 
-# 设置功耗上限
-sudo nvidia-smi -pl <watts>
+Attached GPUs                                          : 5
+GPU 00000000:01:00.0
+    Supported Clocks
+        Memory                                         : 1593 MHz
+            Graphics                                   : 1410 MHz
+            Graphics                                   : 1395 MHz
+            Graphics                                   : 1380 MHz
+            Graphics                                   : 1365 MHz
+            Graphics                                   : 1350 MHz
+            Graphics                                   : 1335 MHz
+            Graphics                                   : 1320 MHz
+......
+```
 
-# 恢复默认
+下面的例子使用上面输出中的 1410MHz。实际操作时，应换成当前机器 `SUPPORTED_CLOCKS` 里列出的值。
+
+```bash
+# 固定核心频率，相当于让 auto-boost 不再动态拉升
+sudo nvidia-smi -lgc 1410,1410
+
+# 解锁核心频率，恢复默认动态调频
 sudo nvidia-smi -rgc
-sudo nvidia-smi -rmc
 ```
 
-ECC 在数据中心 GPU 上应保持启用。`nvidia-smi -q -d ECC` 可以看 correctable / uncorrectable error、page retirement 和 row remapper 状态。长训练中，未纠正错误比少量性能开销更危险。
 
-<Accordion title="练习入口：性能功耗比扫描">
+ECC（Error-Correcting Code，纠错码）用于保护显存数据。比如宇宙射线导致单比特内存错误时，ECC 可以在运行中纠正；如果出现双比特错误，ECC 会检测到，并向调用代码抛出错误。NVIDIA 数据中心 GPU 通常默认启用 ECC。
 
-`power_tuning_tool.py` 会扫描 power limit，并输出平均功耗、最大功耗、TFLOP/s 和 TFLOP/J。这个练习适合回答“锁到满功耗是否值得”。
+ECC 会占用一部分显存容量，并带来少量带宽开销。长训练中，未纠正错误比这点性能损耗更危险。可以用下面的命令分别查看 ECC 错误计数：
 
 ```bash
-python -m ch03.power_tuning_tool \
-  --power-limits 300,350,400 \
-  --iterations 5 \
-  --warmup 1
+# ECC 模式和 ECC 错误计数
+$ nvidia-smi -q -d ECC
+GPU 00000000:01:00.0
+    ECC Mode
+        Current                                        : Enabled  # 当前 ECC 已开启
+        Pending                                        : Enabled
+    ECC Errors
+        Volatile
+            SRAM Correctable                           : 0
+            DRAM Correctable                           : 0
+            DRAM Uncorrectable                         : 0        # 不可纠正错误应为 0
+        Aggregate
+            SRAM Correctable                           : 0
+            DRAM Correctable                           : 9        # 可纠正错误，持续增长时需要观察
+            DRAM Uncorrectable                         : 0
+            SRAM Threshold Exceeded                    : No
 ```
-
-</Accordion>
-
-#### 3.5 GPU 内存管理
-
-PyTorch 使用 caching allocator 来减少重复 `cudaMalloc` / `cudaFree` 和设备同步。[PyTorch CUDA semantics 文档](https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management)说明，`nvidia-smi` 中看到的 reserved memory 不等于 tensor 实际占用；应同时看 `memory_allocated()` 与 `memory_reserved()`。
-
-```python
-import torch
-
-print(torch.cuda.memory_summary())
-print(torch.cuda.memory_stats())
-print(torch.cuda.memory_allocated() / 1024**3)
-print(torch.cuda.memory_reserved() / 1024**3)
-```
-
-`PYTORCH_ALLOC_CONF` 只应在定位到碎片问题后使用。官方文档把 `max_split_size_mb` 描述为 OOM 且存在大量 inactive split blocks 时的最后手段；`backend:cudaMallocAsync` 需要 CUDA 11.4+，适合评估长期服务的碎片问题。
-
-```bash
-# 原生 allocator，限制大块拆分
-export PYTORCH_ALLOC_CONF=max_split_size_mb:512
-
-# CUDA async allocator
-export PYTORCH_ALLOC_CONF=backend:cudaMallocAsync
-```
-
-Unified Memory / UVM 能让数据在 CPU 与 GPU 间自动迁移，但深度学习工作负载通常应显式放置 tensor。PyTorch 文档也提示，对于能放进 GPU memory 的 DL workload，显式 placement 通常优于 UVM，因为 page fault 和双向迁移会引入不可预测开销。
-
-Docker `--gpus` 或 `NVIDIA_VISIBLE_DEVICES` 控制 GPU 暴露范围，不提供硬 GPU memory limit。需要硬隔离时使用 MIG；需要软共享时再考虑 MPS 或 Kubernetes GPU sharing。
 
 ### 4. 系统调优脚本
 
@@ -2452,69 +2454,221 @@ echo "Remember to update /etc/default/grub with CPU isolation parameters if need
 
 ### 5. 容器运行时优化
 
+AI 系统常用 Docker、Kubernetes 等容器运行时和编排工具来管理软件环境。容器能把 CUDA、Python package、系统库和推理/训练框架版本固定下来，减少“在我机器上能跑”的环境漂移问题。
+
+容器会引入一点复杂度和少量开销，但配置正确时，GPU workload 可以接近裸机性能。容器不是传统虚拟机（VM）。和 VM 不同，容器共享宿主 OS kernel，CPU 和内存操作通常接近原生速度，没有额外的 hypervisor 虚拟化层。
+
+**配合 NVIDIA Container Toolkit，Docker 容器内的 GPU 访问是直接的，不会引入传统虚拟化开销。对于现代 GPU 和较新的 NVIDIA Container Toolkit，只要环境配置正确，容器内运行和直接在裸机宿主上运行的 GPU 性能通常几乎一致，差异通常可以控制在 [2%](https://www.redhat.com/en/blog/mlperf-inference-v50-results) 以内**。
+
 #### 5.1 NVIDIA Container Toolkit
 
-容器共享宿主 Linux kernel，CUDA kernel 仍在同一块 GPU 上执行。容器 GPU 性能通常接近裸机，真正容易出问题的是 driver/CUDA 版本、设备注入、文件系统和网络路径。
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/) 允许用户构建和运行 GPU 加速容器。它包含 [container runtime library](https://github.com/NVIDIA/libnvidia-container) 和相关工具，可以自动配置容器，让容器使用 NVIDIA GPU。
 
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/)包含 `nvidia-container-runtime`、`nvidia-ctk`、`nvidia-container-cli` 和 `libnvidia-container` 等组件。容器启动时，它负责把 GPU device、driver library 和能力集暴露给容器。
+NVIDIA Container Toolkit 的组件可以分到两条路径里：传统的 OCI `prestart` hook 路径，以及标准化的 CDI 路径。
+
+**Legacy OCI 路径**
+
+- **NVIDIA Container Runtime（`nvidia-container-runtime`）**：OCI runtime wrapper。legacy mode 下，它会修改容器启动时传入的 OCI runtime spec，插入 NVIDIA `prestart` hook，再调用底层容器运行时（`runc` / `crun`）。
+- **NVIDIA Container Runtime Hook（`nvidia-container-runtime-hook`）**：OCI `prestart` hook。在容器创建后、启动前读取 `config.json`，把 GPU device、driver capabilities 和约束转换成 `nvidia-container-cli` 参数。
+- **NVIDIA Container CLI（`nvidia-container-cli`）**：`libnvidia-container` 提供的命令行入口。runtime hook 会调用它完成 GPU device、driver libraries 和权限配置。
+- **NVIDIA Container Library（`libnvidia-container1`）**：底层库，依赖 Linux kernel primitives，提供自动配置 GNU/Linux 容器以使用 NVIDIA GPU 的能力。
+
+**CDI 路径**
+
+- **NVIDIA CDI Hooks（`nvidia-cdi-hook`）**：CDI spec 中可调用的辅助工具，用于调整权限、创建 symlink、更新动态链接器缓存等额外操作。
+
+**公共组件**
+
+- **NVIDIA Container Toolkit CLI（`nvidia-ctk`）**：通用配置与管理工具。legacy 路径下用 `nvidia-ctk runtime configure` 把 NVIDIA runtime 写入 Docker / containerd / CRI-O 配置；CDI 路径下用 `nvidia-ctk cdi generate` 生成 CDI spec。
+
+下图展示了这些组件在传统 OCI hook 路径和 CDI 路径中的关系：
 
 <Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-container-toolkit-architecture.png" alt="NVIDIA Container Toolkit 通过 runC prestart hook 注入 GPU device、driver library 和容器运行时能力" />
+  <img src="/books/ai-systems-performance-engineering/images/ch03-nvidia-container-toolkit-components.png" alt="NVIDIA Container Toolkit 组件关系图，展示 nvidia-ctk、nvidia-container-runtime、runtime hook、nvidia-container-cli、libnvidia-container1、nvidia-cdi-hook 和宿主机 NVIDIA driver stack 的关系" />
 </Frame>
 
-图源：[NVIDIA Container Toolkit Architecture Overview](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/1.8.1/arch-overview.html)
+<Accordion title="OCI 与 CDI">
+
+**[OCI（Open Container Initiative）](https://github.com/opencontainers/runtime-spec)** 定义容器运行时规范。OCI runtime spec 是底层运行时创建容器时读取的配置文件，里面包含要启动的进程、`rootfs`、`mounts`、`env`、`devices`、`hooks`、`namespaces`、`cgroups` 等运行时配置。`runc` / `crun` 这类底层运行时会按这个 spec 创建容器。
+
+**[CDI（Container Device Interface）](https://github.com/cncf-tags/container-device-interface)** 是设备注入规范。CDI spec 里的 `containerEdits` 字段描述需要对 OCI spec 做哪些修改，例如 `deviceNodes`、`mounts`、`env`、`hooks`、`permissions` 等。支持 CDI 的 runtime 会读取 CDI spec，并把这些 edits 应用到 OCI runtime spec。
+
+两者的关系是：OCI 描述容器整体如何启动，CDI 描述设备如何注入容器。支持 CDI 的 runtime 会把 CDI spec 里的设备配置应用到 OCI runtime spec，最后仍由 `runc` / `crun` 按 OCI spec 创建容器。
+
+</Accordion>
+
+<Accordion title="NVIDIA Container Runtime 注入了什么">
+
+GPU 访问本质上依赖 Linux 的设备文件。NVIDIA kernel driver（`nvidia.ko`）加载后，会在宿主机 `/dev/` 下创建一组字符设备：
 
 ```bash
-# 最小验证
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
-
-# 指定 GPU 和能力
-docker run --rm \
-  --gpus '"device=1,2"' \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-  nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
+$ ls -la /dev/nvidia*
+crw-rw-rw- 1 root root 195,   0 Mar 14 10:00 /dev/nvidia0
+crw-rw-rw- 1 root root 195,   1 Mar 14 10:00 /dev/nvidia1
+crw-rw-rw- 1 root root 195, 255 Mar 14 10:00 /dev/nvidiactl
+crw-rw-rw- 1 root root 510,   0 Mar 14 10:00 /dev/nvidia-uvm
+crw-rw-rw- 1 root root 510,   1 Mar 14 10:00 /dev/nvidia-uvm-tools
 ```
 
-版本匹配规则以官方 [NVIDIA Data Center Driver/CUDA support matrix](https://docs.nvidia.com/datacenter/tesla/drivers/supported-drivers-and-cuda-toolkit-versions.html) 为准。写作时（2026-04-25）该矩阵中 R535 支持 CUDA 12.x，R580/R595 支持 CUDA 13.x；[CUDA Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html) 也说明 CUDA 12.x 工具链的最低 driver 是 525.60.13。实际生产不要只记大版本，镜像里的 `NVIDIA_REQUIRE_CUDA` 约束和宿主 driver 小版本都要检查。
+CUDA 程序不会直接和 GPU 硬件通信。它会打开 `/dev/nvidia0` 这类设备文件，并通过 `ioctl()` 系统调用进入宿主机 kernel driver，由 kernel driver 负责和 GPU 硬件交互。
+
+一个裸容器（bare container）本身没有 GPU 访问能力。它的 `/dev/` 目录里只有标准设备，比如 `null`、`zero`、`pts`。NVIDIA Container Runtime（`nvidia-container-runtime`）会在应用启动前向容器注入三类内容：
+
+- **Device nodes**：从宿主机 bind mount `/dev/nvidia0`（具体 GPU 设备文件）、`/dev/nvidiactl`（NVIDIA driver 控制设备）、`/dev/nvidia-uvm`（Unified Virtual Memory）。
+- **Driver libraries**：bind mount `libcuda.so`（CUDA Driver API）、`libnvidia-ml.so`（NVML，用于 `nvidia-smi`、DCGM 和监控工具查询 GPU 状态）和其他与宿主机 driver 匹配的库。
+- **Device permissions**：配置 cgroup device controller，允许容器访问 NVIDIA 主设备号（device major number）。主设备号是 Linux 用来把设备文件路由到对应内核驱动的编号。
+
+</Accordion>
+
+<Accordion title="容器到宿主机 GPU 的调用路径">
+
+下图展示了 GPU 软件栈如何在容器和宿主机之间协同工作：
+
+- **应用层**：`PyTorch`、`TensorRT`、`JAX` 等框架运行在各自容器里。它们会调用容器内的 CUDA 用户态库（`libcudart.so`），也可能直接使用 CUDA Driver API（`libcuda.so`）。
+- **CUDA 用户态库**：`libcudart.so`、cuBLAS、cuDNN、NCCL 等通常来自容器镜像。不同容器可以携带不同 CUDA 版本，例如 CUDA 11.8、12.1、12.4。
+- **CUDA Driver API**：`libcuda.so` 是 driver API 库，通常由宿主机 driver bind mount 进容器。容器内的 CUDA 用户态库和框架代码最终通过它进入宿主机 driver 路径。
+- **设备文件**：`/dev/nvidia0` 是 GPU 设备文件，也由宿主机挂进容器。`libcuda.so` 通过它发起 `ioctl()` 系统调用，跨过 user / kernel 边界。
+- **Kernel driver**：`nvidia.ko` 运行在宿主机 kernel 中，负责处理 `ioctl()` 请求并和 GPU 硬件通信。所有容器共享同一个宿主机 kernel driver。
+- **GPU hardware**：真正执行计算的物理 GPU。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-gpu-container-driver-stack.png" alt="多个容器使用不同 CUDA runtime，通过宿主机挂载的 libcuda.so、/dev/nvidia0 和共享的 nvidia.ko kernel driver 访问 GPU" />
+</Frame>
+
+图源：[How Docker Works with GPUs: Device Files, Bind Mounts, and Driver Stacks](https://www.abhik.ai/concepts/systems/gpu-containers)
+
+</Accordion>
+
+<Accordion title="安装与配置 NVIDIA Container Toolkit">
+
+安装步骤参考官方文档：[Installing the NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)。
+
+安装完成后，还需要把容器运行时接到 NVIDIA Container Runtime。NVIDIA Container Toolkit 支持 Docker、containerd、CRI-O 和 Podman。下面以 Docker 为例，使用 `nvidia-ctk` 命令配置 runtime：
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+```
+
+`nvidia-ctk` 命令会修改宿主机上的 `/etc/docker/daemon.json` 文件，把 `nvidia` runtime 注册进去，让 Docker 可以使用 NVIDIA Container Runtime，配置类似：
+
+```json
+{
+  "runtimes": {
+    "nvidia": {
+      "path": "nvidia-container-runtime",
+      "runtimeArgs": []
+    }
+  }
+}
+```
+
+重启 Docker daemon：
+
+```bash
+sudo systemctl restart docker
+```
+
+安装 GPU driver 并完成 runtime 配置后，可以运行一个 CUDA 容器验证 GPU 是否正确暴露给 Docker：
+
+```bash
+sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
+```
+
+输出应类似下面这样：
+
+```text
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 535.86.10    Driver Version: 535.86.10    CUDA Version: 12.2     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|                               |                      |               MIG M. |
+|===============================+======================+======================|
+|   0  Tesla T4            On   | 00000000:00:1E.0 Off |                    0 |
+| N/A   34C    P8     9W /  70W |      0MiB / 15109MiB |      0%      Default |
+|                               |                      |                  N/A |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|  No running processes found                                                 |
++-----------------------------------------------------------------------------+
+```
+
+</Accordion>
+
+<Accordion title="CUDA 版本与 NVIDIA driver 兼容性">
+
+不同容器之间的 CUDA runtime、CUDA 版本可以不一样，但它们底层共享的是宿主机上的 NVIDIA driver。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-cuda-components.png" alt="CUDA Toolkit 与 NVIDIA driver package 的组成关系：CUDA Toolkit 位于上层，driver package 包含 libcuda.so 和 nvidia.ko" />
+</Frame>
+
+图源：[CUDA Compatibility: CUDA Components](https://docs.nvidia.com/deploy/cuda-compatibility/latest/why-cuda-compatibility.html)
+
+一般规则是：**宿主机 NVIDIA driver 版本必须至少达到容器内 CUDA 版本要求的最低 driver 版本**。
+
+根据 NVIDIA 的 [CUDA Minor Version Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html) 文档：
+
+- CUDA 13.x 需要 Linux 宿主机 NVIDIA driver **R580 驱动分支或更新**。
+- CUDA 12.x 需要 Linux 宿主机 NVIDIA driver **R525 驱动分支或更新**。
+- CUDA 11.x 需要 Linux 宿主机 NVIDIA driver **R450 驱动分支或更新**。
+
+当宿主机 driver 不方便整体升级，但应用或容器需要较新的 CUDA 用户态组件时，可以考虑通过 [Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html) 的方式进行升级。具体做法是：在宿主机 kernel-mode driver（`nvidia.ko`）不变的情况下，通过安装 CUDA Forward Compatibility Package，补上较新的 user-mode driver libraries，例如 `libcuda.so`，让较新的 CUDA 应用在满足条件的旧 driver 环境上运行。
+
+正常升级 NVIDIA driver 会同时更新 user-mode libraries 和 kernel-mode driver。Forward Compatibility Package 只补 user-mode 组件，不替换 `nvidia.ko`。如果新功能依赖新的 kernel driver 能力，仍然需要升级宿主机 driver。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-cuda-forward-compatibility-upgrade-path.png" alt="CUDA Forward Compatibility 通过升级 CUDA user-mode 组件和 libcuda.so，保持 kernel-mode driver nvidia.ko 不变" />
+</Frame>
+
+图源：[CUDA Compatibility: Forward Compatibility Upgrade Path](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html)
+
+</Accordion>
+
 
 #### 5.2 避免 Overlay FS 开销
 
-容器 writable layer 适合代码和少量日志，不适合训练数据、checkpoint、tokenized cache 和模型权重。大文件读写应通过 bind mount、PVC 或本地 NVMe cache 进入容器。
+和直接在宿主机运行相比，Docker 容器更容易出现差异的地方通常是 I/O。容器常用联合文件系统（union filesystem），它的好处很直接：把只读镜像层和可写容器层透明叠加成一个统一视图，容器看起来像在使用一个完整的文件系统。
+
+OverlayFS 在读写文件时会带来额外开销：
+
+- 读取文件时：文件系统需要检查只读层和可写层，判断应该返回哪个版本的文件。额外的 metadata lookup 和层合并逻辑，会比单一文件系统多一点延迟。
+- 修改文件时：如果修改的是只读层里的文件，会触发 copy-on-write。文件必须先复制到可写层，写入发生在这份副本上，而不是原始只读文件上。
+
+<Accordion title="OverlayFS 与 Copy-on-Write（COW）">
+
+OverlayFS 是 Linux 文件系统能力，可以把一个文件系统叠在另一个文件系统之上，并提供一个合并后的视图。
+
+可以把它理解成两个目录：`upper directory` 可读可写，`lower directory` 只读。`upper directory` 一开始通常是空的，只保存挂载之后新增或修改过的文件。OverlayFS 会把它们组合成一个 `merged directory`，让进程看起来像是在访问一个完整的文件系统。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-overlay-filesystem.png" alt="OverlayFS 把只读 lower filesystem 和可写 upper filesystem 合并为 merged filesystem，并在写入 lower 文件时执行 copy-on-write" />
+</Frame>
+
+容器镜像层通常对应只读的 `lower directory`，容器自己的 writable layer 对应 `upper directory`。这样启动容器时不需要复制整份镜像，只需要引用底层只读文件。
+
+当你想写入或修改来自 `lower directory` 的文件时，OverlayFS 会使用一种叫**写时复制（copy-on-write，COW）** 的技术。它不会修改原始文件，而是在 `upper directory` 中创建该文件的一份副本，并把修改应用到这份副本上。因此，如果修改来自 `lower directory` 的 `b.txt`，OverlayFS 会在 `upper directory` 中创建一份 `b.txt` 副本，后续修改都发生在这份副本上，原始的 lower 文件保持不变。这样既能保证基础系统的完整性，也能减少需要复制的数据量。
+
+参考资料：[Scaling Firecracker: Using OverlayFS to Save Disk Space](https://e2b.dev/blog/scaling-firecracker-using-overlayfs-to-save-disk-space)
+
+</Accordion>
+
+**模型训练经常涉及重 I/O 操作，例如读取数据集、加载模型和写入 checkpoint。为了解决这个问题，可以使用 bind mount 把宿主机目录或网络文件系统挂进容器。** Bind mount 会绕过 overlay，因此性能接近直接在宿主机上进行磁盘 I/O。如果宿主文件系统是 NVMe SSD 或 NFS mount，就能获得底层存储设备本身的性能。
 
 ```bash
 docker run --rm --gpus all \
-  --ipc=host \
-  --ulimit memlock=-1:-1 \
   -v /data/dataset:/mnt/dataset:ro \
-  -v /nvme/checkpoints:/mnt/checkpoints \
   nvcr.io/nvidia/pytorch:25.03-py3 \
   python train.py \
-    --data /mnt/dataset \
-    --output /mnt/checkpoints
+    --data /mnt/dataset
 ```
 
-容器运行参数和前面的小节要连起来看：
-
-- `--ipc=host` 或足够大的 `/dev/shm`，避免 DataLoader/NCCL shared memory 不足。
-- `--ulimit memlock=-1:-1`，配合 pinned memory、RDMA 和某些通信库。
-- `--network=host`，只在 MPI/NCCL/RDMA 对网络路径敏感且安全策略允许时使用。
-- `CUDA_DEVICE_ORDER=PCI_BUS_ID`，让容器内 GPU 顺序与 PCIe 拓扑更容易对应。
-- `numactl --cpunodebind/--membind`，在容器入口或 launcher 中绑定 rank。
-
-<Accordion title="练习入口：优化版 Dockerfile">
-
-[`docker_gpu_optimized.dockerfile`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/docker_gpu_optimized.dockerfile) 使用 NGC PyTorch 镜像，安装 `numactl`、`libnuma`、`tcmalloc`、`jemalloc`，并设置 allocator、CUDA arch 和 PyTorch allocator 环境变量。
-
-```dockerfile
-ENV MALLOC_CONF="narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true"
-ENV TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=536870912
-ENV PYTORCH_ALLOC_CONF=max_split_size_mb:512
-ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
-```
-
-文件里的 `ENTRYPOINT ["numactl", "--interleave=all", "python"]` 是通用 fallback。已知每个 rank 对应的 GPU/NUMA 节点时，更推荐在 launcher 中使用 `--cpunodebind=<node> --membind=<node>`，避免本地性被 `--interleave=all` 稀释。
-
-</Accordion>
+这里假设训练数据在宿主机的 `/data/dataset`。`-v /data/dataset:/mnt/dataset:ro` 会把它挂载到容器内的 `/mnt/dataset`，其中 `ro` 表示只读挂载。训练脚本从 `/mnt/dataset` 读取数据，相当于直接从宿主文件系统读取。
 
 #### 5.3 减小镜像体积
 
@@ -2790,7 +2944,7 @@ MPS 将多个进程的 GPU context 合并为一个，允许内核并发执行，
 </Accordion>
 
 <Accordion title="容器 GPU 性能接近裸机">
-容器共享宿主 OS 内核，没有 hypervisor 虚拟化层。NVIDIA Container Toolkit 在容器启动时直接注入宿主的 driver 库，GPU kernel 的执行路径和裸机完全相同。性能差异来自 overlay FS 的 I/O 开销，通过 bind mount 可以绕过。
+容器性能问题通常不在 GPU 是否被“虚拟化”，而在运行时和数据路径是否配置正确。重点检查 driver/CUDA 版本、GPU device 注入、overlay FS、bind mount、网络路径和 NUMA 绑定。
 </Accordion>
 
 <Accordion title="Kubernetes 默认调度的拓扑盲区">
