@@ -2670,16 +2670,185 @@ docker run --rm --gpus all \
 
 这里假设训练数据在宿主机的 `/data/dataset`。`-v /data/dataset:/mnt/dataset:ro` 会把它挂载到容器内的 `/mnt/dataset`，其中 `ro` 表示只读挂载。训练脚本从 `/mnt/dataset` 读取数据，相当于直接从宿主文件系统读取。
 
-#### 5.3 减小镜像体积
+#### 5.3 HPC 场景的容器运行时
 
-镜像体积主要影响拉取、启动和节点磁盘压力。长训练对启动时间不敏感，但大集群滚动升级、弹性推理和 spot 节点恢复会放大镜像体积的成本。
+HPC 集群对容器运行时提出了更高要求。集群通常遵循最小权限原则：用户应以自身身份运行作业，不能提升权限，也不应接触计算节点上由 root 管理的系统守护进程。同时，HPC 容器运行时还需要更便捷地接入 GPU、高速网络和并行文件系统等宿主资源。因此，在 HPC 场景中，有时候会选择 **Apptainer** 或 **Enroot** 这类面向 HPC 集群环境设计的容器运行时。
 
-常见策略：
+[Apptainer](https://apptainer.org/docs/user/latest/introduction.html) 最初是为了在 HPC 集群上以简单、可移植、可复现的方式运行复杂应用而创建的。它最早由劳伦斯伯克利国家实验室（Lawrence Berkeley National Laboratory）开发，很快在其他 HPC 中心、学术机构和更多场景中流行起来。
 
-- 使用 NGC runtime 镜像作为基础镜像，构建工具放在 build stage。
-- 把 wheel cache、apt cache、源码临时目录在同一 layer 清理。
-- 权重、数据集、checkpoint 不进入镜像，通过对象存储、PVC、bind mount 或本地缓存加载。
-- HPC 环境可评估 Apptainer/Singularity，减少 root daemon 依赖并复用宿主文件系统。
+Apptainer 的设计更贴近 HPC 集群的使用方式：
+
+- 可验证的复现性和安全性：支持加密签名、不可变容器镜像格式和内存中解密。
+- 默认强调集成而不是隔离：更容易使用集群上的 GPU、高速网络和并行文件系统。
+- 计算环境可移动：SIF 单文件镜像便于传输、共享和归档。
+- 简单的安全模型：容器内外默认是同一个用户，默认不能因为进入容器而获得宿主机额外权限。
+
+<Accordion title="Apptainer GPU 容器使用">
+
+Apptainer 的安装可参考官方文档：[Installing Apptainer](https://apptainer.org/docs/admin/main/installation.html)。
+
+Apptainer 运行 NVIDIA GPU 容器时，常用 `--nv`。这个选项会让容器看到宿主机的 NVIDIA device entries，并把基础 CUDA/NVIDIA driver libraries 绑定进容器。
+
+```bash
+# 拉取镜像
+# apptainer pull <image-name> docker://<registry>/<repo>:<tag>
+apptainer pull pytorch-cuda.sif docker://docker.io/pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+
+# 在容器中运行命令
+# apptainer exec --nv <image-name> nvidia-smi
+apptainer exec --nv pytorch-cuda.sif nvidia-smi
+```
+
+如果启动的是长期运行的 instance，可以用 `apptainer instance list` 查看，用 `instance://<name>` 进入或执行命令：
+
+```bash
+# 启动 instance
+# apptainer instance start --nv <image-name> <instance-name>
+apptainer instance start --nv pytorch-cuda.sif train-env
+
+# 查看 instance
+apptainer instance list
+
+# 进入 instance
+# apptainer shell instance://<instance-name>
+apptainer shell instance://train-env
+
+# 或直接在 instance 中执行命令
+# apptainer exec instance://<instance-name> nvidia-smi
+apptainer exec instance://train-env nvidia-smi
+
+# 停止 instance
+# apptainer instance stop <instance-name>
+apptainer instance stop train-env
+```
+
+控制 GPU 可见性时，常见方式是在运行容器前设置 `APPTAINERENV_CUDA_VISIBLE_DEVICES`。Apptainer 会把它映射成容器内的 `CUDA_VISIBLE_DEVICES`，影响遵循该变量的 CUDA 程序：
+
+```bash
+export APPTAINERENV_CUDA_VISIBLE_DEVICES=0,1
+apptainer exec --nv pytorch-cuda.sif python - <<'PY'
+import os
+import torch
+
+print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("visible CUDA devices =", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i))
+PY
+
+# 输出结果
+visible CUDA devices = 2
+0 NVIDIA A100-SXM4-80GB
+1 NVIDIA A100-SXM4-80GB
+```
+
+注意，`APPTAINERENV_CUDA_VISIBLE_DEVICES` 限制的是 CUDA 程序使用哪些 GPU，不一定限制 `nvidia-smi` 能枚举到的设备。Apptainer 也提供实验性的 `--nvccli`，通过 NVIDIA 的 `nvidia-container-cli` 完成 GPU 容器配置。它需要宿主机安装 `nvidia-container-cli`，并且通常要配合 `--writable-tmpfs` 或 writable sandbox 使用；在 setuid 安装模式下也有额外安全限制。
+
+在 `--nvccli` 模式下，如果需要更强的设备隔离，可以配合 `--contain` 和 `NVIDIA_VISIBLE_DEVICES` 控制实际绑定进容器的 GPU：
+
+```bash
+export NVIDIA_VISIBLE_DEVICES=1,2
+apptainer run --nvccli --writable-tmpfs --contain pytorch-cuda.sif nvidia-smi
+
+# 输出
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.48.01              Driver Version: 590.48.01      CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-80GB          On  |   00000000:01:00.0 Off |                    0 |
+| N/A   34C    P0             83W /  275W |       1MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100-SXM4-80GB          On  |   00000000:47:00.0 Off |                    0 |
+| N/A   34C    P0             88W /  275W |       1MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+```
+
+参考资料：
+
+- [Apptainer GPU and other Device Support](https://apptainer.org/docs/user/latest/gpu.html)
+- [Container on HPC with Apptainer: GPUs](https://coderefinery.github.io/hpc-containers/gpus/)
+
+</Accordion>
+
+[Enroot](https://github.com/NVIDIA/enroot) 是 NVIDIA 面向高性能环境的轻量容器工具。它的核心特点包括：
+
+- 遵循 KISS 原则和 Unix philosophy。
+- 独立运行，不需要 daemon。
+- 支持完全非特权和多用户使用：不需要 setuid binary，继承 cgroup，并使用每用户配置和容器存储。
+- 使用简单：镜像格式简单，便于脚本化，也支持 root remapping。
+- 几乎不做额外隔离：减少性能开销，也简化 HPC 部署。
+- 可组合、可扩展：支持系统级和用户级配置。
+- Docker 镜像导入速度快，官方 README 中提到大镜像导入可获得 3x 到 5x 加速。
+- 内置基于 `libnvidia-container` 的 GPU 支持。
+- 支持 bundles、in-memory containers 等协作和开发工作流。
+
+<Accordion title="Enroot GPU 容器使用">
+
+安装 Enroot 可参考官方文档：[Enroot Installation](https://github.com/NVIDIA/enroot/blob/main/doc/installation.md#installation)。
+
+使用 Enroot 时，可以从 Docker/NGC registry 导入镜像，再创建并启动容器：
+
+```bash
+# 导入镜像
+# enroot import docker://<registry>#<repo>:<tag>
+enroot import docker://nvcr.io#nvidia/pytorch:25.03-py3
+
+# 创建容器
+# enroot create --name <container-name> <image>.sqsh
+enroot create --name pytorch nvidia+pytorch+25.03-py3.sqsh
+
+# 启动容器并运行命令
+# enroot start <container-name> <command>
+enroot start pytorch nvidia-smi
+```
+
+控制 GPU 可见性时，需要同时设置 `NVIDIA_VISIBLE_DEVICES` 和 `ENROOT_RESTRICT_DEV` 两个环境变量：
+
+```bash
+ENROOT_RESTRICT_DEV=yes NVIDIA_VISIBLE_DEVICES=0,1 enroot start pytorch nvidia-smi
+
+# 输出
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.48.01              Driver Version: 590.48.01      CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-SXM4-80GB          On  |   00000000:01:00.0 Off |                    0 |
+| N/A   34C    P0             83W /  275W |       1MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100-SXM4-80GB          On  |   00000000:47:00.0 Off |                    0 |
+| N/A   34C    P0             88W /  275W |       1MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+```
+
+参考资料：[Enroot README](https://github.com/NVIDIA/enroot)
+
+</Accordion>
 
 ### 6. Kubernetes 编排与拓扑感知调度
 
