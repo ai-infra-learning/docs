@@ -32,7 +32,7 @@ ENABLE_DYNAMIC_MIG=true ./setup-dra-env.sh  # H100+ 额外开启动态 MIG（检
 | `KIND_CONFIG` | `kind-cluster-config.yaml`（同目录） | kind 集群配置 |
 | `DRA_NAMESPACE` | `dra-driver-nvidia-gpu` | DRA driver 命名空间 |
 | `DRA_CHART` | `oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu` | helm chart |
-| `DRA_VERSION` | `0.4.1` | chart 版本 |
+| `DRA_VERSION` | `0.4.0` | chart 版本（registry.k8s.io 上的最新稳定版） |
 | `ENABLE_DYNAMIC_MIG` | `false` | 是否开启 `featureGates.DynamicMIG`（仅 H100+） |
 
 前置条件：主机需已装 NVIDIA GPU 驱动（`v565+`，提供 `nvidia-smi`）。这一步涉及内核模块与重启，脚本不代装，只检查并提示。NVIDIA Container Toolkit 的安装与配置（含设为 docker 默认 runtime、`accept-nvidia-visible-devices-as-volume-mounts`）在 Ubuntu/Debian 上由脚本自动完成，参考[官方安装指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)。

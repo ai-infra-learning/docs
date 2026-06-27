@@ -26,7 +26,7 @@ KIND_VERSION="${KIND_VERSION:-v0.30.0}"
 KIND_CONFIG="${KIND_CONFIG:-${SCRIPT_DIR}/kind-cluster-config.yaml}"
 DRA_NAMESPACE="${DRA_NAMESPACE:-dra-driver-nvidia-gpu}"
 DRA_CHART="${DRA_CHART:-oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu}"
-DRA_VERSION="${DRA_VERSION:-0.4.1}"
+DRA_VERSION="${DRA_VERSION:-0.4.0}"
 ENABLE_DYNAMIC_MIG="${ENABLE_DYNAMIC_MIG:-false}"
 
 log()  { printf '\033[0;32m[setup]\033[0m %s\n' "$*"; }

@@ -28,7 +28,7 @@ ENABLE_DYNAMIC_MIG=true ../scripts/setup-dra-env.sh
 
 ```bash
 helm upgrade -i dra-driver-nvidia-gpu \
-  oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu --version 0.4.1 \
+  oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu --version 0.4.0 \
   --create-namespace --namespace dra-driver-nvidia-gpu \
   --set gpuResourcesEnabledOverride=true \
   --set featureGates.DynamicMIG=true
