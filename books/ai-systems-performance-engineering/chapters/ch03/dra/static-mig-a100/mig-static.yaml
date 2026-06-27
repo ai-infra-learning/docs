@@ -1,0 +1,50 @@
+# 静态 MIG + DRA 分配（A100）：Namespace + ResourceClaimTemplate + Pod（一个文件）。
+# 前提：先在节点上用 mig-parted 预切好 MIG（见 run-static-mig.sh）。
+#   kubectl apply -f mig-static.yaml
+#
+# DRA 在这条路线下不会现切，只从 mig-parted 已切好的设备里按 selector 挑一个；
+# 若没有匹配的 MIG 设备，Pod 会一直 Pending。profile 名要与 mig-parted 切出来的一致。
+#
+#   Pod ─ ctr ─[claim: mig (1g.10gb)] ─▶ 预切好的某个 MIG 设备
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: static-mig-test
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: static-mig-test
+  name: mig-1g
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mig
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: static-mig-test
+  name: mig-pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: mig
+  resourceClaims:
+  - name: mig
+    resourceClaimTemplateName: mig-1g
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"

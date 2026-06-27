@@ -1,0 +1,28 @@
+# 资源池总量：用 sharedCounters 声明一张 GPU 的可分配预算。
+# 与 devices-slice.yaml 属于同一个 pool（gizmo-pool），通过 pool.name + generation 绑定。
+# sharedCounters 与 devices 必须分处不同 ResourceSlice（Kubernetes 1.35+ 强制）。
+# 教学示例，真实 NVIDIA GPU 由 DRA driver 自动发布对应的 ResourceSlice。
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  name: counterset-slice
+spec:
+  driver: gizmo.example.com
+  nodeName: node-1
+  pool:
+    name: gizmo-pool
+    generation: 1
+    resourceSliceCount: 2     # 这个 pool 由 2 个 ResourceSlice 组成
+  sharedCounters:
+  - name: counterset-1
+    counters:
+      memory:
+        value: "40Gi"
+      cpus:
+        value: "4"
+  - name: counterset-2
+    counters:
+      memory:
+        value: "20Gi"
+      cpus:
+        value: "2"

@@ -1,0 +1,67 @@
+# 动态 MIG 完整示例（H100+）：在同一张 GPU 上现切 1g + 2g + 4g（合计 7g，刚好切满 80GB）。
+# 一个文件包含 Namespace + ResourceClaimTemplate + Pod，可直接 apply。
+#   kubectl apply -f mig-multi-profile.yaml
+#
+# 验证：容器里 nvidia-smi -L 应列出 3 个 MIG 设备；
+#       节点上对比 apply 前后的 `nvidia-smi mig -lgi` 可看到 GI 被动态创建。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dynamic-mig-test
+---
+# constraints.matchAttribute 要求三个 MIG 设备来自同一张物理 GPU。
+# 注意：一个 claim 会把下面所有 request 全部切出来；容器不带 request 字段时会拿到全部 3 个，
+# 带 request 则只注入指定的那个（见 Pod 容器注释）。别堆出超过单卡容量的组合，否则 Pod 会 Pending。
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: dynamic-mig-test
+  name: mig-4-2-1
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mig-1g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+      - name: mig-2g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '2g.20gb'"
+      - name: mig-4g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '4g.40gb'"
+      constraints:
+      - matchAttribute: "gpu.nvidia.com/parentUUID"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: dynamic-mig-test
+  name: mig-pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      # 不带 request：注入 claim 里全部 3 个 MIG 设备。
+      # 只想要其中一个时改成：{ name: mig, request: mig-1g }
+      - name: mig
+  resourceClaims:
+  - name: mig
+    resourceClaimTemplateName: mig-4-2-1
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"

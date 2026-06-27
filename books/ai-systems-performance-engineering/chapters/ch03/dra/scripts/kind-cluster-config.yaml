@@ -1,0 +1,41 @@
+# kind 集群配置，供 setup-dra-env.sh 用作所有路线的默认集群配置。
+# 注入主机 GPU + 开启 DRA；并开启 DRAPartitionableDevices（动态 MIG 必需，对非 MIG / 静态路线无害）。
+# kind 顶层 featureGates 会下发到 apiserver/scheduler/kubelet。
+# 单独使用：
+#   kind create cluster --name dra-demo --image kindest/node:v1.34.3 --config kind-cluster-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  DynamicResourceAllocation: true
+  DRAPartitionableDevices: true        # 动态 MIG 必需；其它路线开着也无影响
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri"]
+    enable_cdi = true
+nodes:
+- role: control-plane
+  labels:
+    node-role.x-k8s.io/control-plane: ""
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+        extraArgs:
+          runtime-config: "resource.k8s.io/v1beta1=true"
+- role: worker
+  labels:
+    node-role.x-k8s.io/worker: ""
+  extraMounts:
+  # 注入主机上的全部 NVIDIA GPU（需要 nvidia-container-runtime 的
+  # accept-nvidia-visible-devices-as-volume-mounts = true）。
+  - hostPath: /dev/null
+    containerPath: /var/run/nvidia-container-devices/cdi/runtime.nvidia.com/gpu/all
+  # MIG 需要 fabricmanager socket。
+  - hostPath: /run/nvidia-fabricmanager/socket
+    containerPath: /run/nvidia-fabricmanager/socket
+  - hostPath: /usr/bin/nvidia-ctk
+    containerPath: /usr/bin/nvidia-ctk
+  # 动态 MIG 要在节点内切换 MIG 模式 / 创建 GI、CI，需要可写的 /sys/bus。
+  - hostPath: /sys/bus
+    containerPath: /sys/bus
+    readOnly: false

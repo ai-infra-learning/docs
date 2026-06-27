@@ -1,0 +1,80 @@
+# gpu-test3：2 个 Pod 共享同一张 GPU（通过一个全局 ResourceClaim，而非 Template）。
+#
+#   ┌─ Pod1 ──────┐     ┌─ Pod2 ──────┐
+#   │ ┌─────────┐ │     │ ┌─────────┐ │
+#   │ │   ctr   │ │     │ │   ctr   │ │
+#   │ └────┬────┘ │     │ └────┬────┘ │
+#   └──────┼──────┘     └──────┼──────┘
+#          └──────────┬────────┘
+#               ┌─────┴─────┐
+#               │   GPU 0   │
+#               └───────────┘
+#
+# 关键区别：这里用的是共享的 ResourceClaim 对象，两个 Pod 引用同名 claim → 同一张 GPU。
+# 对比 gpu-test1：那里用 ResourceClaimTemplate，每个 Pod 各生成独立 claim、拿到不同 GPU。
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test3
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  namespace: gpu-test3
+  name: single-gpu
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test3
+  name: pod1
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu
+  resourceClaims:
+  - name: shared-gpu
+    resourceClaimName: single-gpu
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test3
+  name: pod2
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu
+  resourceClaims:
+  - name: shared-gpu
+    resourceClaimName: single-gpu
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"

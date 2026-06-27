@@ -1,0 +1,15 @@
+# nvidia-mig-parted 配置（A100 80GB，只切 GPU 0）。
+# 用法：sudo -E nvidia-mig-parted apply -f mig-parted-config.yaml -c balanced
+#
+# balanced 布局：1g.10gb x2 + 2g.20gb x1 + 3g.40gb x1
+#   compute slice 合计 = 1*2 + 2 + 3 = 7g，刚好切满 GPU 0。
+# A100 80GB 可用 profile：1g.10gb / 2g.20gb / 3g.40gb / 4g.40gb / 7g.80gb（无 5g、6g）。
+version: v1
+mig-configs:
+  balanced:
+  - devices: [0]
+    mig-enabled: true
+    mig-devices:
+      "1g.10gb": 2
+      "2g.20gb": 1
+      "3g.40gb": 1

@@ -1,0 +1,56 @@
+# 可分配设备：每个 device 用 consumesCounters 从 counterset-slice.yaml 的 CounterSet 扣额度。
+# large-device 与两个 small-device 都消耗 counterset-1（共 40Gi/4cpu），因此互斥：
+#   - 要么 1 个 large-device
+#   - 要么 2 个 small-device
+# 设备按"从小到大"排列，因为调度器是 first-fit（取第一个放得下的，不是最优）。
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  name: devices-slice
+spec:
+  driver: gizmo.example.com
+  nodeName: node-1
+  pool:
+    name: gizmo-pool
+    generation: 1
+    resourceSliceCount: 2
+  devices:
+  - name: small-device-1
+    capacity:
+      memory:
+        value: "20Gi"
+      cpus:
+        value: "2"
+    consumesCounters:
+    - counterSet: counterset-1
+      counters:
+        memory:
+          value: "20Gi"
+        cpus:
+          value: "2"
+  - name: small-device-2
+    capacity:
+      memory:
+        value: "20Gi"
+      cpus:
+        value: "2"
+    consumesCounters:
+    - counterSet: counterset-1
+      counters:
+        memory:
+          value: "20Gi"
+        cpus:
+          value: "2"
+  - name: large-device
+    capacity:
+      memory:
+        value: "40Gi"
+      cpus:
+        value: "4"
+    consumesCounters:
+    - counterSet: counterset-1
+      counters:
+        memory:
+          value: "40Gi"
+        cpus:
+          value: "4"
