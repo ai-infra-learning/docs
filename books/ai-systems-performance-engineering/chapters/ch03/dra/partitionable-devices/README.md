@@ -13,6 +13,37 @@
 
 两个 `ResourceSlice` 属于同一个 pool（`gizmo-pool`，`resourceSliceCount: 2`）。`sharedCounters` 与 `devices` 必须分处不同 slice（Kubernetes 1.35+ 强制）。
 
+## sharedCounters ↔ consumesCounters
+
+`sharedCounters` 是一块共享资源池（总量），每个 device 用 `consumesCounters` 声明自己从池里扣多少。多个 device 重叠在同一个池上，调度器靠记账保证“合计不超过池”。
+
+```text
+              sharedCounters  (资源池 / 总量)
+              ┌────────────────────────┐
+              │ counterset-1           │
+              │   memory: 40Gi         │
+              │   cpus:   4            │
+              └───────────┬────────────┘
+                          ▲
+        consumesCounters: │ 每个 device 都从 counterset-1 扣额度
+          ┌───────────────┼────────────────┐
+          │               │                │
+   ┌──────┴──────┐ ┌──────┴──────┐ ┌───────┴─────┐
+   │large-device │ │small-device1│ │small-device2│
+   │ 40Gi / 4cpu │ │ 20Gi / 2cpu │ │ 20Gi / 2cpu │
+   └─────────────┘ └─────────────┘ └─────────────┘
+```
+
+记账（可用 = 池 − Σ 已分配 device 的 consumesCounters）：
+
+```text
+方案 A:  large-device              → 40Gi/4cpu，占满池 → 两个 small 都不可再分
+方案 B:  small-device1 + small-device2 = 40Gi/4cpu → 占满池 → large 不可分
+非法  :  large + 任一 small = 60Gi/6cpu > 40Gi/4cpu → 超分，调度器拒绝
+```
+
+所以这三个 device 是**互斥重叠**的：要么 1 个 large，要么 2 个 small。换成真实 GPU，`counterset-1` 就是显存/算力池，`large/small` 就是不同大小的 MIG（见下方映射表）。
+
 ## 机制要点
 
 - `large-device`（吃满 `counterset-1`）与两个 `small-device`（各占一半）都消耗同一个 CounterSet，因此**互斥**：要么 1 个 large，要么 2 个 small。

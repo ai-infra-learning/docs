@@ -31,9 +31,9 @@ nvidia-mig-parted 预切  →  DRA driver 发布 ResourceSlice  →  ResourceCla
 sudo -E ./run-static-mig.sh
 # 也可指定：sudo -E ./run-static-mig.sh <GPU_INDEX> <CONFIG_NAME>
 
-# 2) 确认 MIG profile 被 DRA 发布出来
-kubectl get resourceslice -o yaml | grep -i profile | sort -u
-#   期望看到 1g.10gb / 2g.20gb / 3g.40gb
+# 2) 确认 MIG profile 被 DRA 发布出来（profile 值在 profile: 的下一行，需用 -A1 取到）
+kubectl get resourceslice -o yaml | grep -A1 'profile:' | grep 'string:' | sort -u
+#   期望看到 1g.10gb / 2g.20gb / 3g.40gb（与 mig-parted 切出来的一致）
 
 # 3) 分配并验证
 kubectl apply -f mig-static.yaml

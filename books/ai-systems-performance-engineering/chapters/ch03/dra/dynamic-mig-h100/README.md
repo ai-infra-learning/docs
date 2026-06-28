@@ -37,9 +37,11 @@ helm upgrade -i dra-driver-nvidia-gpu \
 ## 步骤
 
 ```bash
-# 1) 确认 MIG profile 已发布
-kubectl get resourceslice -o yaml | grep -i profile | sort -u
-#   期望看到 1g.10gb / 2g.20gb / 3g.40gb / 4g.40gb / 7g.80gb
+# 1) 确认 MIG profile 已发布（profile 值在 profile: 的下一行，需用 -A1 取到）
+kubectl get resourceslice -o yaml | grep -A1 'profile:' | grep 'string:' | sort -u
+#   期望看到 1g.10gb / 1g.20gb / 2g.20gb / 3g.40gb / 4g.40gb / 7g.80gb 等
+# 装了 jq 时更直接：
+#   kubectl get resourceslice -o json | jq -r '.items[].spec.devices[].attributes.profile.string // empty' | sort -u
 
 # 2) 现切 1g+2g+4g 并跑 Pod
 kubectl apply -f mig-multi-profile.yaml

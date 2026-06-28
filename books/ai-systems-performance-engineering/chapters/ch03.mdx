@@ -2993,7 +2993,99 @@ MIG 资源不能跨节点拼接。一个 Pod 请求两个 `2g.45gb` 实例时，
 
 </Accordion>
 
-#### 6.6 调度器：Kubernetes、Slurm 与 Slinky
+#### 6.6 Dynamic Resource Allocation（DRA）
+
+device plugin 把 GPU 表达成可数的扩展资源（`nvidia.com/gpu`、`nvidia.com/mig-2g.45gb`），只能“要几个”，无法表达共享策略、按能力筛选或动态切分。[Dynamic Resource Allocation（DRA）](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) 从 Kubernetes v1.34 起 GA，把 GPU 管理改成类似 PV/PVC 的声明式模型：工作负载在 `ResourceClaim` 里声明“要什么”，由 [DRA Driver for NVIDIA GPUs](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/) 负责满足。一个节点上的 GPU 分配只能二选一：传统 device plugin 或 DRA driver。
+
+四个对象的分工：
+
+| 对象 | 谁创建 | 作用 |
+| --- | --- | --- |
+| `DeviceClass` | 集群管理员 / driver | 定义一类可申请设备（`gpu.nvidia.com`、`mig.nvidia.com`） |
+| `ResourceSlice` | DRA driver | 发布节点上有哪些设备及其属性，由 driver 自动维护 |
+| `ResourceClaim` / `ResourceClaimTemplate` | 用户 / 工作负载 | 声明要什么设备（可带 CEL selector 和配置） |
+| Pod | 用户 | 引用 claim |
+
+用 DRA 申请一个 MIG 设备：`ResourceClaimTemplate` 用 `mig.nvidia.com` DeviceClass 加 CEL selector 按 profile 筛选，Pod 引用它即可：
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: mig-demo
+  name: mig-1g
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mig
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: mig-demo
+  name: mig-pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c", "nvidia-smi -L; sleep 9999"]
+    resources:
+      claims:
+      - name: mig
+  resourceClaims:
+  - name: mig
+    resourceClaimTemplateName: mig-1g
+```
+
+相比 device plugin 的 `nvidia.com/mig-2g.45gb`，DRA 用属性 + selector 表达需求，还能在 claim 里附带共享策略（TimeSlicing、MPS）等配置，表达力更强。
+
+动态 MIG 按 claim 现切。传统做法要先用 `nvidia-mig-parted` 预切，DRA 只分配已存在的 MIG 设备；从 DRA driver [`v25.12.0`](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/releases/tag/v25.12.0) 起（alpha），开启 `DynamicMIG` feature gate 后，driver 可按 `ResourceClaim` 在卡上动态创建 MIG，无需预切。底层是 DRA 的 **partitionable devices**（[KEP-4815](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices)）：driver 把一张 GPU 的资源池声明成 `sharedCounters`，把所有可能的 MIG 摆放作为重叠 device 用 `consumesCounters` 从池里扣额度，调度器靠 counter 记账挑出不超分的合法组合。
+
+```yaml
+# DRA driver 自动发布的 ResourceSlice（H100，节选）
+sharedCounters:
+- name: gpu-0-counter-set            # 这张 GPU 的资源池（总量）
+  counters:
+    memory-slice-0: { value: "1" }   # 8 个显存切片，每格总量 1，充当占位 bit
+    # ... slice-1 .. slice-7 ...
+    multiprocessors: { value: "114" }
+devices:
+- name: gpu-0-mig-1g10gb-19-0        # 一个 1g 摆放
+  attributes:
+    profile: { string: 1g.10gb }
+  consumesCounters:
+  - counterSet: gpu-0-counter-set
+    counters:
+      memory-slice-0: { value: "1" } # 占第 0 格 → 与其它要 slice0 的设备互斥
+      multiprocessors: { value: "14" }
+```
+
+`memory-slice-0..7` 这类总量为 1 的 counter 是物理占位 bit：占同一格的设备互斥，从而把 MIG 几何约束编码进调度，保证切出来的组合合法。
+
+<Tip>
+动态 MIG 只支持 **H100 及更新**（A100 无法在运行时自由开关 MIG 模式，会报 `SetMigMode ... Not Supported`）。`DynamicMIG` 与 `MPSSupport`、`NVMLDeviceHealthCheck`、`PassthroughSupport` 互斥。Kubernetes 1.33–1.35 还需在 apiserver/scheduler/kubelet 开启 `DRAPartitionableDevices` feature gate。
+</Tip>
+
+<Accordion title="练习入口：DRA + MIG / 共享示例">
+
+本书仓库 `books/ai-systems-performance-engineering/chapters/ch03/dra/` 提供可直接运行的 DRA 示例与一键部署脚本：
+
+- `quickstart/` — 整卡分配、容器/Pod 间共享
+- `mps-timeslicing/` — TimeSlicing 与 MPS 软件级共享
+- `static-mig-a100/` — `nvidia-mig-parted` 预切 + DRA 分配（A100 等）
+- `dynamic-mig-h100/` — 按 `ResourceClaim` 动态切 MIG（H100+），含真实 `resourceslice.yaml`
+- `partitionable-devices/` — `sharedCounters` / `consumesCounters` counter 机制示例
+- `scripts/setup-dra-env.sh` — 幂等地装好 kind + DRA driver 实验环境
+
+</Accordion>
+
+#### 6.7 调度器：Kubernetes、Slurm 与 Slinky
 
 训练平台和推理平台的调度目标不同。训练更像 HPC batch：一组 rank 要同时拿到 GPU、CPU、内存、网络和文件系统带宽；推理更像在线服务：关注 rollout、autoscaling、灰度、SLO、可观测和多租户隔离。调度器选型不是“谁更先进”，而是资源模型和团队操作模型是否匹配。
 

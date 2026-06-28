@@ -20,9 +20,3 @@ spec:
         value: "40Gi"
       cpus:
         value: "4"
-  - name: counterset-2
-    counters:
-      memory:
-        value: "20Gi"
-      cpus:
-        value: "2"

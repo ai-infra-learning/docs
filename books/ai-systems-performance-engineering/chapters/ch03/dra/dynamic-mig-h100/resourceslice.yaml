@@ -1,0 +1,1653 @@
+# H100 节点上 NVIDIA DRA driver（开启 DynamicMIG）实际发布的 ResourceSlice，
+# 由 `kubectl get resourceslice -o yaml` 导出，是 partitionable-devices/ 教学示例的真实对照。
+# 只读快照（含 uid/resourceVersion/ownerReferences），由 driver 自动维护，不需也不应手动 apply。
+#
+# 结构：1 个 ResourceSlice = 这张卡的“可切分菜单”
+#   node=dra-demo-worker，pool.resourceSliceCount=1（K8s 1.34：counters 与 devices 放同一 slice）
+#
+#   sharedCounters: gpu-0-counter-set     ← 整张 H100 的资源池（总量）
+#       显存切片 8 格 slice0..7（每格总量=1）     multiprocessors(SM): 114
+#       copy:8  decoders:7  jpeg:7  ofa:1        memory: 80GB
+#
+#   devices: 1 个整卡 + 25 个 MIG 摆放（彼此重叠；各自 consumesCounters 从上面的池扣额度）
+#       显存切片占用：* = 占用 / . = 空闲（slice0 ──► slice7）
+#
+#       profile        slice0-7      SM    显存    个数
+#       1g.10gb        *.......      14    10GB     7
+#       1g.10gb+me     *.......      14    10GB     7
+#       1g.20gb        **......      14    20GB     4   ← 1 份算力 + 2 格显存
+#       2g.20gb        **......      30    20GB     3
+#       3g.40gb        ****....      46    40GB     2
+#       4g.40gb        ****....      62    40GB     1
+#       7g.80gb        ********     114    80GB     1
+#       gpu-0          ********     114    80GB     1   ← 整卡
+#       （上表是从 slice0 起的代表；同 profile 其它实例占 slice1、2…，所以 1g 才有 7 个）
+#
+# 调度（counter 记账，不改这份 slice）：可用 = 池 − Σ(已分配 ResourceClaim 的 consumesCounters)
+#   占同一显存格的设备互斥（每格总量只有 1）→ 自动满足 MIG 几何约束。
+#   例：分配一个 2g.20gb（占 slice0,1）后 → [x][x][ ][ ][ ][ ][ ][ ]
+#       仍要 slice0/1 的（整卡 / 7g / 3g / 4g / 1g…）不可再分；
+#       只占 slice2..7 的（如另一个 3g.40gb）可同卡共存。
+#   kubelet plugin 在 NodePrepareResources 阶段把选中的 MIG 真正切出来。
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  creationTimestamp: "2026-06-27T14:50:47Z"
+  generateName: 00000-gpu.nvidia.com-dra-demo-worker-
+  generation: 1
+  name: 00000-gpu.nvidia.com-dra-demo-worker-b4bbf
+  ownerReferences:
+  - apiVersion: v1
+    controller: true
+    kind: Node
+    name: dra-demo-worker
+    uid: 0de6a776-25fd-4023-8e4b-36967b70e464
+  resourceVersion: "1479"
+  uid: fbde343f-a00b-48fa-85c3-4320d6be2263
+spec:
+  devices:
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      productName:
+        string: NVIDIA H100 PCIe
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: gpu
+      uuid:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+    capacity:
+      copyEngines:
+        value: "8"
+      decoders:
+        value: "7"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "7"
+      memory:
+        value: 81152Mi
+      multiprocessors:
+        value: "114"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "8"
+        decoders:
+          value: "7"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "7"
+        memory:
+          value: 81152Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        memory-slice-4:
+          value: "1"
+        memory-slice-5:
+          value: "1"
+        memory-slice-6:
+          value: "1"
+        memory-slice-7:
+          value: "1"
+        multiprocessors:
+          value: "114"
+        ofa-engines:
+          value: "1"
+    name: gpu-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-0:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-1:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-1
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-2:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-2
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-3
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-4:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-4
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-5:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-5
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-6:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g10gb-19-6
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-0:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-1:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-1
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-2:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-2
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-3
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-4:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-4
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-5:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-5
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.10gb+me
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 9984Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 9984Mi
+        memory-slice-6:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-1g10gb-me-20-6
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 20096Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g20gb-15-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 20096Mi
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g20gb-15-2
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 20096Mi
+        memory-slice-4:
+          value: "1"
+        memory-slice-5:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g20gb-15-4
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 1g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "1"
+      decoders:
+        value: "1"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "1"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "14"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "1"
+        decoders:
+          value: "1"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "1"
+        memory:
+          value: 20096Mi
+        memory-slice-6:
+          value: "1"
+        memory-slice-7:
+          value: "1"
+        multiprocessors:
+          value: "14"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-1g20gb-15-6
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 2g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "2"
+      decoders:
+        value: "2"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "2"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "30"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "2"
+        decoders:
+          value: "2"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "2"
+        memory:
+          value: 20096Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        multiprocessors:
+          value: "30"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-2g20gb-14-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 2g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "2"
+      decoders:
+        value: "2"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "2"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "30"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "2"
+        decoders:
+          value: "2"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "2"
+        memory:
+          value: 20096Mi
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "30"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-2g20gb-14-2
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 2g.20gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "2"
+      decoders:
+        value: "2"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "2"
+      memory:
+        value: 20096Mi
+      multiprocessors:
+        value: "30"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "2"
+        decoders:
+          value: "2"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "2"
+        memory:
+          value: 20096Mi
+        memory-slice-4:
+          value: "1"
+        memory-slice-5:
+          value: "1"
+        multiprocessors:
+          value: "30"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-2g20gb-14-4
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 3g.40gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "3"
+      decoders:
+        value: "3"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "3"
+      memory:
+        value: 40448Mi
+      multiprocessors:
+        value: "46"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "3"
+        decoders:
+          value: "3"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "3"
+        memory:
+          value: 40448Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "46"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-3g40gb-9-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 3g.40gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "3"
+      decoders:
+        value: "3"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "3"
+      memory:
+        value: 40448Mi
+      multiprocessors:
+        value: "46"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "3"
+        decoders:
+          value: "3"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "3"
+        memory:
+          value: 40448Mi
+        memory-slice-4:
+          value: "1"
+        memory-slice-5:
+          value: "1"
+        memory-slice-6:
+          value: "1"
+        memory-slice-7:
+          value: "1"
+        multiprocessors:
+          value: "46"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-3g40gb-9-4
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 4g.40gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "4"
+      decoders:
+        value: "4"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "4"
+      memory:
+        value: 40448Mi
+      multiprocessors:
+        value: "62"
+      ofaEngines:
+        value: "0"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "4"
+        decoders:
+          value: "4"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "4"
+        memory:
+          value: 40448Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        multiprocessors:
+          value: "62"
+        ofa-engines:
+          value: "0"
+    name: gpu-0-mig-4g40gb-5-0
+  - attributes:
+      architecture:
+        string: Hopper
+      brand:
+        string: Nvidia
+      cudaComputeCapability:
+        version: 9.0.0
+      cudaDriverVersion:
+        version: 12.8.0
+      driverVersion:
+        version: 570.195.3
+      parentUUID:
+        string: GPU-ceda209d-d5c7-b802-3fed-9e07948c1527
+      productName:
+        string: NVIDIA H100 PCIe
+      profile:
+        string: 7g.80gb
+      resource.kubernetes.io/pciBusID:
+        string: "0000:00:07.0"
+      resource.kubernetes.io/pcieRoot:
+        string: pci0000:00
+      type:
+        string: mig
+    capacity:
+      copyEngines:
+        value: "8"
+      decoders:
+        value: "7"
+      encoders:
+        value: "0"
+      jpegEngines:
+        value: "7"
+      memory:
+        value: 81152Mi
+      multiprocessors:
+        value: "114"
+      ofaEngines:
+        value: "1"
+    consumesCounters:
+    - counterSet: gpu-0-counter-set
+      counters:
+        copy-engines:
+          value: "8"
+        decoders:
+          value: "7"
+        encoders:
+          value: "0"
+        jpeg-engines:
+          value: "7"
+        memory:
+          value: 81152Mi
+        memory-slice-0:
+          value: "1"
+        memory-slice-1:
+          value: "1"
+        memory-slice-2:
+          value: "1"
+        memory-slice-3:
+          value: "1"
+        memory-slice-4:
+          value: "1"
+        memory-slice-5:
+          value: "1"
+        memory-slice-6:
+          value: "1"
+        memory-slice-7:
+          value: "1"
+        multiprocessors:
+          value: "114"
+        ofa-engines:
+          value: "1"
+    name: gpu-0-mig-7g80gb-0-0
+  driver: gpu.nvidia.com
+  nodeName: dra-demo-worker
+  pool:
+    generation: 1
+    name: dra-demo-worker
+    resourceSliceCount: 1
+  sharedCounters:
+  - counters:
+      copy-engines:
+        value: "8"
+      decoders:
+        value: "7"
+      encoders:
+        value: "0"
+      jpeg-engines:
+        value: "7"
+      memory:
+        value: 81152Mi
+      memory-slice-0:
+        value: "1"
+      memory-slice-1:
+        value: "1"
+      memory-slice-2:
+        value: "1"
+      memory-slice-3:
+        value: "1"
+      memory-slice-4:
+        value: "1"
+      memory-slice-5:
+        value: "1"
+      memory-slice-6:
+        value: "1"
+      memory-slice-7:
+        value: "1"
+      multiprocessors:
+        value: "114"
+      ofa-engines:
+        value: "1"
+    name: gpu-0-counter-set
