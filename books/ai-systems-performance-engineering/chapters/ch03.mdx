@@ -2852,200 +2852,204 @@ ENROOT_RESTRICT_DEV=yes NVIDIA_VISIBLE_DEVICES=0,1 enroot start pytorch nvidia-s
 
 ### 6. Kubernetes 编排与拓扑感知调度
 
-#### 6.1 GPU Operator 与 Device Plugin
+GPU 是集群里最贵、最稀缺的资源，调度方式直接影响利用率与训练/推理成本。
 
-Kubernetes 通过 device plugin framework 暴露 GPU。NVIDIA 的 [k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin) 会注册 `nvidia.com/gpu`，也能在 MIG 或 sharing 配置下注册 `nvidia.com/mig-*`、`nvidia.com/gpu.shared` 等资源。
+#### 6.1 GPU Operator
 
-[NVIDIA GPU Operator](https://developer.nvidia.com/blog/nvidia-gpu-operator-simplifying-gpu-management-in-kubernetes/)把 driver、Container Toolkit、device plugin、DCGM exporter、GPU Feature Discovery 和 MIG Manager 这些组件变成可声明的集群状态。对生产集群来说，它的价值不只是“装驱动”，更是让所有 GPU 节点的软件栈一致、可升级、可观测。
+在 Kubernetes 集群中管理 GPU 可能是一项艰巨的任务。传统方法往往需要手工安装和配置 GPU 驱动，既费时又容易出错。此外，要利用高级 GPU 特性、并确保 GPU 与其它系统组件之间的高效数据传输，还需要专门的知识和工具。缺少一套规范化的方法，这些挑战会拖累 AI/ML 工作负载的性能与可扩展性。
 
+[NVIDIA GPU Operator](https://github.com/nvidia/gpu-operator) 提供了多种特性。它让在 Kubernetes 上设置 GPU 驱动及其配置变得轻而易举。在同一批节点上运行多个 AI 工作负载时，能够使用 vGPU、Multi-Instance GPU（MIG）、GPU Time-Slicing 等高级特性至关重要。此外，GPU 还需要与其它应用/GPU 以及存储之间具备快速通信能力，GPUDirect RDMA、GPUDirect Storage 和 GDR Copy 在其中扮演重要角色。GPU Operator 能帮助你轻松地把这些特性以及更多能力带到 Kubernetes 集群中。
+
+<div style={{ maxWidth: "560px", margin: "0 auto" }}>
 <Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-gpu-operator-automation.png" alt="NVIDIA GPU Operator 把 driver、runtime、device plugin 和 monitoring 从手工安装转为 Kubernetes 中的自动化组件" />
+  <img src="/books/ai-systems-performance-engineering/images/ch03-nvidia-gpu-operator.png" alt="NVIDIA GPU Operator 管理 Kubernetes 集群中的 NVIDIA driver、container runtime、device plugin、DCGM exporter、MIG Manager 等 GPU 软件组件" />
 </Frame>
+</div>
 
-图源：[NVIDIA Technical Blog：NVIDIA GPU Operator: Simplifying GPU Management in Kubernetes](https://developer.nvidia.com/blog/nvidia-gpu-operator-simplifying-gpu-management-in-kubernetes/)
+图源：[NVIDIA Developer Blog: NVIDIA GPU Operator](https://developer-blogs.nvidia.com/wp-content/uploads/2019/10/NV-GPU-Operator-1.png)
+
+它管理的主要组件：
+
+| 组件 | 作用 |
+| --- | --- |
+| [NVIDIA GPU Driver](https://github.com/NVIDIA/gpu-driver-container/tree/main) | 在需要由 GPU Operator 管理 driver 时，它会在 GPU 节点上运行 driver container；如果节点已预装 driver，可以通过 `driver.enabled=false` 关闭这部分。 |
+| [NVIDIA Driver Manager for Kubernetes](https://github.com/NVIDIA/k8s-driver-manager/tree/main) | 管理 driver 生命周期，包括安装、升级、重启相关服务，以及在升级前驱逐 GPU Pod 或 drain 节点。 |
+| [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/) | 配置 Docker、containerd、CRI-O 等容器运行时，让容器启动时能拿到 GPU device、driver libraries 和 CDI 设备描述。 |
+| [NVIDIA Kubernetes Device Plugin](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.3/README.md) | 以 DaemonSet 运行并向 kubelet 注册 GPU 资源，例如 `nvidia.com/gpu`、MIG profile 资源或 sharing 资源。 |
+| [NVIDIA GPU Feature Discovery](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.3/docs/gpu-feature-discovery/README.md) | 读取 NVIDIA GPU 信息并生成 GPU 专属 node labels，例如 GPU 型号、显存、driver 版本、MIG 能力和 `nvidia.com/gpu.clique` 等拓扑标签。 |
+| [NVIDIA MIG Manager for Kubernetes](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.3/gpu-operator-mig.html) | 根据节点上的 `nvidia.com/mig.config` 等标签配置 MIG mode 和 MIG profile。 |
+| [NVIDIA DCGM](https://docs.nvidia.com/datacenter/dcgm/latest/) | NVIDIA Data Center GPU Manager，负责采集和管理 GPU 健康状态、利用率、显存、温度、功耗、ECC、MIG 等底层指标。 |
+| [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter/tree/main) | 把 DCGM 指标转换为 Prometheus 可抓取的 metrics，用于 GPU 监控和告警。 |
+| [Validator for NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator/blob/v26.3.3/cmd/nvidia-validator/main.go) | 在安装和升级后验证各个 operand 是否真正可用，例如 driver、toolkit、device plugin、CUDA 和 vfio/vGPU 相关路径。 |
+
+NVIDIA GPU Operator 的关键特性：
+
+- **自动安装和维护 GPU driver**：NVIDIA GPU Operator 自动安装和维护 GPU driver，消除手动干预的需要。自动化可以确保 driver 始终保持最新并正确配置，让 AI/ML workload 平稳、高效地运行。
+- **配置高级 GPU 特性**：
+  - **vGPU（Virtual GPU）** 允许多个虚拟机共享单张 GPU，提升资源利用率和灵活性。
+  - **MIG（Multi-Instance GPU）** 允许单张 GPU 被划分成多个彼此独立的实例，每个实例拥有专用资源，从而改善 workload 隔离和效率。
+  - **GPU Time-Slicing** 在多个任务之间切分 GPU 时间，保证 GPU 资源在不同 workload 之间公平、高效地分配。
+- **配置 GPUDirect RDMA 和 GPUDirect Storage**：
+  - **GPUDirect RDMA（Remote Direct Memory Access）** 支持不同节点上的 GPU 直接通信，绕过 CPU 并降低延迟，这对高性能计算应用非常重要。
+  - **GPUDirect Storage** 支持 GPU 与存储设备之间直接传输数据，显著加速数据密集型应用的数据访问和处理。
+- **配置 GDR Copy**：GPUDirect RDMA（GDR）Copy 是一个基于 GPUDirect RDMA 技术的低延迟 GPU memory copy library，允许 CPU 直接 map 和访问 GPU memory。它可以提升 memory copy 操作的效率，降低开销，并改善整体性能。
+
+安装步骤可以直接参考 [Installing the NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/getting-started.html)。
+
+先添加 NVIDIA Helm repository：
 
 ```bash
-kubectl describe node <gpu-node> | grep -E "nvidia.com/gpu|nvidia.com/mig"
-kubectl get pods -n gpu-operator
-kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset --tail=100
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia \
+    && helm repo update
 ```
 
-<Note>
-[DCGM exporter](https://docs.nvidia.com/datacenter/dcgm/latest/gpu-telemetry/dcgm-exporter.html) 能把 GPU 利用率、显存、温度、功耗和 MIG 指标导出到 Prometheus。排查“调度看似成功但吞吐不稳定”时，DCGM 指标要和 kubelet、node exporter、NCCL 日志一起看。
-</Note>
+然后使用 Helm 安装 GPU Operator：
 
-#### 6.2 Topology Manager
+```bash
+helm install --wait --generate-name \
+    -n gpu-operator --create-namespace \
+    nvidia/gpu-operator \
+    --version=v26.3.3
+```
 
-默认 Kubernetes 调度器只知道资源数量，不理解 GPU、CPU、NUMA、NIC、NVLink domain 的距离。请求 4 张 GPU 成功，不代表这 4 张 GPU 在同一个 NVLink clique，也不代表 CPU 和 NIC 离它们最近。
+参考资料：
 
-[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)在 kubelet admission 阶段汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示。常用策略：
+- [NVIDIA GPU Operator 官方文档](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html)
+- [Installing the NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/getting-started.html)
+- [InfraCloud：A Guide to NVIDIA GPU Operator in Kubernetes](https://www.infracloud.io/blogs/guide-to-nvidia-gpu-operator-in-kubernetes/)
+- [NVIDIA Blog：Simplifying GPU Management in Kubernetes](https://developer.nvidia.com/blog/nvidia-gpu-operator-simplifying-gpu-management-in-kubernetes/)
+- [Time-Slicing GPUs in Kubernetes（GPU Operator）](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html)
+- [GPU Operator with MIG](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html)
 
-| 策略 | 行为 | 适用场景 |
-| --- | --- | --- |
-| `none` | 不做拓扑对齐 | 默认配置、非性能敏感作业 |
-| `best-effort` | 尽力对齐，不满足也放行 | 共享集群、推理服务 |
-| `restricted` | 不满足 preferred hint 则拒绝 | 拓扑敏感训练作业 |
-| `single-numa-node` | 资源必须落在单个 NUMA node | CPU/NIC/GPU 本地性要求强 |
+#### 6.2 Device Plugin
 
+GPU Operator 部署的组件里，真正把 GPU 暴露给 Kubernetes 调度的是 device plugin。NVIDIA 的 [k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin) 以 DaemonSet 运行，向 kubelet 注册扩展资源 `nvidia.com/gpu`。启用 MIG 时，device plugin 可以按 profile 暴露 `nvidia.com/mig-*` 资源；启用 GPU sharing 时，则可以把共享后的访问入口暴露为 `nvidia.com/gpu.shared` 等资源。
+
+<div style={{ maxWidth: "980px", margin: "0 auto" }}>
 <Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-kubernetes-topology-manager.png" alt="Kubernetes Topology Manager 汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，并决定 Pod 是否可以被 kubelet admit" />
+  <img src="/books/ai-systems-performance-engineering/images/ch03-kubernetes-device-plugin-workflow.png" alt="Kubernetes Device Plugin 架构与工作流程：设备发现、资源注册、调度决策和设备分配挂载" />
 </Frame>
+</div>
 
-图源：[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)
+虽然 device plugin 仍是 Kubernetes 集群中最常用的 GPU 资源管理方式，但它的资源模型仍有一些限制：
 
-Topology Manager 要和 [CPU Manager static policy](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/) 配合。只有 Guaranteed Pod 且 CPU request 是整数时，CPU Manager 才会分配 exclusive CPUs。
+- **仅支持整数计数**：资源以不透明整数暴露，无法按显存容量、架构、compute capability 等属性筛选设备。
+- **共享只能节点级配置**：默认整卡独占；time-slicing / MPS 共享只能按节点 ConfigMap 统一开启（time-slicing 无显存/故障隔离），无法在单个请求中按工作负载表达。
+- **缺乏属性级调度**：调度器只感知数量，无法指定具体设备，需借助节点 label 与 `nodeSelector` 间接约束放置。
+- **MIG 布局静态**：MIG profile 须在节点侧预先配置，调整布局需重新配置节点，无法按工作负载动态切分。
+- **拓扑感知不足**：对 NVLink、NUMA 等拓扑距离缺乏感知。
 
-```yaml
-resources:
-  requests:
-    cpu: "16"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-  limits:
-    cpu: "16"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-```
+#### 6.3 Dynamic Resource Allocation (DRA)
 
-在 GB200 NVL72 这类系统上，拓扑感知尤其关键。[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html)说明 GB200 Grace Blackwell Superchip 通过 900 GB/s NVLink-C2C 连接 Grace CPU 和两颗 Blackwell GPU；rack 级 NVLink domain 的价值只有在调度和通信路径也对齐时才能体现。
+[DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) 是 Kubernetes 的一项功能，用于在 Pod 之间请求和共享资源。这些资源通常是硬件加速器这类附加设备。
+DRA 提供了一种灵活的方式，用于对集群中的设备进行分类、请求和使用。使用 DRA 可以带来如下收益：
 
-<Accordion title="练习入口：拓扑感知 Pod YAML">
+- **灵活的设备过滤**：使用 Common Expression Language（CEL）对特定设备属性进行细粒度过滤。
+- **设备共享**：通过引用对应的 `ResourceClaim`，让多个容器或 Pod 共享同一个资源。
+- **集中式设备分类**：设备驱动和集群管理员可以使用 `DeviceClass`，为应用提供针对不同使用场景优化过的硬件类别。例如，可以为通用 workload 创建成本优化型 `DeviceClass`，为关键任务创建高性能 `DeviceClass`。
+- **简化 Pod 请求**：使用 DRA 时，应用不需要在 Pod resource request 中指定设备数量。Pod 会引用一个 `ResourceClaim`，该 `ResourceClaim` 中的设备配置会应用到 Pod。
 
-[`kubernetes_topology_pod.yaml`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/kubernetes_topology_pod.yaml) 展示了完整的拓扑敏感 Pod 配置：GPU/CPU/memory requests 与 limits、`hostNetwork`、NCCL 环境变量、`IPC_LOCK`、`/dev/shm` memory volume、hostPath 数据目录和 node affinity。
+与 device plugin 相比，这些收益显著改进了设备分配流程；device plugin 要求按容器请求设备，不支持设备共享，也不支持基于表达式的设备过滤。
 
-```yaml
-securityContext:
-  capabilities:
-    add: ["IPC_LOCK"]
+DRA 使用下面这些 Kubernetes API kind 提供核心分配功能：
 
-volumes:
-- name: dshm
-  emptyDir:
-    medium: Memory
-    sizeLimit: 8Gi
-```
+| 资源 | 解释 |
+| --- | --- |
+| `ResourceSlice` | 表示集群中真实可用的设备资源清单，通常由 DRA driver 创建和维护。Scheduler 会用 `ResourceSlice` 判断哪些 Node 上有满足 `ResourceClaim` 要求的设备，并据此完成资源分配和 Pod 调度。 |
+| `DeviceClass` | 定义一类可被申请的设备，以及申请时如何通过属性选择具体设备。它本身不代表具体设备，而是给 `ResourceClaim` 提供一个设备类别和选择规则。 |
+| `ResourceClaim` | 表示一次具体的资源申请，例如“我要一个满足某些条件的 GPU”。Pod 通过引用 `ResourceClaim` 来获得已分配的设备资源。 |
+| `ResourceClaimTemplate` | 是 `ResourceClaim` 的模板，常用于 Deployment、StatefulSet 这类会创建多个 Pod 的 workload。Kubernetes 会根据模板为每个 Pod 自动生成独立的 `ResourceClaim`，Pod 删除时对应的 claim 也会被删除。 |
 
-</Accordion>
+<div style={{ maxWidth: "980px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-api-kinds-workflow.png" alt="Kubernetes DRA API kind 关系示意图，展示 DeviceClass、ResourceClaim、ResourceClaimTemplate、ResourceSlice 与 Pod 调度之间的关系" />
+</Frame>
+</div>
 
-#### 6.3 网络优化
 
-多节点训练里，网络路径与 GPU 拓扑同等重要。NCCL 可能走 NVLink、PCIe P2P、InfiniBand/RDMA、RoCE 或普通 TCP socket；错误的 NIC、CNI overlay 或安全策略会直接压低 all-reduce 带宽。
-
-常用检查项：
-
-- `hostNetwork: true` 用于 MPI/NCCL/RDMA 敏感任务，减少 CNI overlay 变量。
-- RDMA device plugin 暴露 HCA 资源，避免 Pod 看不到 InfiniBand device。
-- `NCCL_SOCKET_IFNAME` 指向 IB/RoCE 网卡，避免 NCCL 选到管理网口。
-- `NCCL_NET_GDR_LEVEL` 控制 GPU Direct RDMA 距离策略；NVIDIA [NCCL environment variables](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/2.4.8/env.html) 文档说明它用于控制 NIC 与 GPU 距离在什么范围内启用 GDR。
-- `/dev/shm` 足够大，避免 NCCL shared memory fallback 异常。
-
-```yaml
-env:
-- name: NCCL_SOCKET_IFNAME
-  value: "ib0"
-- name: NCCL_NET_GDR_LEVEL
-  value: "3"
-- name: NCCL_DEBUG
-  value: "INFO"
-```
-
-`NCCL_DEBUG=INFO` 和 `NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml` 是低成本诊断入口。训练性能异常时，先确认 NCCL 选到的 NIC、GPU bus id、P2P level 和 ring/tree 构造，再看模型代码。
-
-#### 6.4 资源隔离与 QoS
-
-[Kubernetes QoS 文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)定义了 `Guaranteed`、`Burstable`、`BestEffort` 三类。节点内存紧张时，Kubernetes 会优先驱逐 `BestEffort`，其次是 `Burstable`，最后是 `Guaranteed`。
-
-| QoS 级别 | 条件 | GPU 作业建议 |
+| 维度 | Device Plugin | DRA |
 | --- | --- | --- |
-| `Guaranteed` | 每个容器 CPU/memory request 等于 limit | 性能敏感训练、CPU pinning |
-| `Burstable` | 设置了部分 request/limit | 弹性推理、实验作业 |
-| `BestEffort` | 无 request/limit | 不适合 GPU 生产作业 |
+| 资源模型 | 整数计数（`nvidia.com/gpu: N`） | 结构化对象（`DeviceClass` / `ResourceClaim` / `ResourceSlice`） |
+| 设备选择 | 随机/首个可用 + 手动 `nodeSelector` | CEL 按属性筛（显存、架构、UUID 等） |
+| 共享 | 支持 time-slicing / MPS，但按节点 ConfigMap 统一配置 | 支持 time-slicing / MPS，按 `ResourceClaim` 逐工作负载配置 |
+| MIG | 需预切，节点级固定布局 | 可按 `ResourceClaim` 动态切（H100+） |
+| 拓扑感知 | 有限（靠 Topology Manager） | 原生约束（同卡 `parentUUID`、NVLink/PCIe root） |
+| 单卡维护 / 健康 | 坏卡要 drain 整节点；状态粗 | device taints；`ResourceSlice` 实时上报 |
+| 成熟度 | 稳定、生态全 | GA v1.34，部分能力（动态 MIG 等）仍 alpha/beta |
 
-GPU 训练 Pod 通常应该做到：
-
-- CPU request/limit 使用整数并相等，配合 CPU Manager static policy。
-- memory request/limit 预留 DataLoader、pinned memory、page cache 和 checkpoint 峰值。
-- 给 `/dev/shm` 显式 memory-backed `emptyDir`，不要依赖容器默认 64 MB。
-- 训练节点预留 housekeeping CPU，避免 kubelet/containerd/监控 agent 与 DataLoader worker 抢核。
-- I/O 隔离用本地 NVMe 分区、cgroup v2 I/O controller 或存储层 QoS 补齐；Kubernetes 默认资源模型不直接表达磁盘带宽。
-
-#### 6.5 MIG 在 Kubernetes 中的使用
-
-MIG 在 Kubernetes 中表现为扩展资源。例如配套 YAML 使用 `nvidia.com/mig-2g.45gb` 请求两个 MIG 实例：
-
-```yaml
-resources:
-  requests:
-    nvidia.com/mig-2g.45gb: "2"
-  limits:
-    nvidia.com/mig-2g.45gb: "2"
-```
-
-[GPU Operator MIG Manager](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html)可根据节点标签和配置管理 MIG mode 与 profile。典型做法是把节点池分成 full-GPU、MIG-small、MIG-large 几类，避免在同一节点上频繁重配 profile。
-
-<Tip>
-MIG 资源不能跨节点拼接。一个 Pod 请求两个 `2g.45gb` 实例时，单个节点必须同时有两个可用实例；集群总量足够但分散在不同节点上，Pod 仍会 Pending。资源规划应从典型模型尺寸和实例并发数反推 MIG profile。
-</Tip>
-
-<Accordion title="练习入口：MIG Pod YAML">
-
-[`kubernetes_mig_pod.yaml`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/kubernetes_mig_pod.yaml) 演示了 `nvidia.com/mig-2g.45gb` 的 requests/limits，以及用 `nodeSelector: mig-enabled: "true"` 约束到 MIG 节点。
-
-</Accordion>
-
-#### 6.6 Dynamic Resource Allocation（DRA）
-
-device plugin 把 GPU 表达成可数的扩展资源（`nvidia.com/gpu`、`nvidia.com/mig-2g.45gb`），只能“要几个”，无法表达共享策略、按能力筛选或动态切分。[Dynamic Resource Allocation（DRA）](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) 从 Kubernetes v1.34 起 GA，把 GPU 管理改成类似 PV/PVC 的声明式模型：工作负载在 `ResourceClaim` 里声明“要什么”，由 [DRA Driver for NVIDIA GPUs](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/) 负责满足。一个节点上的 GPU 分配只能二选一：传统 device plugin 或 DRA driver。
-
-四个对象的分工：
+DRA 把“设备能力、共享策略、拓扑约束、生命周期”都纳入声明式 API，由此带来按属性选设备、逐工作负载配置共享、动态切 MIG、表达设备互联拓扑等能力。它用四个对象分工协作：
 
 | 对象 | 谁创建 | 作用 |
 | --- | --- | --- |
 | `DeviceClass` | 集群管理员 / driver | 定义一类可申请设备（`gpu.nvidia.com`、`mig.nvidia.com`） |
 | `ResourceSlice` | DRA driver | 发布节点上有哪些设备及其属性，由 driver 自动维护 |
 | `ResourceClaim` / `ResourceClaimTemplate` | 用户 / 工作负载 | 声明要什么设备（可带 CEL selector 和配置） |
-| Pod | 用户 | 引用 claim |
+| Pod | 用户 | 引用 `ResourceClaim` |
 
-用 DRA 申请一个 MIG 设备：`ResourceClaimTemplate` 用 `mig.nvidia.com` DeviceClass 加 CEL selector 按 profile 筛选，Pod 引用它即可：
+以下示例都在本书仓库 `books/ai-systems-performance-engineering/chapters/ch03/dra/` 下，可直接运行；环境用 `scripts/setup-dra-env.sh` 一键拉起（kind + DRA driver）。所有请求都遵循同一套路：`ResourceClaimTemplate`（或 `ResourceClaim`）引用一个 `DeviceClass`，再由 Pod 引用该 `ResourceClaim`。
+
+##### GPU 分配与共享
+
+最基础的用法是申请整卡：`ResourceClaimTemplate` 引用 `gpu.nvidia.com`，Pod 引用它即可拿到一张 GPU。
 
 ```yaml
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  namespace: mig-demo
-  name: mig-1g
+  namespace: gpu-demo
+  name: single-gpu
 spec:
   spec:
     devices:
       requests:
-      - name: mig
+      - name: gpu
         exactly:
-          deviceClassName: mig.nvidia.com
-          selectors:
-          - cel:
-              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
----
-apiVersion: v1
-kind: Pod
-metadata:
-  namespace: mig-demo
-  name: mig-pod
-spec:
-  containers:
-  - name: ctr
-    image: ubuntu:22.04
-    command: ["bash", "-c", "nvidia-smi -L; sleep 9999"]
-    resources:
-      claims:
-      - name: mig
-  resourceClaims:
-  - name: mig
-    resourceClaimTemplateName: mig-1g
+          deviceClassName: gpu.nvidia.com
 ```
 
-相比 device plugin 的 `nvidia.com/mig-2g.45gb`，DRA 用属性 + selector 表达需求，还能在 claim 里附带共享策略（TimeSlicing、MPS）等配置，表达力更强。
+用 `ResourceClaimTemplate` 时每个 Pod 各生成一个独立 claim、拿到不同 GPU；改用一个共享的 `ResourceClaim`（Pod 以 `resourceClaimName` 引用），则多个 Pod 可共享同一张卡。`quickstart/` 提供三种拓扑示例：两 Pod 各独占一卡、一 Pod 两容器共享一卡、两 Pod 共享一卡。
 
-动态 MIG 按 claim 现切。传统做法要先用 `nvidia-mig-parted` 预切，DRA 只分配已存在的 MIG 设备；从 DRA driver [`v25.12.0`](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/releases/tag/v25.12.0) 起（alpha），开启 `DynamicMIG` feature gate 后，driver 可按 `ResourceClaim` 在卡上动态创建 MIG，无需预切。底层是 DRA 的 **partitionable devices**（[KEP-4815](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices)）：driver 把一张 GPU 的资源池声明成 `sharedCounters`，把所有可能的 MIG 摆放作为重叠 device 用 `consumesCounters` 从池里扣额度，调度器靠 counter 记账挑出不超分的合法组合。
+##### TimeSlicing 与 MPS
+
+DRA 把共享策略写进 claim 的 `GpuConfig`，**逐工作负载**配置（区别于 device plugin 的节点级 ConfigMap）。同一个模板里甚至能给不同 request 配不同策略：
+
+```yaml
+config:
+- requests: ["ts-gpu"]
+  opaque:
+    driver: gpu.nvidia.com
+    parameters:
+      kind: GpuConfig
+      sharing:
+        strategy: TimeSlicing          # 时间片轮流，无显存/故障隔离
+        timeSlicingConfig: { interval: Long }
+- requests: ["mps-gpu"]
+  opaque:
+    driver: gpu.nvidia.com
+    parameters:
+      kind: GpuConfig
+      sharing:
+        strategy: MPS                  # 多进程并发，可限线程/显存
+        mpsConfig: { defaultActiveThreadPercentage: 50 }
+```
+
+这两种策略分别需要开启 `TimeSlicingSettings`、`MPSSupport` feature gate，否则 kubelet 在 `NodePrepareResources` 阶段会拒绝。完整示例见 `mps-timeslicing/`。
+
+##### 静态 MIG
+
+A100 等不支持运行时切换 MIG 模式的卡走这条路：先在节点上用 `nvidia-mig-parted` 预切，DRA 只负责把已存在的 MIG 设备分配出去。claim 用 `mig.nvidia.com` + CEL selector 按 profile 筛：
+
+```yaml
+selectors:
+- cel:
+    expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+```
+
+profile 名要和 `mig-parted` 切出来的一致；没有匹配的 MIG 设备时 Pod 会一直 Pending。示例见 `static-mig-a100/`。
+
+##### 动态 MIG
+
+H100 及更新架构可按 claim **现切** MIG，无需预切：开启 `DynamicMIG` feature gate 后，driver 按 `ResourceClaim` 在卡上动态创建 MIG。底层是 DRA 的 **partitionable devices**（[KEP-4815](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices)）：driver 把一张 GPU 的资源池声明成 `sharedCounters`，把所有可能的 MIG 摆放作为重叠 device 用 `consumesCounters` 从池里扣额度，调度器靠 counter 记账挑出不超分的合法组合。
 
 ```yaml
 # DRA driver 自动发布的 ResourceSlice（H100，节选）
@@ -3066,15 +3070,15 @@ devices:
       multiprocessors: { value: "14" }
 ```
 
-`memory-slice-0..7` 这类总量为 1 的 counter 是物理占位 bit：占同一格的设备互斥，从而把 MIG 几何约束编码进调度，保证切出来的组合合法。
+`memory-slice-0..7` 这类总量为 1 的 counter 是物理占位 bit：占同一格的设备互斥，从而把 MIG 几何约束编码进调度。示例见 `dynamic-mig-h100/`（含真实 `resourceslice.yaml`）。
 
 <Tip>
 动态 MIG 只支持 **H100 及更新**（A100 无法在运行时自由开关 MIG 模式，会报 `SetMigMode ... Not Supported`）。`DynamicMIG` 与 `MPSSupport`、`NVMLDeviceHealthCheck`、`PassthroughSupport` 互斥。Kubernetes 1.33–1.35 还需在 apiserver/scheduler/kubelet 开启 `DRAPartitionableDevices` feature gate。
 </Tip>
 
-<Accordion title="练习入口：DRA + MIG / 共享示例">
+<Accordion title="练习入口：DRA 示例与一键部署">
 
-本书仓库 `books/ai-systems-performance-engineering/chapters/ch03/dra/` 提供可直接运行的 DRA 示例与一键部署脚本：
+本书仓库 `books/ai-systems-performance-engineering/chapters/ch03/dra/`：
 
 - `quickstart/` — 整卡分配、容器/Pod 间共享
 - `mps-timeslicing/` — TimeSlicing 与 MPS 软件级共享
@@ -3084,6 +3088,110 @@ devices:
 - `scripts/setup-dra-env.sh` — 幂等地装好 kind + DRA driver 实验环境
 
 </Accordion>
+
+#### 6.4 拓扑感知调度
+
+默认 Kubernetes 调度器只知道资源数量，不理解 GPU、CPU、NUMA、NIC、NVLink domain 的距离。请求 4 张 GPU 成功，不代表这 4 张 GPU 在同一个 NVLink clique，也不代表 CPU 和 NIC 离它们最近。
+
+[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)在 kubelet admission 阶段汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，把 CPU、设备、内存对齐到同一 NUMA 节点。常用策略：
+
+| 策略 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `none` | 不做拓扑对齐（默认） | 非性能敏感作业 |
+| `best-effort` | 尽力对齐，不满足也放行 | 共享集群、推理服务 |
+| `restricted` | 不满足 preferred hint 则拒绝 | 拓扑敏感训练作业 |
+| `single-numa-node` | 资源必须落在单个 NUMA node | CPU/NIC/GPU 本地性要求强 |
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-kubernetes-topology-manager.png" alt="Kubernetes Topology Manager 汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，并决定 Pod 是否可以被 kubelet admit" />
+</Frame>
+
+图源：[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)
+
+Topology Manager 要和 [CPU Manager static policy](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/) 配合：只有 Guaranteed Pod 且 CPU request 是整数时，CPU Manager 才会分配 exclusive CPUs，对齐才有意义。
+
+```yaml
+resources:
+  requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "4" }
+  limits:   { cpu: "16", memory: "128Gi", nvidia.com/gpu: "4" }
+```
+
+但 Topology Manager 有两点局限：它在 **kubelet 准入阶段**（调度之后）工作，粒度只到 NUMA 节点；而且它的设备 hint 只来自 device plugin（Device Manager），表达不了“两张 GPU 是否 NVLink 直连”“多个 MIG 是否来自同一张卡”，DRA 设备它也看不到。
+
+DRA 则在**调度阶段**直接表达设备间互联：driver 把拓扑写成设备属性（`resource.kubernetes.io/pcieRoot`、`gpu.nvidia.com/parentUUID`、`resource.kubernetes.io/numaNode` 等），claim 用 `constraints.matchAttribute` 要求选中的设备共享某属性，由 scheduler 跨集群强制满足。
+
+```yaml
+# 要求一组设备落在同一 PCIe root（换成 parentUUID 即“同一张物理卡”）
+constraints:
+- matchAttribute: "resource.kubernetes.io/pcieRoot"
+```
+
+两者互补：DRA 负责按互联拓扑挑对设备/节点；节点内 CPU 与 GPU 的 NUMA 对齐当前仍可借 Topology Manager / CPU Manager（DRA 原生纳管 CPU/内存自 Kubernetes 1.36 起为 alpha）。在 GB200 NVL72 这类系统上拓扑感知尤其关键，[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html) 说明其 rack 级 NVLink domain 的价值只有在调度和通信路径也对齐时才能体现。
+
+<Accordion title="练习入口：拓扑感知 Pod YAML">
+
+[`kubernetes_topology_pod.yaml`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/kubernetes_topology_pod.yaml) 展示了完整的拓扑敏感 Pod 配置：GPU/CPU/memory requests 与 limits、`hostNetwork`、NCCL 环境变量、`IPC_LOCK`、`/dev/shm` memory volume、hostPath 数据目录和 node affinity。
+
+```yaml
+securityContext:
+  capabilities:
+    add: ["IPC_LOCK"]
+
+volumes:
+- name: dshm
+  emptyDir:
+    medium: Memory
+    sizeLimit: 8Gi
+```
+
+</Accordion>
+
+#### 6.5 ComputeDomain：多节点 NVLink
+
+节点内多张 GPU 走 NVLink/NVSwitch 直连即可；要让**不同节点**的 GPU 以全 NVLink 带宽共享显存，需要 Multi-Node NVLink（MNNVL）和 IMEX。NVIDIA DRA driver 的另一子系统 [ComputeDomain](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/)（`compute-domain.nvidia.com`）就是为此设计：它按工作负载临时拉起一条跨节点的 NVLink fabric（IMEX 通道），随作业创建、随作业销毁。和仍处于 Technology Preview 的 GPU 分配侧不同，ComputeDomain 是 NVIDIA DRA driver 中**已正式支持**的部分。
+
+前置条件：
+
+- **MNNVL 硬件**：多个节点接入同一 NVLink 交换 fabric，典型是 GB200 NVL72。普通以太网 / InfiniBand 互联的双机不算。
+- NVIDIA Driver `v570.158.01+`；GPU Feature Discovery 给 MNNVL 节点打 `nvidia.com/gpu.clique` 标签；节点上禁用 `nvidia-imex.service`。
+
+用法是先建一个 `ComputeDomain`，它会自动生成一个 `ResourceClaimTemplate`，Pod 再引用其中的 channel：
+
+```yaml
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: imex-channel-injection
+spec:
+  numNodes: 0
+  channel:
+    resourceClaimTemplate:
+      name: imex-channel-0
+```
+
+Pod 通过 `resourceClaimTemplateName: imex-channel-0` 申请到 channel 后，容器里会注入 `/dev/nvidia-caps-imex-channels/...`，从而跨节点走 NVLink。
+
+<Tip>
+ComputeDomain 只适用于真正的 MNNVL 系统（GB200 NVL72 等）。单张卡、单节点多卡、或普通网络互联的多机都用不上；这类场景下安装 driver 时可 `--set resources.computeDomains.enabled=false` 关掉该子系统。
+</Tip>
+
+#### 6.6 资源隔离与 QoS
+
+[Kubernetes QoS 文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)定义了 `Guaranteed`、`Burstable`、`BestEffort` 三类。节点内存紧张时，Kubernetes 会优先驱逐 `BestEffort`，其次是 `Burstable`，最后是 `Guaranteed`。
+
+| QoS 级别 | 条件 | GPU 作业建议 |
+| --- | --- | --- |
+| `Guaranteed` | 每个容器 CPU/memory request 等于 limit | 性能敏感训练、CPU pinning |
+| `Burstable` | 设置了部分 request/limit | 弹性推理、实验作业 |
+| `BestEffort` | 无 request/limit | 不适合 GPU 生产作业 |
+
+GPU 训练 Pod 通常应该做到：
+
+- CPU request/limit 使用整数并相等，配合 CPU Manager static policy。
+- memory request/limit 预留 DataLoader、pinned memory、page cache 和 checkpoint 峰值。
+- 给 `/dev/shm` 显式 memory-backed `emptyDir`，不要依赖容器默认 64 MB。
+- 训练节点预留 housekeeping CPU，避免 kubelet/containerd/监控 agent 与 DataLoader worker 抢核。
+- I/O 隔离用本地 NVMe 分区、cgroup v2 I/O controller 或存储层 QoS 补齐；Kubernetes 默认资源模型不直接表达磁盘带宽。
 
 #### 6.7 调度器：Kubernetes、Slurm 与 Slinky
 
