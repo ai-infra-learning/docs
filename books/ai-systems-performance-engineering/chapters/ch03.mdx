@@ -3126,7 +3126,7 @@ constraints:
 - matchAttribute: "resource.kubernetes.io/pcieRoot"
 ```
 
-两者互补：DRA 负责按互联拓扑挑对设备/节点；节点内 CPU 与 GPU 的 NUMA 对齐当前仍可借 Topology Manager / CPU Manager（DRA 原生纳管 CPU/内存自 Kubernetes 1.36 起为 alpha）。在 GB200 NVL72 这类系统上拓扑感知尤其关键，[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html) 说明其 rack 级 NVLink domain 的价值只有在调度和通信路径也对齐时才能体现。
+两者互补：DRA 负责按互联拓扑挑对设备/节点；节点内 CPU 与 GPU 的 NUMA 对齐当前仍可借 Topology Manager / CPU Manager（DRA 原生纳管 CPU/内存自 Kubernetes 1.36 起为 alpha）。在 GB200 NVL72 这类系统上拓扑感知尤其关键，[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html) 说明其 rack 级 NVLink domain 的价值只有在调度和通信路径也对齐时才能体现；[NVIDIA Topograph](https://github.com/NVIDIA/topograph) 则提供了发现集群物理网络拓扑并暴露给调度器的工具。
 
 <Accordion title="练习入口：拓扑感知 Pod YAML">
 
@@ -3148,14 +3148,15 @@ volumes:
 
 #### 6.5 ComputeDomain：多节点 NVLink
 
-节点内多张 GPU 走 NVLink/NVSwitch 直连即可；要让**不同节点**的 GPU 以全 NVLink 带宽共享显存，需要 Multi-Node NVLink（MNNVL）和 IMEX。NVIDIA DRA driver 的另一子系统 [ComputeDomain](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/)（`compute-domain.nvidia.com`）就是为此设计：它按工作负载临时拉起一条跨节点的 NVLink fabric（IMEX 通道），随作业创建、随作业销毁。和仍处于 Technology Preview 的 GPU 分配侧不同，ComputeDomain 是 NVIDIA DRA driver 中**已正式支持**的部分。
+节点内多张 GPU 走 NVLink/NVSwitch 直连即可；要让**不同节点**的 GPU 以全 NVLink 带宽共享显存，需要 Multi-Node NVLink（MNNVL）和 IMEX。NVIDIA DRA driver 的另一子系统 [ComputeDomain](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/)（`compute-domain.nvidia.com`）就是为此设计：当 workload 请求一个 `ComputeDomain` 时，driver 会按这组 Pod 所在节点临时编排 IMEX daemon、IMEX domain 和 channel device，随作业创建、随作业销毁。和仍处于 Technology Preview 的 GPU 分配侧不同，ComputeDomain 是 NVIDIA DRA driver 中**已正式支持**的部分。
 
 前置条件：
 
 - **MNNVL 硬件**：多个节点接入同一 NVLink 交换 fabric，典型是 GB200 NVL72。普通以太网 / InfiniBand 互联的双机不算。
-- NVIDIA Driver `v570.158.01+`；GPU Feature Discovery 给 MNNVL 节点打 `nvidia.com/gpu.clique` 标签；节点上禁用 `nvidia-imex.service`。
+- **软件栈**：Kubernetes `1.32+`，集群启用 DRA 和 CDI；NVIDIA Driver `v570.158.01+`。
+- **节点标签与服务**：GPU Feature Discovery 给 MNNVL 节点打 `nvidia.com/gpu.clique` 标签；节点上禁用宿主机级 `nvidia-imex.service`，避免和 DRA driver 管理的 IMEX daemon 冲突。
 
-用法是先建一个 `ComputeDomain`，它会自动生成一个 `ResourceClaimTemplate`，Pod 再引用其中的 channel：
+用法是先建一个 `ComputeDomain`。最小配置只需要声明 channel 对应的 `ResourceClaimTemplate` 名称；`numNodes` 已废弃，推荐设为 `0`：
 
 ```yaml
 apiVersion: resource.nvidia.com/v1beta1
@@ -3169,11 +3170,51 @@ spec:
       name: imex-channel-0
 ```
 
-Pod 通过 `resourceClaimTemplateName: imex-channel-0` 申请到 channel 后，容器里会注入 `/dev/nvidia-caps-imex-channels/...`，从而跨节点走 NVLink。
+应用这个对象后，controller 会创建两类资源：
+
+- 一个按 `ComputeDomain` 生成的 `compute-domain-daemon` DaemonSet，每个 GPU 节点上运行一个 daemon pod，用来包装和监督 `nvidia-imex`。
+- 一个名为 `imex-channel-0` 的 `ResourceClaimTemplate`，workload Pod 通过它申请 IMEX channel。
+
+Pod 通过 `resourceClaimTemplateName: imex-channel-0` 申请 channel 后，容器里会注入 `/dev/nvidia-caps-imex-channels/...` 和 IMEX mount；Pod 会等本地 IMEX daemon ready 后再启动：
+
+```yaml
+spec:
+  containers:
+  - name: app
+    resources:
+      claims:
+      - name: imex-channel-0
+  resourceClaims:
+  - name: imex-channel-0
+    resourceClaimTemplateName: imex-channel-0
+```
+
+默认 `spec.channel.allocationMode` 是 `Single`，只向 workload 注入一个 IMEX channel；需要访问 IMEX domain 内所有 channel 的 workload 可以设为 `All`。
+
+验证时先看 `ComputeDomain` 状态，再看 clique 对象和 channel 注入结果：
+
+```bash
+kubectl get computedomain imex-channel-injection -o yaml
+kubectl get computedomainclique -n nvidia-dra-driver-gpu
+kubectl logs imex-channel-injection
+```
 
 <Tip>
-ComputeDomain 只适用于真正的 MNNVL 系统（GB200 NVL72 等）。单张卡、单节点多卡、或普通网络互联的多机都用不上；这类场景下安装 driver 时可 `--set resources.computeDomains.enabled=false` 关掉该子系统。
+ComputeDomain 只适用于真正的 MNNVL 系统（GB200 NVL72 等）。单张卡、单节点多卡、或普通网络互联的多机都用不上；这类场景下安装 DRA driver 时可 `--set resources.computeDomains.enabled=false` 关掉该子系统。
 </Tip>
+
+<Accordion title="ComputeDomain 参考资料">
+
+- [ComputeDomain workloads](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/compute-domain-workloads/)：官方 workload 示例，覆盖创建 `ComputeDomain`、申请 channel、查看状态和 feature gates。
+- [Validate setup for ComputeDomain allocation](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/wiki/Validate-setup-for-ComputeDomain-allocation)：ComputeDomain 环境验证 checklist，包含 IMEX channel 注入测试和 `nvbandwidth` 多节点测试。
+- [NVIDIA DRA Driver for GPUs - GPU Operator docs](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-cds.html)：解释 ComputeDomain、IMEX 安全边界和 GPU Operator 集成路径。
+- [Enabling Multi-Node NVLink on Kubernetes for NVIDIA GB200 NVL72 and Beyond](https://developer.nvidia.com/blog/enabling-multi-node-nvlink-on-kubernetes-for-gb200-and-beyond/)：NVIDIA 官方博客，解释 ComputeDomain 与 GB200 NVL72 / MNNVL 的关系。
+- [Running AI Workloads on Rack-Scale Supercomputers](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)：解释 rack-scale NVLink fabric、Cluster UUID、Clique ID 与拓扑感知调度的关系。
+- [NVIDIA GB200 NVL Partition](https://docs.nvidia.com/multi-node-nvlink-systems/partition-guide-v1-2.pdf)：说明 NVLink Domain、NVLink Partition 和平台侧 partition 管理。
+- [Kubernetes support for GH200 / GB200](https://docs.google.com/document/d/1PrdDofsPFVJuZvcv-vtlI9n2eAh-YVf_fRQLIVmDwVY)：ComputeDomain 背景设计资料。
+- [Supporting GB200 on Kubernetes](https://docs.google.com/presentation/d/1Xupr8IZVAjs5bNFKJnYaK0LE7QWETnJjkz6KOfLu87E)：GB200 / Kubernetes 支持相关 slides。
+
+</Accordion>
 
 #### 6.6 资源隔离与 QoS
 
