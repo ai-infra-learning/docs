@@ -5,3 +5,7 @@
 # Draft content
 drafts/
 *.draft.mdx
+
+# Chapter companion example code (scripts, K8s manifests, traces), not doc pages.
+# Multi-document Kubernetes YAML here breaks `mint dev`'s single-document YAML scan.
+books/ai-systems-performance-engineering/chapters/ch03/
