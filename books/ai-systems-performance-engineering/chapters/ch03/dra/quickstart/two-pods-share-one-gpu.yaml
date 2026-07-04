@@ -2,7 +2,7 @@
 #
 #   ┌─ Pod1 ──────┐     ┌─ Pod2 ──────┐
 #   │ ┌─────────┐ │     │ ┌─────────┐ │
-#   │ │   ctr   │ │     │ │   ctr   │ │
+#   │ │container│ │     │ │container│ │
 #   │ └────┬────┘ │     │ └────┬────┘ │
 #   └──────┼──────┘     └──────┼──────┘
 #          └──────────┬────────┘
@@ -40,7 +40,7 @@ metadata:
     app: pod
 spec:
   containers:
-  - name: ctr
+  - name: container
     image: ubuntu:22.04
     command: ["bash", "-c"]
     args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
@@ -64,7 +64,7 @@ metadata:
     app: pod
 spec:
   containers:
-  - name: ctr
+  - name: container
     image: ubuntu:22.04
     command: ["bash", "-c"]
     args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]

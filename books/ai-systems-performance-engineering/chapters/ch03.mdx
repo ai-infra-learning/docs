@@ -2956,6 +2956,33 @@ DRA 使用下面这些 Kubernetes API kind 提供核心分配功能：
 | `ResourceClaim` | 表示一次具体的资源申请，例如“我要一个满足某些条件的 GPU”。Pod 通过引用 `ResourceClaim` 来获得已分配的设备资源。 |
 | `ResourceClaimTemplate` | 是 `ResourceClaim` 的模板，常用于 Deployment、StatefulSet 这类会创建多个 Pod 的 workload。Kubernetes 会根据模板为每个 Pod 自动生成独立的 `ResourceClaim`，Pod 删除时对应的 claim 也会被删除。 |
 
+<Accordion title="从 CSI 看 DRA：同一套声明式设计">
+
+如果对 Kubernetes 比较熟悉，会发现 DRA 的设计思路和 CSI 很像：都把异构资源的管理拆成同样的三层——供给、分类、申请。
+
+- **CSI（存储）**：`PersistentVolume` 代表可用存储 → `StorageClass` 分类 → `PersistentVolumeClaim` 申请。
+- **DRA（设备）**：`ResourceSlice` 代表可用设备 → `DeviceClass` 分类 → `ResourceClaim` 申请。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-csi-vs-dra.png" alt="CSI 与 DRA 的对比：PV / StorageClass / PVC 分别对应 ResourceSlice / DeviceClass / ResourceClaim，并从定位、管理对象、核心资源、典型用途、关注点、生态成熟度等维度对比两者" />
+</Frame>
+
+> 严格说 `ResourceSlice` 和 `PV` 不能完全等同：`PV` 是一块具体的存储卷，`ResourceSlice` 更像节点上设备的目录清单。但从供需关系看，模式是一样的。
+
+DRA 三者按数据流方向串起来：
+
+```text
+ResourceSlice ──→ DeviceClass ──→ ResourceClaim ──→ 调度器分配
+   (供给)           (分类)           (需求)           (决策)
+```
+
+- **`ResourceSlice`（供给）**：DRA driver 发布节点上的设备信息，包括型号、显存、驱动版本等属性，以及可用容量。
+- **`DeviceClass`（分类）**：管理员用 CEL 表达式从设备属性里筛出一类设备，形成用户友好的分组，比如「所有 NVIDIA GPU」或「仅 A100」。
+- **`ResourceClaim`（需求）**：用户通过 `deviceClassName` 引用某个 `DeviceClass`，声明需要几个该类设备。
+- **调度器（决策）**：综合 `ResourceSlice` 的库存和 `ResourceClaim` 的需求，选出满足条件的节点和具体设备，完成分配。
+
+</Accordion>
+
 <Accordion title="完整流程：一个 Pod 如何用上 DRA 资源">
 
 以单 Pod、单容器申请一张整卡为例，串起 `ResourceSlice`、`DeviceClass`、`ResourceClaim` 与 Pod 之间的配合，看一次分配从设备注册到容器启动经历哪些阶段。
@@ -3098,7 +3125,7 @@ spec:
 
 **阶段三：声明需求（用户 → ResourceClaim / ResourceClaimTemplate）**
 
-用户基于 `DeviceClass` 声明要什么设备、要多少。有两种写法：直接建一个 `ResourceClaim`，或用 `ResourceClaimTemplate` 让 K8s 为每个 Pod 自动生成 claim。设备申请字段（`devices.requests`）两者完全一样，区别只在外层包装和 Pod 的引用方式。
+用户基于 `DeviceClass` 声明要什么设备、要多少。有两种写法：直接建一个 `ResourceClaim`，或用 `ResourceClaimTemplate` 让 K8s 为每个 Pod 自动生成 claim。
 
 直接建 `ResourceClaim`：
 
@@ -3175,24 +3202,30 @@ Pod 提交到 API Server
     ├─ 1. 用模板时，ResourceClaim Controller 按 Template 生成独立 ResourceClaim
     │        （直接引用已有 claim 则跳过这步）
     │
-    ├─ 2. 调度器 Filter：遍历节点，基于 ResourceSlice 判断
-    │        - 先用 DeviceClass 的 CEL 筛出符合 class 的设备
-    │        - 再按 Claim 的 selector / 容量 / 约束进一步过滤
+    ├─ 2. 调度器 Filter：遍历节点，基于 ResourceSlice / DeviceClass / ResourceClaim 判断
+    │        - 用 DeviceClass 和 Claim 中的 selector / 容量 / 约束匹配设备
+    │        - 为候选节点计算一组可能的具体设备分配结果
     │
-    ├─ 3. 调度器 Reserve + Bind
+    ├─ 3. 调度器 Reserve
     │        - 选定节点 + 选定具体设备
+    │        - 在调度器内部缓存 pending allocation
+    │
+    ├─ 4. 调度器 PreBind
     │        - 写入 ResourceClaim.status.allocation（driver / pool / device）
     │        - 写入 ResourceClaim.status.reservedFor
+    │        - 必要时等待 device binding conditions 满足
+    │
+    ├─ 5. 调度器 Bind
     │        - 绑定 Pod 到节点
     │
-    └─ 4. Kubelet 启动 Pod
+    └─ 6. Kubelet 启动 Pod
 ```
 
-调度器不只选节点，还选定了**具体设备**。Reserve 阶段在调度器内部缓存里完成设备选择，Bind 阶段把结果写进 `ResourceClaim.status.allocation`，之后 driver 和 kubelet 都以这份结果为准。三个组件分工如下：
+调度器不只选节点，还选定了**具体设备**。`Filter` 阶段为候选节点计算设备分配结果，`Reserve` 阶段在调度器内部缓存 pending allocation，`PreBind` 阶段通过 `bindClaim` 把 `ResourceClaim.status.allocation` 和 `ResourceClaim.status.reservedFor` 写回 API Server；之后 driver 和 kubelet 都以这份结果为准。三个组件分工如下：
 
 | 组件 | 职责 |
 | --- | --- |
-| Scheduler | 选节点 + 选具体设备，写入 `allocation` |
+| Scheduler | 选节点 + 选具体设备，并在 `PreBind` 写入 `allocation` / `reservedFor` |
 | Driver | 按 `allocation` 结果在节点上准备设备（`NodePrepareResources`） |
 | Kubelet | 调用 driver，并把设备注入容器 |
 
@@ -3216,9 +3249,9 @@ Kubelet 收到已绑定的 Pod
 
 </Accordion>
 
-#### GPU 分配与共享
+#### 6.3.1 GPU 分配基本示例
 
-最基础的用法是申请整卡：`ResourceClaimTemplate` 引用 `gpu.nvidia.com`，Pod 引用它即可拿到一张 GPU。
+最基础的用法是申请整卡：`ResourceClaimTemplate` 或 `ResourceClaim` 通过 `deviceClassName` 引用 `gpu.nvidia.com` 这个 DeviceClass，Pod 再引用该 claim 即可拿到一张 GPU。
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -3235,87 +3268,556 @@ spec:
           deviceClassName: gpu.nvidia.com
 ```
 
-用 `ResourceClaimTemplate` 时每个 Pod 各生成一个独立 claim、拿到不同 GPU；改用一个共享的 `ResourceClaim`（Pod 以 `resourceClaimName` 引用），则多个 Pod 可共享同一张卡。`quickstart/` 提供三种拓扑示例：两 Pod 各独占一卡、一 Pod 两容器共享一卡、两 Pod 共享一卡。
+两者的区别在于：
 
-#### TimeSlicing 与 MPS
+- `ResourceClaimTemplate` 会为每个 Pod 各生成一个独立 claim、拿到不同 GPU；
+- 共享的 `ResourceClaim`（Pod 以 `resourceClaimName` 引用）则可以让多个 Pod 共享同一张卡。
 
-DRA 把共享策略写进 claim 的 `GpuConfig`，**逐工作负载**配置（区别于 device plugin 的节点级 ConfigMap）。同一个模板里甚至能给不同 request 配不同策略：
+**两 Pod 各独占一卡**：各自的 `ResourceClaimTemplate` 生成独立 claim，分到不同 GPU。
 
-```yaml
-config:
-- requests: ["ts-gpu"]
-  opaque:
-    driver: gpu.nvidia.com
-    parameters:
-      kind: GpuConfig
-      sharing:
-        strategy: TimeSlicing          # 时间片轮流，无显存/故障隔离
-        timeSlicingConfig: { interval: Long }
-- requests: ["mps-gpu"]
-  opaque:
-    driver: gpu.nvidia.com
-    parameters:
-      kind: GpuConfig
-      sharing:
-        strategy: MPS                  # 多进程并发，可限线程/显存
-        mpsConfig: { defaultActiveThreadPercentage: 50 }
-```
+<div style={{ maxWidth: "560px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-two-pods-one-gpu-each.png" alt="两个 Pod 各含一个容器，Pod 1 的容器连到 GPU 0、Pod 2 的容器连到 GPU 1，彼此不共享" />
+</Frame>
+</div>
 
-这两种策略分别需要开启 `TimeSlicingSettings`、`MPSSupport` feature gate，否则 kubelet 在 `NodePrepareResources` 阶段会拒绝。完整示例见 `mps-timeslicing/`。
-
-#### 静态 MIG
-
-A100 等不支持运行时切换 MIG 模式的卡走这条路：先在节点上用 `nvidia-mig-parted` 预切，DRA 只负责把已存在的 MIG 设备分配出去。claim 用 `mig.nvidia.com` + CEL selector 按 profile 筛：
+<Accordion title="完整 YAML：quickstart/two-pods-one-gpu-each.yaml">
 
 ```yaml
-selectors:
-- cel:
-    expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test1
+---
+# 模板：每个引用它的 Pod 都会自动生成一份独立的 ResourceClaim
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: gpu-test1
+  name: single-gpu
+spec:
+  spec:                                     # 模板比 ResourceClaim 多包一层 spec
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com   # 要一张这个 class 的设备
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test1
+  name: pod1
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: container
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: gpu                    # 容器使用下面 resourceClaims 里名为 gpu 的申请
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: single-gpu   # 用模板 → 本 Pod 独得一个 claim（一张卡）
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+---
+# pod2 与 pod1 相同：同样引用模板，于是各自生成独立 claim → 分到不同 GPU
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test1
+  name: pod2
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: container
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: gpu
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: single-gpu
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
 ```
-
-profile 名要和 `mig-parted` 切出来的一致；没有匹配的 MIG 设备时 Pod 会一直 Pending。示例见 `static-mig-a100/`。
-
-#### 动态 MIG
-
-H100 及更新架构可按 claim **现切** MIG，无需预切：开启 `DynamicMIG` feature gate 后，driver 按 `ResourceClaim` 在卡上动态创建 MIG。底层是 DRA 的 **partitionable devices**（[KEP-4815](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices)）：driver 把一张 GPU 的资源池声明成 `sharedCounters`，把所有可能的 MIG 摆放作为重叠 device 用 `consumesCounters` 从池里扣额度，调度器靠 counter 记账挑出不超分的合法组合。
-
-```yaml
-# DRA driver 自动发布的 ResourceSlice（H100，节选）
-sharedCounters:
-- name: gpu-0-counter-set            # 这张 GPU 的资源池（总量）
-  counters:
-    memory-slice-0: { value: "1" }   # 8 个显存切片，每格总量 1，充当占位 bit
-    # ... slice-1 .. slice-7 ...
-    multiprocessors: { value: "114" }
-devices:
-- name: gpu-0-mig-1g10gb-19-0        # 一个 1g 摆放
-  attributes:
-    profile: { string: 1g.10gb }
-  consumesCounters:
-  - counterSet: gpu-0-counter-set
-    counters:
-      memory-slice-0: { value: "1" } # 占第 0 格 → 与其它要 slice0 的设备互斥
-      multiprocessors: { value: "14" }
-```
-
-`memory-slice-0..7` 这类总量为 1 的 counter 是物理占位 bit：占同一格的设备互斥，从而把 MIG 几何约束编码进调度。示例见 `dynamic-mig-h100/`（含真实 `resourceslice.yaml`）。
-
-<Tip>
-动态 MIG 只支持 **H100 及更新**（A100 无法在运行时自由开关 MIG 模式，会报 `SetMigMode ... Not Supported`）。`DynamicMIG` 与 `MPSSupport`、`NVMLDeviceHealthCheck`、`PassthroughSupport` 互斥。Kubernetes 1.33–1.35 还需在 apiserver/scheduler/kubelet 开启 `DRAPartitionableDevices` feature gate。
-</Tip>
-
-<Accordion title="练习入口：DRA 示例与一键部署">
-
-本书仓库 `books/ai-systems-performance-engineering/chapters/ch03/dra/`：
-
-- `quickstart/` — 整卡分配、容器/Pod 间共享
-- `mps-timeslicing/` — TimeSlicing 与 MPS 软件级共享
-- `static-mig-a100/` — `nvidia-mig-parted` 预切 + DRA 分配（A100 等）
-- `dynamic-mig-h100/` — 按 `ResourceClaim` 动态切 MIG（H100+），含真实 `resourceslice.yaml`
-- `partitionable-devices/` — `sharedCounters` / `consumesCounters` counter 机制示例
-- `scripts/setup-dra-env.sh` — 幂等地装好 kind + DRA driver 实验环境
 
 </Accordion>
+
+**一 Pod 两容器共享一卡**：同一个 Pod 里的两个容器引用同一个 claim，映射到同一张 GPU。
+
+<div style={{ maxWidth: "560px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-two-containers-share-gpu.png" alt="一个 Pod 内的 container0 和 container1 两个容器通过箭头汇聚到同一张 GPU 0" />
+</Frame>
+</div>
+
+<Accordion title="完整 YAML：quickstart/two-containers-share-one-gpu.yaml">
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test2
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: gpu-test2
+  name: single-gpu
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test2
+  name: pod
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: container0
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu           # 两个容器引用同一个 claim 名
+  - name: container1
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu           # → 落到同一张 GPU
+  resourceClaims:
+  - name: shared-gpu               # 本 Pod 只生成一个 claim，被两个容器共用
+    resourceClaimTemplateName: single-gpu
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+</Accordion>
+
+**两 Pod 共享一卡**：两个 Pod 引用同一个全局 `ResourceClaim`（`resourceClaimName`），落到同一张 GPU。
+
+<div style={{ maxWidth: "560px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-two-pods-share-gpu.png" alt="两个 Pod 各含一个容器，箭头汇聚到同一张 GPU 0，表示两个 Pod 共享一张卡" />
+</Frame>
+</div>
+
+<Accordion title="完整 YAML：quickstart/two-pods-share-one-gpu.yaml">
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test3
+---
+# 关键区别：这是一个独立的 ResourceClaim 对象（不是 Template），可被多个 Pod 共享
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  namespace: gpu-test3
+  name: single-gpu
+spec:
+  devices:                          # 直接就是 spec.devices，没有模板那层嵌套
+    requests:
+    - name: gpu
+      exactly:
+        deviceClassName: gpu.nvidia.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test3
+  name: pod1
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: container
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu
+  resourceClaims:
+  - name: shared-gpu
+    resourceClaimName: single-gpu       # 按名字引用已存在的 claim（不是 Template）
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+---
+# pod2 引用同一个 claim（single-gpu）→ 和 pod1 落到同一张 GPU
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test3
+  name: pod2
+  labels:
+    app: pod
+spec:
+  containers:
+  - name: container
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: shared-gpu
+  resourceClaims:
+  - name: shared-gpu
+    resourceClaimName: single-gpu
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+</Accordion>
+
+#### 6.3.2 TimeSlicing 与 MPS
+
+DRA 把共享策略直接写进每个 claim 的 `GpuConfig`，因此能**按工作负载单独配置**；而 device plugin 的 TimeSlicing / MPS 由整节点共用一份 ConfigMap 决定，同一节点上所有 Pod 只能套用同一套。DRA 的粒度还能更细——同一个 `ResourceClaimTemplate` 里就能给不同 request 配不同策略：一个 request 走 TimeSlicing、另一个走 MPS，各自落到不同的 GPU。下面这个示例用一个 Pod、4 个容器演示：`ts-ctr0/ts-ctr1` 共享一张走 TimeSlicing 的 GPU，`mps-ctr0/mps-ctr1` 共享另一张走 MPS 的 GPU。
+
+<div style={{ maxWidth: "620px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-timeslicing-mps.png" alt="一个 Pod 内 4 个容器：ts-ctr0/ts-ctr1 汇聚到 GPU A（TimeSlicing），mps-ctr0/mps-ctr1 汇聚到 GPU B（MPS）" />
+</Frame>
+</div>
+
+<Accordion title="完整 YAML：mps-timeslicing/timeslicing-and-mps-sharing.yaml">
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test5
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: gpu-test5
+  name: multiple-gpus
+spec:
+  spec:
+    devices:
+      requests:
+      - name: ts-gpu                    # 第一张卡：走 TimeSlicing
+        exactly:
+          deviceClassName: gpu.nvidia.com
+      - name: mps-gpu                   # 第二张卡：走 MPS
+        exactly:
+          deviceClassName: gpu.nvidia.com
+      config:                           # 按 request 分别配置共享策略
+      - requests: ["ts-gpu"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: TimeSlicing     # 时间片轮流，无显存/故障隔离
+              timeSlicingConfig:
+                interval: Long
+      - requests: ["mps-gpu"]
+        opaque:
+          driver: gpu.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: GpuConfig
+            sharing:
+              strategy: MPS             # 多进程并发，可限线程/显存
+              mpsConfig:
+                defaultActiveThreadPercentage: 50   # 每个进程最多用 50% SM
+                defaultPinnedDeviceMemoryLimit: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: gpu-test5
+  name: pod0
+spec:
+  containers:
+  - name: ts-ctr0                       # 与 ts-ctr1 共享 GPU A（TimeSlicing）
+    image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.6.0-ubuntu18.04
+    command: ["bash", "-c"]
+    args: ["trap 'exit 0' TERM; /tmp/sample --benchmark --numbodies=4226000 & wait"]
+    resources:
+      claims:
+      - name: shared-gpus
+        request: ts-gpu               # 选择走 TimeSlicing 的那张卡
+  - name: ts-ctr1
+    image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.6.0-ubuntu18.04
+    command: ["bash", "-c"]
+    args: ["trap 'exit 0' TERM; /tmp/sample --benchmark --numbodies=4226000 & wait"]
+    resources:
+      claims:
+      - name: shared-gpus
+        request: ts-gpu
+  - name: mps-ctr0                      # 与 mps-ctr1 共享 GPU B（MPS）
+    image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.6.0-ubuntu18.04
+    command: ["bash", "-c"]
+    args: ["trap 'exit 0' TERM; /tmp/sample --benchmark --numbodies=4226000 & wait"]
+    resources:
+      claims:
+      - name: shared-gpus
+        request: mps-gpu              # 选择走 MPS 的那张卡
+  - name: mps-ctr1
+    image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.6.0-ubuntu18.04
+    command: ["bash", "-c"]
+    args: ["trap 'exit 0' TERM; /tmp/sample --benchmark --numbodies=4226000 & wait"]
+    resources:
+      claims:
+      - name: shared-gpus
+        request: mps-gpu
+  resourceClaims:
+  - name: shared-gpus
+    resourceClaimTemplateName: multiple-gpus
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+</Accordion>
+
+GpuConfig 字段含义见官方 [GpuConfig API 参考](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/site/content/docs/reference/api.md#gpuconfig)。
+
+**启用 feature gate**：这两种策略分别需要 `TimeSlicingSettings`、`MPSSupport`，未开启时 kubelet 会在 `NodePrepareResources` 阶段拒绝。安装 DRA driver 时用 Helm 打开：
+
+```bash
+helm upgrade -i dra-driver-nvidia-gpu \
+  oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu --version 0.4.0 \
+  --create-namespace --namespace dra-driver-nvidia-gpu \
+  --set gpuResourcesEnabledOverride=true \
+  --set featureGates.TimeSlicingSettings=true \
+  --set featureGates.MPSSupport=true
+```
+
+`TimeSlicingSettings` 不与任何特性冲突，可与 `MPSSupport` 同时开启；但 `MPSSupport` 与 `DynamicMIG` **互斥**，两者不能同开（想跑动态 MIG 时需去掉 `MPSSupport`）。完整的互斥组合见官方 [feature gate constraints](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/site/content/docs/reference/feature-gates.md#constraints)。
+
+#### 6.3.3 静态 MIG
+
+静态 MIG 需要先在节点上把 GPU 提前做好 MIG 切分（比如用 [`nvidia-mig-parted`](https://github.com/NVIDIA/mig-parted)），之后 `ResourceClaim` / `ResourceClaimTemplate` 只能申请这些已经切好的 MIG 规格。
+
+<div style={{ maxWidth: "620px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-static-mig.png" alt="静态 MIG：先用 nvidia-mig-parted 把 GPU 0 预切成 1g.10gb×2 + 2g.20gb + 3g.40gb，Pod 的 claim 再从中分到一个 1g.10gb MIG" />
+</Frame>
+</div>
+
+**第一步：预切 MIG。** 用一份 `nvidia-mig-parted` 布局文件描述每张卡切成什么。下面把 GPU 0 切成 `1g.10gb×2 + 2g.20gb + 3g.40gb`（compute slice 合计 7g，刚好切满 A100 80GB）：
+
+```yaml
+# mig-parted-config.yaml
+version: v1
+mig-configs:
+  balanced:
+  - devices: [0]
+    mig-enabled: true
+    mig-devices:
+      "1g.10gb": 2
+      "2g.20gb": 1
+      "3g.40gb": 1
+```
+
+在节点上开启 MIG 模式并切分 MIG：
+
+```bash
+sudo nvidia-smi -i 0 -mig 1                                    # 开启 GPU 0 的 MIG 模式
+sudo -E nvidia-mig-parted apply -f mig-parted-config.yaml -c balanced
+nvidia-smi -L                                                 # 应列出切好的 MIG 设备
+```
+
+**第二步：申请 MIG 设备。** claim 引用 `mig.nvidia.com` DeviceClass，用 CEL selector 按 profile 选中已经切好的 MIG。完整清单见下：
+
+<Accordion title="完整 YAML：static-mig-a100/mig-static.yaml">
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: static-mig-test
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: static-mig-test
+  name: mig-1g
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mig
+        exactly:
+          deviceClassName: mig.nvidia.com          # MIG 用 mig.nvidia.com，不是 gpu.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: static-mig-test
+  name: mig-pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: mig
+  resourceClaims:
+  - name: mig
+    resourceClaimTemplateName: mig-1g
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+</Accordion>
+
+#### 6.3.4 动态 MIG
+
+H100 及更新架构可按 claim **现切** MIG，无需提前切分：开启 `DynamicMIG` feature gate 后，DRA driver 会直接依据 `ResourceClaim` 在卡上动态创建对应的 MIG 设备。
+
+<div style={{ maxWidth: "720px", margin: "0 auto" }}>
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-dynamic-mig.png" alt="动态 MIG：Pod 的 claim 声明 1g.10gb + 2g.20gb + 4g.40gb，DRA driver 按需在同一张 H100 上现切出这三个 MIG" />
+</Frame>
+</div>
+
+安装 DRA driver 时需打开 `DynamicMIG` feature gate（另外 Kubernetes 1.33–1.35 还需在 kube-apiserver、kube-scheduler 手动开启 [`DRAPartitionableDevices`](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/site/content/docs/reference/feature-gates.md)，1.36 起该 feature gate 默认开启）：
+
+```bash
+helm upgrade -i dra-driver-nvidia-gpu \
+  oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu --version 0.4.0 \
+  --create-namespace --namespace dra-driver-nvidia-gpu \
+  --set gpuResourcesEnabledOverride=true \
+  --set featureGates.DynamicMIG=true
+```
+
+下面看怎么用动态 MIG 为 Pod 申请资源。对用户来说，写法和静态 MIG **完全一样**——同样是在 `ResourceClaim` 里用 CEL selector 按 profile 选 MIG；区别只在于**不用提前切分**，driver 会根据申请**按需现切**出对应的 MIG。
+
+一个 claim 里可以声明多个 request，一次拿到多块 MIG。`constraints.matchAttribute: gpu.nvidia.com/parentUUID` 是可选的：加上它会把这些 MIG 约束在**同一张物理卡**上；不加则各 request 独立匹配，可能分散到多张 GPU。
+
+<Accordion title="完整 YAML：dynamic-mig-h100/mig-multi-profile.yaml">
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dynamic-mig-test
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: dynamic-mig-test
+  name: mig-4-2-1
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mig-1g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '1g.10gb'"
+      - name: mig-2g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '2g.20gb'"
+      - name: mig-4g
+        exactly:
+          deviceClassName: mig.nvidia.com
+          selectors:
+          - cel:
+              expression: "device.attributes['gpu.nvidia.com'].profile == '4g.40gb'"
+      constraints:
+      - matchAttribute: "gpu.nvidia.com/parentUUID"   # 三个 MIG 必须来自同一张物理卡
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: dynamic-mig-test
+  name: mig-pod
+spec:
+  containers:
+  - name: ctr
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      # 不带 request：注入 claim 里全部 3 个 MIG 设备；
+      # 只想要其中一个时改成：{ name: mig, request: mig-1g }
+      - name: mig
+  resourceClaims:
+  - name: mig
+    resourceClaimTemplateName: mig-4-2-1
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+</Accordion>
+
+动态 MIG 靠 DRA 的 partitionable devices 机制（[KEP-4815](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/4815-dra-partitionable-devices)）实现：
+
+1. DRA driver 把一张 GPU 的有限资源（显存切片、SM 等）声明成一个 `CounterSet`（放在 `ResourceSlice` 的 `sharedCounters` 字段里，通常一张物理卡一个），记录各项资源的总量；
+2. 再把这张卡上所有可能的 MIG 切分组合都作为设备列进 `ResourceSlice`，每个设备用 `consumesCounters` 声明要从对应 `CounterSet` 消耗多少；
+3. 调度时，调度器按「池总量 − 已分配 `ResourceClaim` 的消耗」核对每个 `CounterSet` 的余量，某项 counter 不够时对应设备就无法被分配。
+
+下面借 KubeCon 2025 的演讲 [Partitionable Devices: Putting the “Dynamic” Back in Dynamic Resource Allocation](https://kccncna2025.sched.com/event/b742642a3d9d914e51ef001b72ed596d)（Morten Jæger Torkildsen, Google & Jan-Philip Gehrcke, NVIDIA）的三张图看这套机制的实际过程。
+
+图里是两个 `ResourceSlice`（同属一个资源池，按规范拆成两份）：右边的 `counterset-slice` 用 `sharedCounters` 声明每个 CounterSet 的总量；左边的 `devices-slice` 把所有可能的（互相重叠的）设备列出来，各用 `consumesCounters` 声明要从某个 CounterSet 扣掉多少。调度器为每个 CounterSet 跟踪可用 counter，只有余量足够时设备才可分配。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-counter-1-tracking.png" alt="KubeCon 幻灯片：devices-slice 里的设备用 consumesCounters 引用 counterset-slice 里的 sharedCounters，调度器为每个 CounterSet 跟踪可用 counter" />
+</Frame>
+
+分配 `small-device-1` 时，从 `counterset-1` 扣掉 20Gi 显存 + 2 CPU，该 CounterSet 的可用 counter 相应减少。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-counter-2-allocate.png" alt="KubeCon 幻灯片：分配 small-device-1 后从 counterset-1 消耗 20Gi 显存和 2 CPU，可用 counter 减少" />
+</Frame>
+
+扣减后 `large-device` 需要的 counter 已不够、无法再分配。注意 `ResourceSlice` 本身不会被改写——调度器是通过已分配的 `ResourceClaim` 反推每个 CounterSet 还剩多少。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-dra-counter-3-unavailable.png" alt="KubeCon 幻灯片：counter 被 small-device-1 占用后，large-device 因余量不足变为不可分配；ResourceSlice 不被改写，调度器靠已分配 ResourceClaim 反推余量" />
+</Frame>
 
 ### 6.4 拓扑感知调度
 

@@ -1,14 +1,14 @@
 # gpu-test2：1 个 Pod、2 个容器，共享同一张 GPU。
 #
-#   ┌─ Pod ──────────────────┐
-#   │  ┌────────┐ ┌────────┐  │
-#   │  │  ctr0  │ │  ctr1  │  │
-#   │  └───┬────┘ └───┬────┘  │
-#   └──────┼──────────┼───────┘
-#          └────┬─────┘
-#          ┌────┴────┐
-#          │  GPU 0  │
-#          └─────────┘
+#   ┌─ Pod ────────────────────────┐
+#   │  ┌──────────┐  ┌──────────┐  │
+#   │  │container0│  │container1│  │
+#   │  └────┬─────┘  └────┬─────┘  │
+#   └───────┼─────────────┼────────┘
+#           └──────┬──────┘
+#           ┌──────┴──────┐
+#           │    GPU 0    │
+#           └─────────────┘
 #
 # 两个容器引用同一个 claim → 映射到同一张物理 GPU。
 
@@ -40,14 +40,14 @@ metadata:
     app: pod
 spec:
   containers:
-  - name: ctr0
+  - name: container0
     image: ubuntu:22.04
     command: ["bash", "-c"]
     args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]
     resources:
       claims:
       - name: shared-gpu
-  - name: ctr1
+  - name: container1
     image: ubuntu:22.04
     command: ["bash", "-c"]
     args: ["nvidia-smi -L; trap 'exit 0' TERM; sleep 9999 & wait"]

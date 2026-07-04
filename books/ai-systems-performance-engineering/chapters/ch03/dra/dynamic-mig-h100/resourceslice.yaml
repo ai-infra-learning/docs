@@ -1,6 +1,4 @@
 # H100 节点上 NVIDIA DRA driver（开启 DynamicMIG）实际发布的 ResourceSlice，
-# 由 `kubectl get resourceslice -o yaml` 导出，是 partitionable-devices/ 教学示例的真实对照。
-# 只读快照（含 uid/resourceVersion/ownerReferences），由 driver 自动维护，不需也不应手动 apply。
 #
 # 结构：1 个 ResourceSlice = 这张卡的“可切分菜单”
 #   node=dra-demo-worker，pool.resourceSliceCount=1（K8s 1.34：counters 与 devices 放同一 slice）
