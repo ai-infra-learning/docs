@@ -3819,6 +3819,245 @@ spec:
   <img src="/books/ai-systems-performance-engineering/images/ch03-dra-counter-3-unavailable.png" alt="KubeCon 幻灯片：counter 被 small-device-1 占用后，large-device 因余量不足变为不可分配；ResourceSlice 不被改写，调度器靠已分配 ResourceClaim 反推余量" />
 </Frame>
 
+#### 6.3.5 ComputeDomain：多节点 NVLink
+
+早期 NVIDIA DGX 的做法是把尽可能多的 GPU 塞进**一台服务器**、用高带宽 NVLink 连起来：单机内扩展很强，但作业规模被限制在一台机器内。GB300 NVL72 和 GB200 NVL72 正是为打破这一限制而生：每一台都提供由 NVLink Switch 连接的密集 GPU fabric，在机架内支持 **NVIDIA Multi-Node NVLink（MNNVL）**，并包含具备 IMEX 能力的 compute tray，实现跨节点的 GPU 显存共享——整个机架因此变成一块**统一的 GPU fabric**，成为超大规模分布式训练与推理的基础。
+
+<Frame caption="DGX GB200 系统——顶部 10 个、底部 8 个 compute tray，中间通过 9 个 NVLink Switch 相连，把 72 张 GPU 经 Multi-Node NVLink 连成一个全互连 mesh（chip-to-chip 1.8 TB/s，累计带宽超过 130 TB/s）">
+  <img src="/books/ai-systems-performance-engineering/images/ch03-gb200-nvl72-rack.webp" alt="GB200 NVL72 机架构成：18 个 compute tray（每 tray 4 GPU）加 9 个 NVLink Switch tray（每 tray 2 个 72 端口 NVSwitch），GPU 间共 1296 条 NVLink 连接" />
+</Frame>
+
+作为 [NVIDIA DRA driver for GPUs](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu) 的一部分，ComputeDomain 把底层的 GPU 构造（[NVIDIA NVLink](https://www.nvidia.com/en-us/data-center/nvlink/) 与 [NVIDIA IMEX](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html)）与现代 Kubernetes 原生的调度概念 DRA 桥接起来，为在现代 GPU 硬件上运行分布式、多节点工作负载提供必要的基础支撑。
+
+那么，在 Kubernetes 上支持多节点 NVLink 需要哪些东西、ComputeDomain 又如何帮上忙？关键是 **NVIDIA Internode Memory Exchange Service（IMEX）**——运行在 GPU driver 层的软件，让 GPU 能够跨节点通信。有了 IMEX，每一次 GPU 显存的导出/导入操作都会受到细粒度的访问控制。IMEX 作用在一组节点上，这组节点被称为 **IMEX domain**。
+
+<Accordion title="什么是 IMEX">
+
+IMEX（Internode Memory Exchange Service）提供的能力是：让**一组 GPU 通过高带宽 NVLink 直接读写彼此的显存**。这种连接既可以是**同一节点内** GPU 之间的直连，也可以是**不同节点**间经 NVSwitch 连接的 GPU。
+
+要让不同机器上的 GPU 互相通信，它们必须共享一个叫 **IMEX channel** 的构造——可以理解成一个**跨节点资源**，需要被多节点作业的每个 worker 共享。
+
+IMEX 共享的对象是 **fabric-attached memory（fabric 显存）**——被映射进 NVLink fabric 地址空间的 GPU 显存：除了本地的「虚拟地址 → 物理地址」映射，它还多了一个 **fabric 地址（FA）**，因而同一 NVLink fabric 上的其它 GPU 都能经 NVLink 直接寻址、读写它（这正是 MNNVL「把整机架当作一块可共享的大显存」的底层）。
+
+一个 CUDA 进程要读写这样的 fabric 显存，需要同时满足：
+
+- 它与**创建原始 handle 的进程处在同一个 IMEX domain**；
+- 它能访问**创建原始 handle 的进程所用的同一个 IMEX channel**；
+- 它持有对该 `sharedHandle` 的引用（`sharedHandle` 的 export / import 具体方式见 [Supporting GB200 on Kubernetes](https://docs.google.com/presentation/d/1-qc_6W2w4D3zXu9LA6CSmzBdOwscRpEJydxu9BD89WI/edit?slide=id.g30d67777a5f_1_14#slide=id.g30d67777a5f_1_14)）。
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-imex-shared-handle.png" alt="IMEX 显存共享的 handle 模型：一端把本地 handle 导出为 sharedHandle，另一端导入后重建出 handle，两端的 ptr 指向同一块 fabric 显存" />
+</Frame>
+
+上图：一端的 CUDA 进程分配显存、拿到本地 `handle`（指向 `ptr`），把它导出成一个 `sharedHandle`；另一端的进程凭这个 `sharedHandle` 导入、在本地重建出 `handle`（同样指向那块 fabric 显存的 `ptr`）。于是两端进程虽然在不同节点、各有独立的地址空间，却通过 NVLink 读写到**同一块物理显存**——这就是跨节点显存共享的本质。
+
+</Accordion>
+
+参考下图，可以更好地理解在多节点 NVLink 环境中，NVLink domain、IMEX domain 以及其它可能的 GPU 分区层级之间的关系：
+
+<Frame>
+  <img src="/books/ai-systems-performance-engineering/images/ch03-mnnvl-concepts.webp" alt="NVLink Domain / NVLink Partition / IMEX Domain / IMEX Channel 的嵌套关系：Domain 是物理互连的全部 GPU，Partition 在 NVSwitch 层做硬件隔离，IMEX Domain 是运行 IMEX daemon 的节点组，IMEX Channel 是跨节点通信必须共享的软件通道" />
+</Frame>
+
+图源：[Enabling Multi-Node NVLink on Kubernetes for NVIDIA GB200 NVL72 and Beyond](https://developer.nvidia.com/blog/enabling-multi-node-nvlink-on-kubernetes-for-gb200-and-beyond/)。
+
+- **NVLink Domain（NVLink 域）**：通过 NVLink 物理互连的一组 GPU；GB200 上一个 rack（NVL72）就是一个 NVLink Domain（72 GPU），有相同的 **Cluster UUID**。
+- **NVLink Partition（NVLink 分区）**：由 NVSwitch 硬件隔离出的分区，分区之间互不相通、用于多租户隔离；GPU 的 **Clique ID** 就对应它所属的分区（在 K8s 里，GFD 据此给节点打上 `nvidia.com/gpu.clique` 标签）。
+- **IMEX Domain**：某个 NVLink Partition 内运行 `nvidia-imex` 的一组节点，必须共享同一 `<ClusterUUID, CliqueID>`；一个 NVLink Partition 内可以有多个 IMEX Domain。
+- **IMEX Channel**：IMEX Domain 内的一条软件通道，跨节点作业的各个进程拿到同一个 channel 才能互访显存；不同作业用不同 channel，互相隔离。
+
+| 概念 | 类型 | 由谁配置 | 描述 |
+|---|---|---|---|
+| NVLink Domain | 硬件 | 物理拓扑决定 | 通过 NVLink 物理互连的一组 GPU（如一个 NVL72 机架） |
+| NVLink Partition | 硬件 | NVSwitch Control Plane（NMX） | 在 NVSwitch 层把 NVLink Domain 隔成互不相通的分区，做多租户隔离 |
+| IMEX Domain | 软件 | ComputeDomain / DRA driver（起 `nvidia-imex`） | 某个 Partition 内实际运行 `nvidia-imex` 的一组节点 |
+| IMEX Channel | 软件 | ComputeDomain（按作业分配） | Domain 内做访问隔离的通道，同 channel 的进程才能互访显存；在 ComputeDomain 里，一个 domain 默认只有一个 channel，由 domain 的全部节点共用 |
+
+下面看看 ComputeDomain 的工作原理，过程如下：
+
+- 创建 `ComputeDomain`（图中 `compute-domain-0`）后，`compute-domain-controller` 会配套建出一个 DaemonSet 和一个 `ResourceClaimTemplate`，此时还没真正组网：
+  - 一个 per-domain 的 DaemonSet，用来在节点上运行 `nvidia-imex`；它的 `nodeSelector` 只认带有 ComputeDomain UID 标签的节点——标签形如 `resource.nvidia.com/computeDomain: <ComputeDomain 的 UID>`。
+  - 一个供 workload 申请 channel 的 `ResourceClaimTemplate`（`compute-domain-0-rct`，背后是 `compute-domain-default-channel.nvidia.com` 这个 DeviceClass）。
+  - 此刻还没有节点带这个标签，所以没有 daemon Pod 在跑，也还没有 IMEX domain。
+- workload Pod 引用该 `ResourceClaimTemplate` 并被调度到节点后，daemon 才被拉起来：
+  - `compute-domain-kubelet-plugin` 给所在节点打上上述标签，DaemonSet 随即在这批节点上拉起 `compute-domain-daemon`。
+  - 每个 daemon 运行 `nvidia-imex`（配置目录 `/imexd` 由 kubelet-plugin 挂载进 daemon 容器），管理本节点的 NVLink fabric 连接。
+  - daemon 通过 driver namespace 里的 `ComputeDomainClique` CR 公布自己的 IP、clique 归属和就绪状态。
+- daemon 起来后互相组网，channel 也随之注入容器：
+  - 这些 daemon 组成**一个** IMEX domain，也就是这批节点能互访显存的范围。
+  - workload Pod 申请到 channel 后，`compute-domain-kubelet-plugin` 向其容器注入对应的 IMEX channel 设备（`/dev/nvidia-caps-imex-channels/channel0`）。
+  - 同一 ComputeDomain 下所有 Pod 拿到**同一个** channel（图中 `channel 0`），凭它跨节点读写彼此的 fabric 显存——真正能互访的，就是拿到同一 channel 的这批 Pod。
+
+<Frame caption="一个 ComputeDomain 对应一个 IMEX domain：controller 先建出 ResourceClaimTemplate 和 per-domain DaemonSet，workload Pod 落到节点后由 nvidia-imex 组成一个 IMEX domain，并给这批 Pod 注入同一个 channel，跨节点经 NVLink/NVSwitch fabric 共享显存">
+  <img src="/books/ai-systems-performance-engineering/images/ch03-computedomain-imex.png" alt="ComputeDomain 到 IMEX domain 的映射：左侧 Kubernetes 控制面里 ComputeDomain 创建 ResourceClaimTemplate 与 per-domain DaemonSet；右侧同一 NVLink Partition（同一 Clique ID）内的三个节点各跑一个 workload Pod、一个 compute-domain-daemon（nvidia-imex）和若干 GPU，daemon 组成一个 IMEX Domain，三个 Pod 拿到同一个 channel 0，底部经 NVLink/NVSwitch fabric 共享显存" />
+</Frame>
+
+<Accordion title="示例：两节点 nvbandwidth 测试（验证跨节点 NVLink）">
+
+下面用一个真实的**两节点 `nvbandwidth` 测试**走一遍：每节点用 4 张 GPU，跨两个节点验证 GPU 之间能否以全 NVLink 带宽互访。MPI 作业的编排交给 MPI Operator（`MPIJob`），ComputeDomain 负责把这两个节点的 IMEX 打通。
+
+先装 MPI Operator：
+
+```bash
+kubectl create -f https://github.com/kubeflow/mpi-operator/releases/download/v0.6.0/mpi-operator.yaml
+```
+
+同一份 spec 里声明两样东西：一个 `numNodes: 2` 的 `ComputeDomain`，和一个引用它 channel 的 `MPIJob`（1 个 launcher + 2 个 worker，每 worker 4 GPU）：
+
+```yaml
+---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: nvbandwidth-test-compute-domain
+spec:
+  numNodes: 0                                   # 该字段已废弃，设为 0 即可（daemon 随 worker 落点自动组网）
+  channel:
+    resourceClaimTemplate:
+      name: nvbandwidth-test-compute-domain-channel
+---
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nvbandwidth-test
+spec:
+  slotsPerWorker: 4                             # 每个 worker 4 个 slot = 4 张 GPU
+  launcherCreationPolicy: WaitForWorkersReady   # 等 worker 就绪再起 launcher
+  runPolicy:
+    cleanPodPolicy: Running
+  sshAuthMountPath: /home/mpiuser/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            nvbandwidth-test-replica: mpi-launcher
+        spec:
+          affinity:
+            nodeAffinity:                        # launcher 放到 control-plane 节点
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+          containers:
+          - image: ghcr.io/nvidia/k8s-samples:nvbandwidth-v0.7-8d103163
+            name: mpi-launcher
+            securityContext:
+              runAsUser: 1000
+            command:
+            - mpirun
+            args:                                # 8 rank、每节点 4 个，跑跨节点 D2D 读带宽
+            - --bind-to
+            - core
+            - --map-by
+            - ppr:4:node
+            - -np
+            - "8"
+            - --report-bindings
+            - -q
+            - nvbandwidth
+            - -t
+            - multinode_device_to_device_memcpy_read_ce
+    Worker:
+      replicas: 2                                # 2 个 worker，各占一个节点
+      template:
+        metadata:
+          labels:
+            nvbandwidth-test-replica: mpi-worker
+        spec:
+          affinity:
+            podAffinity:                         # 2 个 worker 落到同一 NVLink partition（同一 clique）
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                  - key: nvbandwidth-test-replica
+                    operator: In
+                    values:
+                    - mpi-worker
+                topologyKey: nvidia.com/gpu.clique
+          containers:
+          - image: ghcr.io/nvidia/k8s-samples:nvbandwidth-v0.7-8d103163
+            name: mpi-worker
+            securityContext:
+              runAsUser: 1000
+            command:                             # worker 只跑 sshd，等 launcher 经 MPI 拉起 rank
+            - /usr/sbin/sshd
+            args:
+            - -De
+            - -f
+            - /home/mpiuser/.sshd_config
+            resources:
+              limits:
+                nvidia.com/gpu: 4                # 每 worker 4 张 GPU
+              claims:
+              - name: compute-domain-channel
+          resourceClaims:
+          - name: compute-domain-channel         # 加入上面的 ComputeDomain，拿到 IMEX channel
+            resourceClaimTemplateName: nvbandwidth-test-compute-domain-channel
+```
+
+应用上面的配置之后能看到三组 Pod：`MPIJob` 的 1 个 launcher + 2 个 worker，以及 ComputeDomain 按 worker 落点节点拉起的 2 个 daemon：
+
+```bash
+$ kubectl get pods
+NAME                              READY   STATUS      RESTARTS   AGE
+nvbandwidth-test-launcher-lzv84   1/1     Running     0          3s
+nvbandwidth-test-worker-0         1/1     Running     0          15s
+nvbandwidth-test-worker-1         1/1     Running     0          15s
+
+# ComputeDomain 的 per-domain daemon（每个 worker 节点一个）
+$ kubectl get pods -n nvidia-dra-driver-gpu -l resource.nvidia.com/computeDomain
+NAME                                          READY   STATUS    RESTARTS   AGE
+nvbandwidth-test-compute-domain-ht24d-9jhmj   1/1     Running   0          20s
+nvbandwidth-test-compute-domain-ht24d-rcn2c   1/1     Running   0          20s
+```
+
+launcher 日志里，8 个 rank 分布在两个 worker 上（每节点 4 张 GB200），核心是那张带宽矩阵：
+
+```text
+Process 0 (nvbandwidth-test-worker-0): device 0: HGX GB200 ...
+Process 1 (nvbandwidth-test-worker-0): device 1: HGX GB200 ...
+Process 2 (nvbandwidth-test-worker-0): device 2: HGX GB200 ...
+Process 3 (nvbandwidth-test-worker-0): device 3: HGX GB200 ...
+Process 4 (nvbandwidth-test-worker-1): device 0: HGX GB200 ...
+Process 5 (nvbandwidth-test-worker-1): device 1: HGX GB200 ...
+Process 6 (nvbandwidth-test-worker-1): device 2: HGX GB200 ...
+Process 7 (nvbandwidth-test-worker-1): device 3: HGX GB200 ...
+
+Running multinode_device_to_device_memcpy_read_ce.
+memcpy CE GPU(row) -> GPU(column) bandwidth (GB/s)
+           0         1         2         3         4         5         6         7
+ 0       N/A    798.02    798.25    798.02    798.02    797.88    797.73    797.95
+ 1    798.10       N/A    797.80    798.02    798.02    798.25    797.88    798.02
+ 2    797.95    797.95       N/A    797.73    797.80    797.95    797.95    797.65
+ 3    798.10    798.02    797.95       N/A    798.02    798.10    797.88    797.73
+ 4    797.80    798.02    798.02    798.02       N/A    797.95    797.80    798.02
+ 5    797.80    797.95    798.10    798.10    797.95       N/A    797.95    797.88
+ 6    797.73    797.95    798.10    798.02    797.95    797.88       N/A    797.80
+ 7    797.88    798.02    797.95    798.02    797.88    797.95    798.02       N/A
+
+SUM multinode_device_to_device_memcpy_read_ce 44685.29
+```
+
+rank 0–3 在 worker-0、rank 4–7 在 worker-1。矩阵里**跨节点**的格子（例如 0↔4、3↔7）和**同节点**的格子一样都是 ~798 GB/s——分处两个节点的 GPU 之间达到了全 NVLink 带宽。这正是 ComputeDomain 的作用所在：它自动把两个节点的 IMEX 打通，让这 8 张 GPU 像在同一条 NVLink fabric 上一样互访显存。
+
+</Accordion>
+
+
+**参考资料**
+
+- [ComputeDomain workloads](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/compute-domain-workloads/)：官方 workload 示例，覆盖创建 `ComputeDomain`、申请 channel、查看状态和 feature gates。
+- [Validate setup for ComputeDomain allocation](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/wiki/Validate-setup-for-ComputeDomain-allocation)：ComputeDomain 环境验证 checklist，包含 IMEX channel 注入测试和 `nvbandwidth` 多节点测试。
+- [NVIDIA DRA Driver for GPUs - GPU Operator docs](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-cds.html)：解释 ComputeDomain、IMEX 安全边界和 GPU Operator 集成路径。
+- [Enabling Multi-Node NVLink on Kubernetes for NVIDIA GB200 NVL72 and Beyond](https://developer.nvidia.com/blog/enabling-multi-node-nvlink-on-kubernetes-for-gb200-and-beyond/)：NVIDIA 官方博客，解释 ComputeDomain 与 GB200 NVL72 / MNNVL 的关系。
+- [Running AI Workloads on Rack-Scale Supercomputers](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)：解释 rack-scale NVLink fabric、Cluster UUID、Clique ID 与拓扑感知调度的关系。
+- [NVIDIA GB200 NVL Partition](https://docs.nvidia.com/multi-node-nvlink-systems/partition-guide-v1-2.pdf)：说明 NVLink Domain、NVLink Partition 和平台侧 partition 管理。
+- [Kubernetes support for GH200 / GB200](https://docs.google.com/document/d/1PrdDofsPFVJuZvcv-vtlI9n2eAh-YVf_fRQLIVmDwVY)：ComputeDomain 背景设计资料。
+- [Supporting GB200 on Kubernetes](https://docs.google.com/presentation/d/1Xupr8IZVAjs5bNFKJnYaK0LE7QWETnJjkz6KOfLu87E)：GB200 / Kubernetes 支持相关 slides。
+
+
 ### 6.4 拓扑感知调度
 
 默认 Kubernetes 调度器只知道资源数量，不理解 GPU、CPU、NUMA、NIC、NVLink domain 的距离。请求 4 张 GPU 成功，不代表这 4 张 GPU 在同一个 NVLink clique，也不代表 CPU 和 NIC 离它们最近。
@@ -3876,77 +4115,7 @@ volumes:
 
 </Accordion>
 
-### 6.5 ComputeDomain：多节点 NVLink
-
-节点内多张 GPU 走 NVLink/NVSwitch 直连即可；要让**不同节点**的 GPU 以全 NVLink 带宽共享显存，需要 Multi-Node NVLink（MNNVL）和 IMEX。NVIDIA DRA driver 的另一子系统 [ComputeDomain](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/)（`compute-domain.nvidia.com`）就是为此设计：当 workload 请求一个 `ComputeDomain` 时，driver 会按这组 Pod 所在节点临时编排 IMEX daemon、IMEX domain 和 channel device，随作业创建、随作业销毁。和仍处于 Technology Preview 的 GPU 分配侧不同，ComputeDomain 是 NVIDIA DRA driver 中**已正式支持**的部分。
-
-前置条件：
-
-- **MNNVL 硬件**：多个节点接入同一 NVLink 交换 fabric，典型是 GB200 NVL72。普通以太网 / InfiniBand 互联的双机不算。
-- **软件栈**：Kubernetes `1.32+`，集群启用 DRA 和 CDI；NVIDIA Driver `v570.158.01+`。
-- **节点标签与服务**：GPU Feature Discovery 给 MNNVL 节点打 `nvidia.com/gpu.clique` 标签；节点上禁用宿主机级 `nvidia-imex.service`，避免和 DRA driver 管理的 IMEX daemon 冲突。
-
-用法是先建一个 `ComputeDomain`。最小配置只需要声明 channel 对应的 `ResourceClaimTemplate` 名称；`numNodes` 已废弃，推荐设为 `0`：
-
-```yaml
-apiVersion: resource.nvidia.com/v1beta1
-kind: ComputeDomain
-metadata:
-  name: imex-channel-injection
-spec:
-  numNodes: 0
-  channel:
-    resourceClaimTemplate:
-      name: imex-channel-0
-```
-
-应用这个对象后，controller 会创建两类资源：
-
-- 一个按 `ComputeDomain` 生成的 `compute-domain-daemon` DaemonSet，每个 GPU 节点上运行一个 daemon pod，用来包装和监督 `nvidia-imex`。
-- 一个名为 `imex-channel-0` 的 `ResourceClaimTemplate`，workload Pod 通过它申请 IMEX channel。
-
-Pod 通过 `resourceClaimTemplateName: imex-channel-0` 申请 channel 后，容器里会注入 `/dev/nvidia-caps-imex-channels/...` 和 IMEX mount；Pod 会等本地 IMEX daemon ready 后再启动：
-
-```yaml
-spec:
-  containers:
-  - name: app
-    resources:
-      claims:
-      - name: imex-channel-0
-  resourceClaims:
-  - name: imex-channel-0
-    resourceClaimTemplateName: imex-channel-0
-```
-
-默认 `spec.channel.allocationMode` 是 `Single`，只向 workload 注入一个 IMEX channel；需要访问 IMEX domain 内所有 channel 的 workload 可以设为 `All`。
-
-验证时先看 `ComputeDomain` 状态，再看 clique 对象和 channel 注入结果：
-
-```bash
-kubectl get computedomain imex-channel-injection -o yaml
-kubectl get computedomainclique -n nvidia-dra-driver-gpu
-kubectl logs imex-channel-injection
-```
-
-<Tip>
-ComputeDomain 只适用于真正的 MNNVL 系统（GB200 NVL72 等）。单张卡、单节点多卡、或普通网络互联的多机都用不上；这类场景下安装 DRA driver 时可 `--set resources.computeDomains.enabled=false` 关掉该子系统。
-</Tip>
-
-<Accordion title="ComputeDomain 参考资料">
-
-- [ComputeDomain workloads](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/compute-domain-workloads/)：官方 workload 示例，覆盖创建 `ComputeDomain`、申请 channel、查看状态和 feature gates。
-- [Validate setup for ComputeDomain allocation](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/wiki/Validate-setup-for-ComputeDomain-allocation)：ComputeDomain 环境验证 checklist，包含 IMEX channel 注入测试和 `nvbandwidth` 多节点测试。
-- [NVIDIA DRA Driver for GPUs - GPU Operator docs](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-cds.html)：解释 ComputeDomain、IMEX 安全边界和 GPU Operator 集成路径。
-- [Enabling Multi-Node NVLink on Kubernetes for NVIDIA GB200 NVL72 and Beyond](https://developer.nvidia.com/blog/enabling-multi-node-nvlink-on-kubernetes-for-gb200-and-beyond/)：NVIDIA 官方博客，解释 ComputeDomain 与 GB200 NVL72 / MNNVL 的关系。
-- [Running AI Workloads on Rack-Scale Supercomputers](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)：解释 rack-scale NVLink fabric、Cluster UUID、Clique ID 与拓扑感知调度的关系。
-- [NVIDIA GB200 NVL Partition](https://docs.nvidia.com/multi-node-nvlink-systems/partition-guide-v1-2.pdf)：说明 NVLink Domain、NVLink Partition 和平台侧 partition 管理。
-- [Kubernetes support for GH200 / GB200](https://docs.google.com/document/d/1PrdDofsPFVJuZvcv-vtlI9n2eAh-YVf_fRQLIVmDwVY)：ComputeDomain 背景设计资料。
-- [Supporting GB200 on Kubernetes](https://docs.google.com/presentation/d/1Xupr8IZVAjs5bNFKJnYaK0LE7QWETnJjkz6KOfLu87E)：GB200 / Kubernetes 支持相关 slides。
-
-</Accordion>
-
-### 6.6 资源隔离与 QoS
+### 6.5 资源隔离与 QoS
 
 [Kubernetes QoS 文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)定义了 `Guaranteed`、`Burstable`、`BestEffort` 三类。节点内存紧张时，Kubernetes 会优先驱逐 `BestEffort`，其次是 `Burstable`，最后是 `Guaranteed`。
 
@@ -3964,7 +4133,7 @@ GPU 训练 Pod 通常应该做到：
 - 训练节点预留 housekeeping CPU，避免 kubelet/containerd/监控 agent 与 DataLoader worker 抢核。
 - I/O 隔离用本地 NVMe 分区、cgroup v2 I/O controller 或存储层 QoS 补齐；Kubernetes 默认资源模型不直接表达磁盘带宽。
 
-### 6.7 调度器：Kubernetes、Slurm 与 Slinky
+### 6.6 调度器：Kubernetes、Slurm 与 Slinky
 
 训练平台和推理平台的调度目标不同。训练更像 HPC batch：一组 rank 要同时拿到 GPU、CPU、内存、网络和文件系统带宽；推理更像在线服务：关注 rollout、autoscaling、灰度、SLO、可观测和多租户隔离。调度器选型不是“谁更先进”，而是资源模型和团队操作模型是否匹配。
 
