@@ -5,7 +5,7 @@ title: "第六章：GPU 架构、CUDA 编程与最大化占用率"
 ## 本章概要
 
 
-本章可以理解为一章“CUDA 性能优化入门地图”。它不是单独讲 CUDA 语法，也不是单独讲 GPU 硬件，而是把 GPU 架构、CUDA 编程模型、内存体系和性能分析方法串联起来。原文先解释 GPU 与 CPU 的差异：CPU 更追求单线程低延迟，而 GPU 更追求大量线程同时执行的吞吐量；随后介绍 GPU 内部的 SM、warp scheduler、SIMT 执行模型，以及 thread、warp、block、grid 这些 CUDA 线程层级；接着讲解如何选择 `threadsPerBlock` 和 `blocksPerGrid`，为什么线程块大小通常要是 32 的倍数，以及为什么 kernel 中必须做边界检查；中间部分重点介绍 GPU 内存体系，包括 register、shared memory / L1、L2、HBM、TMEM、TMA、Unified Memory、异步内存分配和 memory pool；最后通过 occupancy、launch bounds、CUDA Occupancy API、Compute Sanitizer、Roofline 模型、Nsight Systems、Nsight Compute 和 NVTX，说明如何判断一个 CUDA kernel 是并行度不足、资源受限、内存受限还是计算受限。整章的主线可以概括为：高性能 CUDA 编程的关键，是让 GPU 有足够多的有效并行工作，同时让数据尽可能靠近计算单元，并用 profiling 工具验证每一次优化是否真正解决了瓶颈。
+CUDA 性能优化需要把 GPU 架构、CUDA 编程模型、内存体系和性能分析方法串联起来。CPU 更追求单线程低延迟，而 GPU 更追求大量线程同时执行的吞吐量；SM、warp scheduler、SIMT 执行模型，以及 thread、warp、block、grid 这些 CUDA 线程层级，是理解 CUDA kernel 执行方式的基础；`threadsPerBlock` 和 `blocksPerGrid` 的选择、线程块大小使用 32 的倍数、kernel 中的边界检查，决定了并行任务能否正确映射到 GPU；register、shared memory / L1、L2、HBM、TMEM、TMA、Unified Memory、异步内存分配和 memory pool，则决定了数据移动成本。occupancy、launch bounds、CUDA Occupancy API、Compute Sanitizer、Roofline 模型、Nsight Systems、Nsight Compute 和 NVTX 可以帮助判断一个 CUDA kernel 是并行度不足、资源受限、内存受限还是计算受限。高性能 CUDA 编程的关键，是让 GPU 有足够多的有效并行工作，同时让数据尽可能靠近计算单元，并用 profiling 工具验证每一次优化是否真正解决了瓶颈。
 
 ## 章节详解
 
@@ -14,11 +14,11 @@ title: "第六章：GPU 架构、CUDA 编程与最大化占用率"
 
 ### 1 GPU 架构与 CUDA 的执行
 
-这一部分对应原文前半部分的架构基础，重点回答三个问题：GPU 为什么快，SM 和 warp scheduler 如何工作，以及 CUDA 为什么要用 thread、warp、block、grid 这样的层级来组织并行任务。
+GPU 架构基础围绕三个问题展开：GPU 为什么快，SM 和 warp scheduler 如何工作，以及 CUDA 为什么要用 thread、warp、block、grid 这样的层级来组织并行任务。
 
 #### 1.1 GPU 为什么快：吞吐量优先，而不是单线程优先
 
-理解本章内容，需要先区分 CPU 和 GPU 的设计目标。CPU 的设计更偏向“尽快完成一个复杂任务”，它依赖较强的单线程性能、复杂的分支预测、乱序执行和大缓存，因此适合执行控制流复杂、线程数量不多、每一步逻辑差异较大的任务。
+理解 GPU 性能优化，需要先区分 CPU 和 GPU 的设计目标。CPU 的设计更偏向“尽快完成一个复杂任务”，它依赖较强的单线程性能、复杂的分支预测、乱序执行和大缓存，因此适合执行控制流复杂、线程数量不多、每一步逻辑差异较大的任务。
 
 GPU 的设计目标不同。GPU 不是为了让某一个线程执行得特别快，而是为了让成千上万个线程同时工作。它更像一个吞吐量机器：只要任务可以拆成大量相似的小任务，GPU 就能把这些小任务分发给大量线程并行处理。
 
@@ -26,7 +26,7 @@ GPU 的设计目标不同。GPU 不是为了让某一个线程执行得特别快
 
 > GPU 的快，不在于单个线程跑得快，而在于同时运行的线程足够多。它依靠大规模并行和 warp 间快速切换来隐藏等待时间。
 
-开头用 CUDA 的基本执行流程说明 CPU 和 GPU 如何配合：
+CUDA 的基本执行流程展示了 CPU 和 GPU 如何配合：
 
 <Frame caption="CUDA 基本执行流程：CPU 准备数据、拷贝到 GPU、启动 kernel、执行、拷贝回 CPU">
   <img src="../images/ch06-01.png" alt="CUDA 基本执行流程示意图" />
@@ -39,7 +39,7 @@ GPU 的设计目标不同。GPU 不是为了让某一个线程执行得特别快
 4. GPU 在 device 上执行 kernel。
 5. 执行结束后，结果从 GPU memory 拷贝回 CPU memory。
 
-这一流程说明，GPU 程序的性能问题不一定只来自 kernel 本身，也可能来自 CPU-GPU 数据传输，或者来自数据传输和计算没有重叠。后文中 `cudaMemcpyAsync`、pinned memory、Nsight Systems 时间线等内容，都与这一问题相关。
+这一流程说明，GPU 程序的性能问题不一定只来自 kernel 本身，也可能来自 CPU-GPU 数据传输，或者来自数据传输和计算没有重叠。`cudaMemcpyAsync`、pinned memory、Nsight Systems 时间线等内容，都与这一问题相关。
 
 #### 1.2 SM、warp scheduler 与执行流水线
 
@@ -48,16 +48,16 @@ GPU 的设计目标不同。GPU 不是为了让某一个线程执行得特别快
 | 制程            | 12nm        | 7nm           | 4nm         | 4nm         |
 | Tensor Core   | 第1代         | 第3代           | 第4代         | 第5代         |
 | 标志性精度         | FP16        | TF32 + BF16   | FP8         | FP4         |
-| 内存            | 16GB HBM2   | 40/80GB HBM2e | 80GB HBM3   | 192GB HBM3e |
+| 内存            | 16GB HBM2   | 40/80GB HBM2e | 80GB HBM3   | 180GB HBM3e |
 | 内存带宽          | 900 GB/s    | 1.55 TB/s     | 3.35 TB/s   | ~8 TB/s     |
 | NVLink        | 300 GB/s    | 600 GB/s      | 900 GB/s    | 1.8 TB/s    |
 | 计算能力          | 7.0         | 8.0           | 9.0         | 10.0        |
 | **CUDA_ARCH** | **700**     | **800**       | **900**     | **1000**    |
 
 - GPU Device
-	- Streaming Multiprocessor(SMs)
+	- Streaming Multiprocessor (SMs)
 		- CUDA Cores
-		- Special Function Units(SFU)
+		- Special Function Units (SFU)
 		- Register File
 		- Shared Memory / L1 Cache
 		- Texture Units / Load/Store Units
@@ -71,15 +71,15 @@ GPU 的设计目标不同。GPU 不是为了让某一个线程执行得特别快
 	- Interconnect
 		- NVLink / NVSwitch
 
-原文重点介绍了 Blackwell 中 SM 的组织方式和 warp 调度机制。
+Blackwell 中 SM 的组织方式和 warp 调度机制，是理解现代 NVIDIA GPU 执行模型的重要入口。
 
-GPU 由许多 SM 组成，SM 全称是 Streaming Multiprocessor。SM 可以暂时理解为 GPU 上的”计算单元”，但它不是 CPU core 的简单放大版。CPU core 更强调单线程执行能力，而 SM 更强调同时容纳和调度大量线程。
+GPU 由许多 SM 组成，SM 全称是 Streaming Multiprocessor。SM 可以暂时理解为 GPU 上的“计算单元”，但它不是 CPU core 的简单放大版。CPU core 更强调单线程执行能力，而 SM 更强调同时容纳和调度大量线程。
 
 <Frame caption="Blackwell SM 内部结构：warp scheduler、CUDA cores、寄存器和共享内存等组件">
   <img src="../images/ch06-02.png" alt="GPU SM 内部架构图" />
 </Frame>
 
-以 Blackwell 为例，原文提到：
+以 Blackwell 为例：
 
 - 每个 SM 最多可以跟踪 64 个 warp。
 - 一个 warp 是 32 个线程。
@@ -89,7 +89,7 @@ GPU 由许多 SM 组成，SM 全称是 Streaming Multiprocessor。SM 可以暂�
 
 SM 需要维护大量 warp，是因为 GPU 访问 global memory 的延迟很高。如果一个 warp 发起内存访问后原地等待，SM 就会空转。GPU 的做法是：当某个 warp 等待内存时，warp scheduler 会切换到另一个 ready warp 继续执行。只要活跃 warp 足够多，SM 就能持续保持忙碌。
 
-原文还介绍了 Blackwell SM 内部的 warp scheduler。一个 SM 可以看作由多个调度分区组成，每个分区有自己的 warp scheduler 和 dispatch logic。理想情况下，四个 scheduler 每个周期可以从四个不同 warp 中各发射一条指令。
+Blackwell SM 内部有多个 warp scheduler。一个 SM 可以看作由多个调度分区组成，每个分区有自己的 warp scheduler 和 dispatch logic。理想情况下，四个 scheduler 每个周期可以从四个不同 warp 中各发射一条指令。
 
 可以用如下类比理解：
 
@@ -103,17 +103,16 @@ SM 需要维护大量 warp，是因为 GPU 访问 global memory 的延迟很高�
 - 如果一个 warp 只有内存操作，可能计算流水线处于空闲。
 - 如果同一个 warp 有可配对的计算和访存操作，就可能同时使用 math pipeline 和 memory pipeline，从而提高硬件利用率。
 
-还有特殊函数单元SFU，也就是 Special Function Unit。SFU 用于处理 `sin`、`cos`、倒数、平方根等特殊函数。SFU 拥有独立流水线，不属于普通 math + memory 的 dual issue 配对。这个细节说明 GPU 内部并不是单一计算单元，而是包含 INT32、FP32、Tensor Core、LD/ST、SFU 等多种执行管线。
+还有特殊函数单元 SFU，也就是 Special Function Unit。SFU 用于处理 `sin`、`cos`、倒数、平方根等特殊函数。SFU 拥有独立流水线，不属于普通 math + memory 的 dual issue 配对。这个细节说明 GPU 内部并不是单一计算单元，而是包含 INT32、FP32、Tensor Core、LD/ST、SFU 等多种执行管线。
 
-这一节的核心结论是：
 
-> GPU 架构层面的关键，是 SM 能同时维护大量 warp，并通过 warp scheduler 把 ready warp 持续送入不同流水线执行。后文中的 occupancy，本质上就是讨论如何让 SM 有足够多的 warp 可以调度。
+ GPU 架构层面的关键，是 SM 能同时维护大量 warp，并通过 warp scheduler 把 ready warp 持续送入不同流水线执行。occupancy 本质上就是讨论如何让 SM 有足够多的 warp 可以调度。
 
 #### 1.3 SIMT、warp 与分支发散
 
 SIMT 是 Single Instruction, Multiple Threads，即单指令多线程。CUDA 程序员写的是 thread 级代码，看起来每个线程都在独立运行；但在硬件层面，GPU 会把 32 个线程组成一个 warp。warp 是实际的硬件执行单位，同一个 warp 中的 32 个线程通常一起执行同一条指令，只是处理的数据不同。
 
-例如下面的 kernel：
+例如这个 kernel：
 
 ```cpp
 int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -141,16 +140,13 @@ if (x > 0) {
 因此，warp divergence 的本质是：同一个 warp 内本来应该一起执行的 32 个线程被分成不同路径，硬件只能分批执行，导致并行效率下降。
 
 分支发散只在同一个 warp 内部造成这个问题。不同 warp 走不同分支，一般不会有同样的惩罚，因为 warp 本来就是独立调度的。
-原文将在 第 8 章 中更深入探讨 warp 发散，以及检测、分析和缓解它的方法。
+Warp 发散的检测、分析和缓解，需要结合控制流结构和 profiling 指标一起看。
 
-（需要注意的是:
-- 在Volta 架构之前，Warp 内的线程必须一起执行
-- Volta 改进了该机制，允许 Warp 内的线程独立等待/执行
-- 这样能够更加灵活处理 锁，同步，条件执行）
+补充一点：Volta 之前，warp 内线程以更严格的 lockstep 方式推进；Volta 引入 Independent Thread Scheduling，使同一 warp 内的线程在等待、同步和条件执行上更灵活地独立推进。不过硬件调度单位仍然是 warp，warp divergence 仍会影响有效吞吐。
 
 #### 1.4 CUDA 线程层级与 thread block cluster
 
-原文介绍了 CUDA 中的三个主要层级：
+CUDA 中有三个主要层级：
 
 <Frame caption="CUDA 线程层级结构：thread、warp、block、grid 的嵌套关系">
   <img src="../images/ch06-03.png" alt="CUDA 线程层级示意图" />
@@ -173,9 +169,9 @@ if (x > 0) {
 
 但同步也是需要耗时，`__syncthreads()` 会让 block 内线程在某一点等待彼此，如果同步点太多，就会增加开销。因此应尽量减少不必要的同步屏障（barrier）。
 
-原文还补充了现代 GPU 的 thread block cluster（此特性在Hopper 架构引入）。之前的 CUDA 中，不同 block 之间通常不能直接协作，因为 block 的执行顺序不保证，也不一定在同一个 SM 上。但现在 GPU 支持把多个 block 组成 cluster，让它们跨 SM 通信。
+现代 GPU 支持 thread block cluster（此特性在 Hopper 架构引入）。之前的 CUDA 中，不同 block 之间通常不能直接协作，因为 block 的执行顺序不保证，也不一定在同一个 SM 上。但现在 GPU 支持把多个 block 组成 cluster，让它们跨 SM 通信。
 
-这里涉及 DSMEM，也就是 distributed shared memory。它把参与 cluster 的多个 SM 的 shared memory 通过片上互连连接起来，使不同 block 可以访问彼此的 shared memory，并使用 cluster 级别的 barrier。（原文说明 DSMEM 和 thread block cluster 会在第10章涵盖诸如线程块簇和 DSMEM 之类的高级主题进一步展开，本章只先建立概念。）
+DSMEM 也就是 distributed shared memory。它把参与 cluster 的多个 SM 的 shared memory 通过片上互连连接起来，使不同 block 可以访问彼此的 shared memory，并使用 cluster 级别的 barrier。
 
 <Frame caption="Thread block cluster 和 DSMEM 跨 SM 共享内存结构">
   <img src="../images/ch06-06.png" alt="Thread block cluster 架构图" />
@@ -185,20 +181,20 @@ if (x > 0) {
 
 ### 2 CUDA 编程基础与启动配置
 
-这一部分对应原文中 CUDA kernel 编写、启动参数以及多维输入映射部分。核心问题是：如何把数据任务映射到 CUDA 线程层级上，并让 kernel 启动配置符合硬件执行方式。
+CUDA kernel 编写、启动参数以及多维输入映射的核心问题是：如何把数据任务映射到 CUDA 线程层级上，并让 kernel 启动配置符合硬件执行方式。
 
 #### 2.1 选择 threadsPerBlock 和 blocksPerGrid
 
-启动参数是编写 CUDA kernel 最先遇到的问题。原文强调，`threadsPerBlock` 通常要选择 32 的倍数。原因很直接：warp 大小固定为 32。如果 block size 不是 32 的倍数，就会产生不完整 warp，浪费了可以进行并行的资源。
+启动参数是编写 CUDA kernel 最先遇到的问题。`threadsPerBlock` 通常要选择 32 的倍数。原因很直接：warp 大小固定为 32。如果 block size 不是 32 的倍数，就会产生不完整 warp，浪费了可以进行并行的资源。
 
 例如：
 
 - `threadsPerBlock = 256`，等于 8 个完整 warp。
 - `threadsPerBlock = 33`，需要 2 个 warp，但第二个 warp 只有 1 个线程有用，其余 31 个 lane 被浪费。
 
-因此，原文建议常见起点是 `threadsPerBlock = 256`。这个配置有 8 个 warp，通常能在 occupancy 和资源使用之间取得较好平衡。根据 kernel 的寄存器使用、shared memory 使用和 profiling 结果，也可以尝试 128、512 等配置。
+因此，常见起点是 `threadsPerBlock = 256`。这个配置有 8 个 warp，通常能在 occupancy 和资源使用之间取得较好平衡。根据 kernel 的寄存器使用、shared memory 使用和 profiling 结果，也可以尝试 128、512 等配置。
 
-原文还给出了 Blackwell B200 的一些硬件限制：
+Blackwell B200 有一些硬件限制：
 
 - warp size 是 32。
 - 每个 thread block 最多 1024 个线程，也就是最多 32 个 warp。
@@ -226,9 +222,9 @@ if (idx < N) {
 }
 ```
 
-这里的 `if (idx < N)` 非常关键。如果没有这个检查，多出来的线程可能访问数组边界外的地址，引发非法内存访问。
+`if (idx < N)` 非常关键。如果没有这个检查，多出来的线程可能访问数组边界外的地址，引发非法内存访问。
 
-原文还提到 CUDA grid 本身也有维度限制，例如 X 维最多可到 2,147,483,647 个 block，Y/Z 维最多 65,535 个 block，并且一个设备最多可以有 128 个 concurrent grids。不过实际开发中，通常更先碰到的是 thread、block、register、shared memory 这些资源限制。
+CUDA grid 本身也有维度限制，例如 X 维最多可到 2,147,483,647 个 block，Y/Z 维最多 65,535 个 block，并且一个设备最多可以有 128 个 concurrent grids。不过实际开发中，通常更先碰到的是 thread、block、register、shared memory 这些资源限制。
 
 如果某一维度需要超过 65,535 个块，可以启动 2D 或 3D 网格，将工作拆分到多次内核启动（多次启动）。实际上，在达到其他资源限制之前就触及网格大小限制的情况很少见。
 
@@ -245,7 +241,7 @@ __global__ void myKernel(float* input, int N) {
 }
 ```
 
-这里需要重点理解三个内置变量：
+重点理解三个内置变量：
 
 - `threadIdx.x`：当前线程在 block 内的编号。
 - `blockIdx.x`：当前 block 在 grid 中的编号。
@@ -253,7 +249,7 @@ __global__ void myKernel(float* input, int N) {
 
 通过这三个值，线程可以算出自己的全局索引 `idx`。这就是 CUDA kernel 的基本套路：每个线程先找到自己负责的数据位置，然后只处理这一小块数据。
 
-原文还提醒，CUDA kernel 是异步执行的。CPU 启动 kernel 后不会自动等待 GPU 执行完。如果 kernel 中发生越界访问，错误也可能不会立刻显示，而是在后续同步或 CUDA API 调用时才出现。因此开发时通常需要检查：
+CUDA kernel 是异步执行的。CPU 启动 kernel 后不会自动等待 GPU 执行完。如果 kernel 中发生越界访问，错误也可能不会立刻显示，而是在后续同步或 CUDA API 调用时才出现。因此开发时通常需要检查：
 
 ```cpp
 cudaGetLastError();
@@ -264,7 +260,7 @@ CUDA 调试和 CPU 程序不同，错误可能是“延迟暴露”的，因此�
 
 #### 2.3 2D/3D 输入映射
 
-原文除了 1D 数组，也讲了 2D 和 3D 输入。
+输入也可以是 2D 或 3D 结构。
 
 如果输入是图像，本身就是二维结构，就可以使用二维 block 和二维 grid。比如一个 1024 x 1024 的矩阵，可以用：
 
@@ -273,7 +269,7 @@ dim3 threads(16, 16);
 dim3 blocks((width + 15) / 16, (height + 15) / 16);
 ```
 
-这里每个 block 有 `16 x 16 = 256` 个线程，仍然符合前文提到的常见起点。kernel 内部可以计算二维坐标：
+这个配置中，每个 block 有 `16 x 16 = 256` 个线程，仍然符合常见起点。kernel 内部可以计算二维坐标：
 
 ```cpp
 int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -287,17 +283,17 @@ if (x < width && y < height) {
 
 这个例子把 CUDA 的 block/grid 和图像像素对应起来：每个线程负责一个像素，`x` 和 `y` 表示当前线程处理哪一列、哪一行。
 
-如果是 3D 体数据，也可以使用 `dim3(x, y, z)` 把线程映射到三维空间。原文说本书大部分场景会使用 1D 或 2D tiled 配置，但理解 3D 映射有助于处理体数据、三维网格等任务。
+如果是 3D 体数据，也可以使用 `dim3(x, y, z)` 把线程映射到三维空间。大多数 CUDA 性能示例会使用 1D 或 2D tiled 配置，但理解 3D 映射有助于处理体数据、三维网格等任务。
 
 ### 3 GPU 内存体系与数据移动
 
-这一板块对应原文中关于内存管理、内存层级、TMEM/TMA 和 Unified Memory 的内容。GPU 性能优化的核心往往不是“多算几次”，而是“少等数据”。
+内存管理、内存层级、TMEM/TMA 和 Unified Memory 都围绕一个核心问题：GPU 性能优化的关键往往不是“多算几次”，而是“少等数据”。
 
 #### 3.1 异步内存分配、memory pool 和 stream
 
-原文指出，标准的 `cudaMalloc` 和 `cudaFree` 是同步且相对昂贵的。这里的“同步”可以理解为：为了保证内存分配或释放是安全的，CUDA runtime / driver 可能需要等待设备上相关工作完成，甚至引入全设备级别的同步。这样一来，本来可以继续排队执行的 GPU 工作会被打断，CPU 端也可能被迫等待。
+标准的 `cudaMalloc` 和 `cudaFree` 是同步且相对昂贵的。其中，“同步”指：为了保证内存分配或释放是安全的，CUDA runtime / driver 可能需要等待设备上相关工作完成，甚至引入全设备级别的同步。这样一来，本来可以继续排队执行的 GPU 工作会被打断，CPU 端也可能被迫等待。
 
-除了同步开销，传统分配释放还涉及驱动和操作系统级调用。这种交互会引发用户态到内核态的上下文切换，以及 NVIDIA 驱动内部的显存资源管理开销。原文中提到的 `mmap` / `ioctl` 就属于这类底层系统调用：`mmap` 常用于建立内存映射，`ioctl` 常用于向设备驱动发送控制命令。它们不是普通函数调用，而是会进入操作系统内核和驱动层，因此比纯设备端操作更慢。
+除了同步开销，传统分配释放还涉及驱动和操作系统级调用。这种交互会引发用户态到内核态的上下文切换，以及 NVIDIA 驱动内部的显存资源管理开销。`mmap` / `ioctl` 就属于这类底层系统调用：`mmap` 常用于建立内存映射，`ioctl` 常用于向设备驱动发送控制命令。它们不是普通函数调用，而是会进入操作系统内核和驱动层，因此比纯设备端操作更慢。
 
 如果只是程序启动时分配几块长期使用的大 buffer，这种开销通常可以接受。但如果在训练循环、推理服务或某个高频算子路径中反复申请和释放小 buffer，开销就会不断累积，表现为延迟尖峰、GPU 时间线空洞，甚至影响端到端吞吐。
 
@@ -311,7 +307,6 @@ if (x < width && y < height) {
 
 示例写法：
 ```cpp
-
 cudaStream_t s;
 cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
 
@@ -330,29 +325,29 @@ cudaStreamSynchronize(s);
 4. 在同一个 stream 上调用 `cudaFreeAsync` 释放 `d_buf`。
 5. 最后通过 `cudaStreamSynchronize(s)` 等待这个 stream 中的工作完成。
 
-stream 可以理解为一个有序队列。同一个 stream 内的操作按顺序执行，比如先分配、再拷贝、再启动 kernel、再释放。不同 stream 之间则有机会并发或重叠。因此，`cudaFreeAsync(d_buf, s)` 并不是立即粗暴地释放内存，而是表示：等到这个 stream 中前面依赖 `d_buf` 的工作完成后，再把这块内存释放回池子。
+stream 是一个有序队列。同一个 stream 内的操作按顺序执行，比如先分配、再拷贝、再启动 kernel、再释放。不同 stream 之间则有机会并发或重叠。因此，`cudaFreeAsync(d_buf, s)` 并不是立即粗暴地释放内存，而是表示：等到这个 stream 中前面依赖 `d_buf` 的工作完成后，再把这块内存释放回池子。
 
 这和传统 `cudaFree` 的差异很关键。传统 `cudaFree` 为了确认没有 GPU 工作还在使用这块内存，往往需要更强的同步；而 `cudaFreeAsync` 借助 stream 顺序，知道同一 stream 中前面的 kernel 已经排在释放之前，因此可以避免不必要的全局同步。
 
-`cudaMallocAsync` 和 `cudaFreeAsync` 底层使用 CUDA memory pool。memory pool 可以理解为显存缓存池：第一次需要某个大小的 buffer 时，CUDA 可能仍然需要向底层驱动申请显存；但释放时，这块显存不一定立刻还给系统，而是回到 pool 中。后面再次申请相近大小的 buffer 时，可以直接从 pool 中复用。
+`cudaMallocAsync` 和 `cudaFreeAsync` 底层使用 CUDA memory pool。memory pool 是显存缓存池：第一次需要某个大小的 buffer 时，CUDA 可能仍然需要向底层驱动申请显存；但释放时，这块显存不一定立刻还给系统，而是回到 pool 中。后面再次申请相近大小的 buffer 时，可以直接从 pool 中复用。
 
 这种机制有三个好处：
 - 减少反复调用底层驱动和操作系统接口的次数。
 - 减少全设备同步带来的停顿。
 - 通过复用已经申请过的显存块，降低长期运行程序中的碎片和延迟抖动。
 
-类似的在 PyTorch 中也不会每次 tensor 生命周期结束就立刻把显存还给系统，而是缓存起来复用。这样训练循环中反复创建 tensor 时，就不会每次都触发昂贵的底层 `cudaMalloc`。
+PyTorch 也采用类似思路，不会在每次 tensor 生命周期结束时立刻把显存还给系统，而是缓存起来复用。这样训练循环中反复创建 tensor 时，就不会每次都触发昂贵的底层 `cudaMalloc`。
 
 可以用一个训练循环的例子来理解：每一轮 iteration 里都会产生很多临时 tensor，比如中间激活、临时 workspace、后处理 buffer。如果每个临时 tensor 都真正触发一次底层显存申请和释放，整个训练过程会频繁打断 GPU 工作；如果使用缓存分配器或 memory pool，这些临时显存可以在多轮 iteration 中反复复用，性能会更稳定。
 
-不过也需要注意，memory pool 并不是让显存消耗凭空减少。它更像是“缓存已申请的显存以便复用”。因此在监控工具中可能看到程序占用的显存没有马上下降，这是正常现象。它换来的是更低的分配开销和更稳定的延迟。如果确实需要把显存还给系统，可以通过 CUDA memory pool 的相关属性或 trim 操作进行控制，原文也提到可以调节 release threshold 等策略。
+不过也需要注意，memory pool 并不是让显存消耗凭空减少。它更像是“缓存已申请的显存以便复用”。因此在监控工具中可能看到程序占用的显存没有马上下降，这是正常现象。它换来的是更低的分配开销和更稳定的延迟。如果确实需要把显存还给系统，可以通过 CUDA memory pool 的相关属性或 trim 操作进行控制，例如调节 release threshold 等策略。
 
-小结：
-> 对长时间运行、频繁申请临时显存的程序来说，异步分配和 memory pool 的价值不只是“更快”，更重要的是把内存生命周期纳入 stream 顺序管理，减少全局同步、底层驱动调用和延迟抖动。
+
+对长时间运行、频繁申请临时显存的程序来说，异步分配和 memory pool 的价值不只是“更快”，更重要的是把内存生命周期纳入 stream 顺序管理，减少全局同步、底层驱动调用和延迟抖动。
 
 #### 3.2 GPU 内存层级：从 register 到 HBM
 
-原文用较大篇幅讲 GPU memory hierarchy，这是本章非常重要的部分。这里最容易混淆的是：有些名称来自 CUDA 编程模型，有些名称来自硬件结构图。读书会中建议先把“逻辑视角”和“物理视角”分开。
+GPU memory hierarchy 是 CUDA 性能优化中最容易混淆的部分之一。有些名称来自 CUDA 编程模型，有些名称来自硬件结构图。理解内存层级时，可以先把“逻辑视角”和“物理视角”分开。
 
 从 CUDA 编程模型看，常见内存名称包括：
 
@@ -363,7 +358,7 @@ stream 可以理解为一个有序队列。同一个 stream 内的操作按顺�
 - constant memory：用于小型只读常量数据。
 
 
-原文（Blackwell 架构）提到的主要层级包括：
+Blackwell 架构下的主要硬件层级包括：
 
 <Frame caption="Blackwell GPU 内存层级结构：从 register 到 HBM 的完整数据通路">
   <img src="../images/ch06-07.png" alt="GPU 内存层级架构图" />
@@ -400,7 +395,7 @@ register 是最快的存储，每个线程私有，用来保存局部变量和�
 
 local memory 这个名字容易误导。它虽然叫 local，但并不是一块独立的高速片上内存。很多情况下，local memory 是寄存器溢出后落到 global memory / HBM 支撑的空间，延迟很高。因此，local memory 使用过多往往说明 register pressure 有问题。
 
-这里还需要补充一点：local memory 通常不是程序员主动使用的。多数 CUDA 代码里不会显式写“使用 local memory”，它更多是 CUDA 编译器在寄存器放不下线程私有数据时自动生成的“备用空间”。例如，一个线程里有太多局部变量、线程私有数组太大、数组索引无法在编译期确定，或者复杂函数调用产生很多临时值时，编译器可能无法把所有数据都放进 register，于是把一部分数据 spill 到 local memory。因此，平时写 CUDA 程序时很少“主动使用 local memory”是正常的。但在性能优化时必须关注它，因为它可能悄悄出现并拖慢 kernel。可以通过编译参数 `-Xptxas -v` 查看是否出现 `spill loads` / `spill stores`，也可以在 Nsight Compute 中观察 local memory load/store、registers per thread 和 spilling 相关指标。
+补充一点：local memory 通常不是程序员主动使用的。多数 CUDA 代码里不会显式写“使用 local memory”，它更多是 CUDA 编译器在寄存器放不下线程私有数据时自动生成的“备用空间”。例如，一个线程里有太多局部变量、线程私有数组太大、数组索引无法在编译期确定，或者复杂函数调用产生很多临时值时，编译器可能无法把所有数据都放进 register，于是把一部分数据 spill 到 local memory。因此，平时写 CUDA 程序时很少“主动使用 local memory”是正常的。但在性能优化时必须关注它，因为它可能悄悄出现并拖慢 kernel。可以通过编译参数 `-Xptxas -v` 查看是否出现 `spill loads` / `spill stores`，也可以在 Nsight Compute 中观察 local memory load/store、registers per thread 和 spilling 相关指标。
 
 shared memory / L1 cache 位于 SM 内，延迟远低于 HBM。二者都和 SM 内部片上 SRAM 资源相关，但角色不同：
 
@@ -416,9 +411,9 @@ shared memory / L1 cache 位于 SM 内，延迟远低于 HBM。二者都和 SM �
 - 可能出现 bank conflict。
 - 使用太多 shared memory 会减少每个 SM 可驻留的 block 数，影响 occupancy。
 
-TMEM 是 Blackwell 中与 Tensor Core 路径相关的片上存储。它不是普通 CUDA C++ 指针可以直接读写的空间，而是服务 Tensor Core 指令和矩阵乘加累加路径。本章关注现代 AI 计算时，Tensor Core 数据路径非常关键。
+TMEM 是 Blackwell 中与 Tensor Core 路径相关的片上存储。它不是普通 CUDA C++ 指针可以直接读写的空间，而是服务 Tensor Core 指令和矩阵乘加累加路径。现代 AI 计算中，Tensor Core 数据路径非常关键。
 
-L2 cache 是全 GPU 共享缓存，位于所有 SM 和 HBM 之间。可以把它理解成一个全局缓冲层：当某个 SM 从 global memory 读取数据时，数据可能先经过 L2；如果后续其他 SM 或同一个 SM 再访问相同或相邻的数据，就可能从 L2 中命中，而不必重新访问 HBM。原文提到 Blackwell 级别 L2 约 126 MB，这个容量比每个 SM 内部的 shared memory / L1 大很多，因此更适合做跨 SM 的数据复用缓冲。
+L2 cache 是全 GPU 共享缓存，位于所有 SM 和 HBM 之间。可以把它理解成一个全局缓冲层：当某个 SM 从 global memory 读取数据时，数据可能先经过 L2；如果后续其他 SM 或同一个 SM 再访问相同或相邻的数据，就可能从 L2 中命中，而不必重新访问 HBM。Blackwell Tuning Guide 提到 GB200 GPU 的 L2 cache 可到 126 MB，这个容量比每个 SM 内部的 shared memory / L1 大很多，因此更适合做跨 SM 的数据复用缓冲。
 
 global memory 是 CUDA 编程视角的设备全局内存；在 A100、H100、B200 这类数据中心 GPU 上，它在硬件上通常对应 HBM。也就是说：
 
@@ -427,9 +422,9 @@ CUDA 视角：global memory
 硬件视角：HBM / HBM2e / HBM3 / HBM3e
 ```
 
-HBM 全称是 High Bandwidth Memory，即高带宽内存。它容量大、带宽高，但相对于 register、shared memory、L1/L2 cache 来说，延迟仍然高。原文以 Blackwell B200 为例，提到 HBM3e 容量可到约 192 GB，带宽约 8 TB/s。这个带宽听起来非常高，但 GPU 的 Tensor Core 计算吞吐也非常高，因此很多时候问题不是“算不动”，而是“数据来不及送到计算单元”。
+HBM 全称是 High Bandwidth Memory，即高带宽内存。它容量大、带宽高，但相对于 register、shared memory、L1/L2 cache 来说，延迟仍然高。以 Blackwell B200 为例，HBM3e 容量可到约 180 GB，带宽约 8 TB/s。这个带宽听起来非常高，但 GPU 的 Tensor Core 计算吞吐也非常高，因此很多时候问题不是“算不动”，而是“数据来不及送到计算单元”。
 
-通过 L2，可能被复用，从而减少再次访问 DRAM 的机会。为最大化 L2 的好处，应将全局加载组织为与缓存行整洁映射的128 字节对齐、合并（coalesced）事务。
+经过 L2 的全局内存访问有机会被后续访问复用，从而减少再次访问 HBM / DRAM。为了最大化 L2 和内存事务效率，应尽量让 warp 内的全局加载形成 128 字节对齐、连续合并的 coalesced 访问。
 
 比如一个 warp 有 32 个线程，如果第 0 个线程读取 `A[0]`，第 1 个线程读取 `A[1]`，一直到第 31 个线程读取 `A[31]`，那么这些访问在地址上是连续的，硬件可以把它们合并成少数几次高效的内存事务。相反，如果 32 个线程访问的地址很分散，例如分别访问 `A[0]`、`A[1024]`、`A[2048]` 这样的跨步地址，硬件就很难把它们合并成连续事务，可能需要发起更多内存请求。这样即使 HBM 的理论带宽很高，实际有效带宽也会下降。
 
@@ -440,9 +435,9 @@ HBM 全称是 High Bandwidth Memory，即高带宽内存。它容量大、带宽
 
 #### 3.3 TMEM、TMA 和 Tensor Core 数据路径
 
-原文还专门提到 Blackwell 中的 TMEM 和 TMA。这部分比较偏新架构，但原文有写，因此分享笔记中需要覆盖。
+Blackwell 中的 TMEM 和 TMA 属于较新的架构能力，值得单独说明。
 
-TMEM 是 Tensor Memory，可以理解为 Blackwell 每个 SM 上专门服务 Tensor Core 的片上内存。原文提到 TMEM 每个 SM 大约 256 KB，用于第五代 Tensor Core 指令，比如 `tcgen05.*` 和 UMMA。
+TMEM 是 Tensor Memory，是 Blackwell 每个 SM 上专门服务 Tensor Core 的片上内存。TMEM 每个 SM 大约 256 KB，用于第五代 Tensor Core 指令，比如 `tcgen05.*` 和 UMMA。
 
 需要注意的是，TMEM 不是普通 CUDA C++ 指针可以直接读写的空间。它不像 global memory 或 shared memory 那样用普通指针访问，而是通过 Tensor Core 相关指令和描述符参与数据移动。
 
@@ -451,14 +446,14 @@ TMA 是 Tensor Memory Accelerator，用于大块数据传输。
 
 TMA 是专用硬件单元，负责将数据从 Global Memory 高效传输到 Shared Memory：
 
-```
+```text
 TMA 示意图：
 
 Global Memory ◄──► L2 Cache ◄──► L1/Shared Memory
                       
                      
                ┌─────────────┐
-               │   TMA Unit  │  ← 专用硬件，不占用执行单元
+               │  TMA Unit  │  ← 专用硬件，不占用执行单元
                └─────────────┘
 ```
 
@@ -466,7 +461,7 @@ Global Memory ◄──► L2 Cache ◄──► L1/Shared Memory
 
 1. tile 数据从 global memory 经过 L2 cache 进入 shared memory。
 2. TMA 负责协调这些大块数据搬运。
-3. Tensor Core 相关指令会配合 shared memory / TMEM 完成矩阵乘加路径
+3. Tensor Core 相关指令会配合 shared memory / TMEM 完成矩阵乘加路径。
 
 <Frame caption="TMA 数据搬运路径：从 Global Memory 经 L2 高效传输到 Shared Memory">
   <img src="../images/ch06-08.png" alt="TMA Tensor Memory Accelerator 数据路径示意图" />
@@ -521,21 +516,20 @@ CUDA 提供了一些优化接口：
 - `cudaMemAdvise()`：向 Driver 提供数据放置建议。
 - `cudaStreamAttachMemAsync()`：将内存关联到指定流（stream）。
 
-小结
->统一内存更强调编程的便利性，而传统显式内存管理方式更强调对数据传输过程和存储位置的精确控制。因此，在高性能 CUDA 应用中，通常仍采用显式内存管理方式以获得更好的性能优化空间；而统一内存则广泛应用于原型开发、算法验证以及 CPU-GPU 协同计算等场景。随着 GPU 架构和统一内存技术的不断发展，两者之间的性能差距正在逐渐缩小。
+统一内存更强调编程的便利性，而传统显式内存管理方式更强调对数据传输过程和存储位置的精确控制。因此，在高性能 CUDA 应用中，通常仍采用显式内存管理方式以获得更好的性能优化空间；而统一内存则广泛应用于原型开发、算法验证以及 CPU-GPU 协同计算等场景。随着 GPU 架构和统一内存技术的不断发展，两者之间的性能差距正在逐渐缩小。
 
 
 ### 4 Occupancy 调优与正确性检查
 
-这一部分对应原文中 occupancy、GPU 利用率、launch bounds、Occupancy API 以及 Compute Sanitizer 的内容。它关注两个问题：如何让 GPU 有足够多的有效工作，以及如何保证 CUDA 程序本身是正确的。
+Occupancy、GPU 利用率、launch bounds、Occupancy API 以及 Compute Sanitizer 关注两个问题：如何让 GPU 有足够多的有效工作，以及如何保证 CUDA 程序本身是正确的。
 
 #### 4.1 占有率（Occupancy） 和 GPU 利用率：向量加法例子
 
 occupancy 指的是 SM 中活跃 warp 数占理论最大 warp 数的比例。高 occupancy 的价值是隐藏延迟：当一个 warp 在等待内存时，SM 可以切换到其他 warp 执行。
 
-但原文也强调，occupancy 很重要，但并不是越高越好。真正目标是提高吞吐量，而不是单纯把 occupancy 数字堆到 100%。
+Occupancy 很重要，但并不是越高越好。真正目标是提高吞吐量，而不是单纯把 occupancy 数字堆到 100%。
 
-以长度为N的两个向量求和`C = A + B` 做例子。错误版本 `add_sequential` 只用一个线程或一个 warp 处理所有元素：
+以长度为 `N` 的两个向量求和 `C = A + B` 做例子。基本写法 `add_sequential` 只用一个线程或一个 warp 处理所有元素：
 
 ```cpp
 for (int i = 0; i < N; ++i) {
@@ -545,7 +539,7 @@ for (int i = 0; i < N; ++i) {
 
 这种写法等于把 GPU 当成单线程 CPU 使用。GPU 的大量 SM、warp scheduler 和计算流水线都处于闲置状态。
 
-正确版本`add_parallel`是每个线程处理一个元素：
+性能更高的版本 `add_parallel` 是每个线程处理一个元素：
 
 ```cpp
 int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -558,7 +552,7 @@ if (idx < N) {
   <img src="../images/ch06-09.png" alt="向量加法串行与并行执行示意图" />
 </Frame>
 
- profiling 对比非常直观：
+Profiling 对比非常直观：
 
 <Frame caption="Nsight Compute 向量加法串行与并行版本的 profiling 对比">
   <img src="../images/ch06-10.png" alt="Nsight Compute profiling 结果对比" />
@@ -571,16 +565,16 @@ if (idx < N) {
 - achieved occupancy 从 1.3% 到 38.7%，说明 SM 中可调度的活跃 warp 明显变多，硬件有更多机会隐藏延迟。
 - warp 执行效率从 3.1% 到 100%，说明并行版本中 warp 内 32 个线程基本都在做有效工作，而不是只有少量 lane 在执行。串行版本里，一个 warp 虽然硬件上仍以 32 个 lane 为单位执行，但只有一个线程有用，其余 lane 大多处于无效状态，因此效率很低。
 
-这里要强调一个容易混淆的点：GPU 是面向吞吐量优化的处理器，不是为了让少数线程跑得尽可能快，而是为了让大量线程同时推进。CPU 负责发起 kernel，GPU 内部的 SM、warp scheduler、计算单元和内存子系统共同执行 kernel。这个过程中会不断发生访存、cache 访问、指令依赖等等待。如果只有很少线程，这些等待会直接变成硬件空闲；如果有足够多 warp，SM 就可以在 warp 之间切换，用其他 warp 的计算或访存来覆盖等待时间。
+一个容易混淆的点是：GPU 是面向吞吐量优化的处理器，不是为了让少数线程跑得尽可能快，而是为了让大量线程同时推进。CPU 负责发起 kernel，GPU 内部的 SM、warp scheduler、计算单元和内存子系统共同执行 kernel。这个过程中会不断发生访存、cache 访问、指令依赖等等待。如果只有很少线程，这些等待会直接变成硬件空闲；如果有足够多 warp，SM 就可以在 warp 之间切换，用其他 warp 的计算或访存来覆盖等待时间。
 
 因此，这个例子说明了 GPU 优化的第一步：先给 GPU 足够多的并行工作。无论单个线程写得多快，如果线程数量太少，就无法利用 GPU 的吞吐量潜力。
 
-需要注意的是，并行版本的 achieved occupancy 只有约 38.7%，并不是 100%，但性能已经大幅提升。这正好对应原文的观点：occupancy 不是越高越好。只要活跃 warp 足够隐藏主要延迟，性能瓶颈就可能转移到别处。后续优化才会进入更细的层面，例如提高每个 warp 内部的指令级并行性、减少指令依赖、改善内存访问模式，或者提高 Tensor Core / CUDA Core 的实际利用率。
+并行版本的 achieved occupancy 只有约 38.7%，并不是 100%，但性能已经大幅提升。这说明 occupancy 不是越高越好。只要活跃 warp 足够隐藏主要延迟，性能瓶颈就可能转移到别处。后续优化才会进入更细的层面，例如提高每个 warp 内部的指令级并行性、减少指令依赖、改善内存访问模式，或者提高 Tensor Core / CUDA Core 的实际利用率。
 
 当 occupancy 达到 100%，性能仍可能不好，因为程序可能是 memory-bound。memory-bound 指的是性能主要受内存访问限制，而不是受计算能力限制。一个典型例子是大语言模型的 decode 阶段。
 
-小结
->这个例子说明，GPU 优化第一步往往不是复杂技巧，而是先确保启动足够多的并行工作。如果 kernel 只启动很少线程，那么后面再讨论 shared memory、Tensor Core、coalesced access 等优化都意义有限，因为 GPU 硬件根本没有被充分调动起来。
+
+这个例子说明，GPU 优化第一步往往不是复杂技巧，而是先确保启动足够多的并行工作。如果 kernel 只启动很少线程，那么后面再讨论 shared memory、Tensor Core、coalesced access 等优化都意义有限，因为 GPU 硬件根本没有被充分调动起来。
 
 
 #### 4.2 launch bounds 和 Occupancy API：在资源和并行度之间找平衡
@@ -591,23 +585,23 @@ occupancy 并不是只靠增加线程数就能提高。一个 SM 能同时驻留
 CUDA 提供了 `__launch_bounds__` kernel 注解，用来在编译阶段给编译器提供 occupancy 相关提示：
 
 ```cpp
-__global__ __launch_bounds__(256, 16)
+__global__ __launch_bounds__(256, 4)
 void myKernel(...) {
     // ...
 }
 ```
 
 
-这里的 `__launch_bounds__(256, 16)` 表示两层含义：
+`__launch_bounds__(256, 4)` 表示两层含义：
 - `256` 表示承诺这个 kernel 启动时，每个 block 的线程数不会超过 256。
-- `16` 表示希望每个 SM 至少可以常驻 16 个 block。
-`launch_bounds` 的第一个参数是实际 `threadsPerBlock` 的上限，第二个参数不是 `blocksPerGrid`
+- `4` 表示希望每个 SM 至少可以常驻 4 个 block。
+`launch_bounds` 的第一个参数是实际 `threadsPerBlock` 的上限，第二个参数不是 `blocksPerGrid`。
 
-这个注解会影响编译器的寄存器分配、函数内联和循环展开策略。它的目的不是突破硬件上限，而是让编译器在“单个线程使用更多资源”和“让更多 warp 常驻 SM”之间做取舍。现代 NVIDIA GPU 每个 SM 的常驻 thread 数量有上限，例如 2048。如果请求 `16 x 256 = 4096` 个线程常驻一个 SM，就超过了硬件能力，编译器会降低请求并可能给出 warning。
+这个注解会影响编译器的寄存器分配、函数内联和循环展开策略。它的目的不是突破硬件上限，而是让编译器在“单个线程使用更多资源”和“让更多 warp 常驻 SM”之间做取舍。现代 NVIDIA GPU 每个 SM 的常驻 thread 数量有上限，例如 2048。`4 x 256 = 1024` 没有超过这个线程上限，但真实常驻数量仍可能继续受 register、shared memory 和 active block 上限限制。
 
 实践中，`__launch_bounds__` 可能会限制每个线程使用的寄存器数量，从而让更多 warp 同时驻留在 SM 上，提高延迟隐藏能力（更稳定的吞吐量）。但限制也不能过度。如果寄存器太少（一个 SM 驻留更多的线程/Block），编译器可能把放不下的变量 spill 到 local memory。local memory 虽然逻辑上是线程私有的，但物理访问通常走 global memory / HBM 路径，比 register 慢得多。因此，launch bounds 的核心是平衡。
 
-``` cpp
+```cpp
 int threadsPerBlock = 256;
 int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
 kernel<<<blocksPerGrid, threadsPerBlock>>>(...);
@@ -637,7 +631,7 @@ int gridSize = std::max(
 myKernel<<<gridSize, bestBlockSize, dynSmemBytes>>>(...);
 ```
 
-这里需要注意两个返回值：
+两个返回值需要区分：
 
 - `bestBlockSize` 是 API 建议的每 block 线程数。
 - `minGridSize` 是为了让该 kernel 在当前设备上达到 occupancy 饱和，至少需要启动的 block 数。
@@ -645,7 +639,7 @@ myKernel<<<gridSize, bestBlockSize, dynSmemBytes>>>(...);
 `minGridSize` 不是为了覆盖输入长度 `N` 的 grid size。因此真正启动 kernel 时，还需要结合输入规模计算：
 
 ```cpp
-gridSize = max(minGridSize, ceil_div(N, bestBlockSize));
+gridSize = std::max(minGridSize, (N + bestBlockSize - 1) / bestBlockSize);
 ```
 
 如果 kernel 使用 `extern __shared__` 这样的动态 shared memory，调用 Occupancy API 时也要传入真实的动态 shared memory 大小，因为 shared memory 使用量会影响一个 SM 能同时容纳多少 block。
@@ -666,7 +660,7 @@ gridSize = max(minGridSize, ceil_div(N, bestBlockSize));
 
 #### 4.3 Compute Sanitizer 调试功能正确性
 
-NVIDIA Compute Sanitizer是随CUDA Toolkit提供的功能正确性套件，它通过在运行时对代码进行插桩来在开发早期发现错误。
+NVIDIA Compute Sanitizer 是随 CUDA Toolkit 提供的功能正确性套件，它通过在运行时对代码进行插桩来在开发早期发现错误。
 
 CUDA kernel 往往会启动成千上万个线程，错误不一定像普通 CPU 程序那样容易复现。比如某个线程越界访问、多个线程同时写 shared memory、读取未初始化的 device memory，或者 barrier 使用不一致，都可能造成隐蔽 bug。程序如果本身不正确，后面的性能分析也就失去了可靠基础。
 
@@ -678,23 +672,23 @@ compute-sanitizer [--tool toolname] [options] <application> [app_args]
 
 同时也可以配合 `--kernel-name`、`--kernel-name-exclude` 只检查特定 kernel，也可以用 `--nvtx yes` 结合 NVTX 区间缩小分析范围。实际工程中，还可以用 `--error-exitcode` 把 Compute Sanitizer 集成到 CI 中，让正确性问题直接导致流水线失败。
 
-Compute Sanitizer 主要包含四类工具，它们有助于检测越界内存访问、数据竞争、未初始化内存读取以及CUDA代码中的同步问题：
+Compute Sanitizer 主要包含四类工具，它们有助于检测越界内存访问、数据竞争、未初始化内存读取以及 CUDA 代码中的同步问题：
 - `memcheck`：检查 global、local、shared memory 中的越界访问、未对齐访问、GPU 硬件异常和 device 侧内存泄漏，也可以配合 `--check-device-heap` 检查设备端堆分配。
 - `racecheck`：检查 shared memory 中的数据竞争，例如 Write-After-Write、Write-After-Read、Read-After-Write。这类问题可能导致结果不稳定，同样输入多次运行也可能得到不同结果。
 - `initcheck`：检查未初始化的 device global memory 读取。常见原因是 host-to-device 拷贝遗漏，或者某些线程分支没有完成写入。
 - `synccheck`：检查同步原语使用错误，例如 barrier 不匹配。同步错误可能造成线程之间状态不一致，严重时会导致死锁。
 
 小结：
->CUDA 优化不能只看速度，必须先保证 kernel 的功能正确。只有解决了：程序是否算对、是否安全访问内存、线程同步是否合理等问题，后面的 profiling 结果才有意义。
+> CUDA 优化不能只看速度，必须先保证 kernel 的功能正确。只有解决了：程序是否算对、是否安全访问内存、线程同步是否合理等问题，后面的 profiling 结果才有意义。
 
 
 ### 5 性能分析
 
-这一部分对应原文最后的 Roofline、Nsight 工具和总结部分。
+Roofline、Nsight 工具和 NVTX 可以组成性能分析闭环。
 
 #### 5.1 Roofline 模型：判断 memory-bound 还是 compute-bound
 
-Roofline 模型是一种有用的可视化方法，这个模型用于回答一个关键问题：kernel 慢，到底是算不动，还是数据搬不动？
+Roofline 模型是一种有用的可视化方法，用于判断 kernel 的主要瓶颈来自计算吞吐，还是来自数据搬运。
 
 <Frame caption="Roofline 模型：计算峰值与内存带宽限制决定 kernel 的优化方向">
   <img src="../images/ch06-11.png" alt="Roofline 性能模型图" />
@@ -706,8 +700,8 @@ Roofline 模型有两条上限：
 - 一条水平线：表示硬件峰值计算能力。
 - 一条斜线：表示内存带宽限制。
 
-关键指标是 算术强度（arithmetic intensity），也就是每传输 1 字节数据能做多少 FLOP。
-​
+关键指标是算术强度（arithmetic intensity），也就是每传输 1 字节数据能做多少 FLOP。
+
 $$
 算术强度=\frac{\text{计算量(FLOPs)}}{\text{内存访问量(Bytes)}}
 $$
@@ -749,7 +743,7 @@ $$
 
 #### 5.2 Nsight Systems、Nsight Compute 和 NVTX：形成优化闭环
 
-然后使用 Roofline 和 profiling 工具结合起来。
+Roofline 需要和 profiling 工具结合使用。
 
 Nsight Systems 更适合看整体时间线，主要功能：
 
@@ -771,20 +765,20 @@ Nsight Compute 更适合看单个 kernel 内部，主要功能：
 
 NVTX 用于给代码区域打标签。例如可以把某段代码标成 `memory copy`，把另一段标成 `kernel execution`，这样在 Nsight Systems 时间线上就能清楚看到每个阶段。
 
-Nsight Systems 会在时间线上显示这些 NVTX 区间，使得观察重叠变得容易。使用异步内存拷贝（cudaMemcpyAsync）时，数据传输会与 GPU 上的内核执行重叠，比较同步和异步内存传输。
+Nsight Systems 会在时间线上显示这些 NVTX 区间，使得观察重叠变得容易。使用异步内存拷贝（`cudaMemcpyAsync`）时，可以在时间线上比较同步拷贝和异步拷贝，并确认数据传输是否真正与 GPU kernel 重叠。
 
 <Frame caption="Nsight Systems 时间线：异步内存拷贝与 kernel 执行的重叠效果">
   <img src="../images/ch06-12.png" alt="Nsight Systems 异步内存拷贝时间线" />
 </Frame>
 
 
-需要提醒的是，`cudaMemcpyAsync` 可以实现和 kernel 重叠。要真正重叠，通常需要：
+`cudaMemcpyAsync` 可以实现和 kernel 重叠。要真正重叠，通常需要：
 - 使用正确的 CUDA stream。
 - 避免 default stream 隐式同步。
 - 使用 pinned memory，也就是 page-locked host memory。
 
 
-profiling 流程：
+Profiling 流程：
 1. 先用 Nsight Systems 看整体时间线，确认 GPU 是否被喂饱。
 2. 再用 Nsight Compute 看最慢 kernel 的细节。
 3. 用 Roofline 判断是 memory-bound 还是 compute-bound。
@@ -794,11 +788,11 @@ profiling 流程：
 
 
 
-最后，高性能 CUDA 编程不是单纯追求某一个指标，而是在并行度、资源占用、内存层级和实际吞吐之间找平衡。先保证程序正确，再通过 Roofline、Nsight Compute、Nsight Systems 和 NVTX 找到瓶颈，最后用 profiling 验证每一次优化是否真正有效。
+高性能 CUDA 编程不是单纯追求某一个指标，而是在并行度、资源占用、内存层级和实际吞吐之间找平衡。先保证程序正确，再通过 Roofline、Nsight Compute、Nsight Systems 和 NVTX 找到瓶颈，最后用 profiling 验证每一次优化是否真正有效。
 
 ## 核心要点
 
-最后对本章进行了总结。可以把本章收束为以下几个关键点。
+核心结论可以收束为以下几个关键点。
 
 第一，GPU 使用 SIMT 执行模型。线程以 warp 为单位执行，一个 warp 通常包含 32 个线程。高 occupancy 的意义是让 SM 中有足够多的活跃 warp，用于隐藏内存访问和流水线延迟。
 
@@ -806,7 +800,7 @@ profiling 流程：
 
 第三，启动参数要兼顾并行度和资源限制。`threadsPerBlock` 通常选择 32 的倍数，以避免 warp 填不满。实践中可以从 `threadsPerBlock = 256` 开始，再根据 profiling 结果调整。`blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock` 用于覆盖全部输入元素。
 
-第四，occupancy 受资源限制影响。每个线程使用的 register、每个 block 使用的 shared memory、SM 最大 resident warp 数和 resident block 数，都会限制同一时刻能驻留的线程数量。Blackwell 相关原文中提到的限制包括每线程最多 255 个 register、每 SM shared memory 上限约 228 KB、最大 resident warp 数 64、最大 resident thread block 数 32。
+第四，occupancy 受资源限制影响。每个线程使用的 register、每个 block 使用的 shared memory、SM 最大 resident warp 数和 resident block 数，都会限制同一时刻能驻留的线程数量。Blackwell 相关限制包括每线程最多 255 个 register、每 SM shared memory 上限约 228 KB、最大 resident warp 数 64、最大 resident thread block 数 32。
 
 第五，异步内存管理可以减少同步和分配开销。建议使用 `cudaMallocAsync`、`cudaFreeAsync` 和 CUDA memory pool，避免频繁 `cudaMalloc()` / `cudaFree()` 带来的全局同步和操作系统级开销。PyTorch 的 caching allocator 与这个思路类似，都会复用已申请的显存。
 
@@ -814,7 +808,7 @@ profiling 流程：
 
 第七，Unified Memory 简化编程，但可能带来 page migration。使用 `cudaMallocManaged()` 后，CPU 和 GPU 可以共享统一地址空间，但数据页可能在 CPU 和 GPU 之间迁移。如果迁移发生在 kernel 执行过程中，就会造成隐藏停顿。可以通过 `cudaMemPrefetchAsync` 和 memory advice 来提前控制数据位置。
 
-第八，Roofline 模型用于判断优化方向。arithmetic intensity 决定 kernel 更接近 memory-bound 还是 compute-bound。对于 memory-bound 场景，可以通过低精度、压缩、提高数据复用、改善访存模式等方式减少数据移动。TMEM 与 Blackwell 的 统一矩阵乘加（UMMA） 也是改善矩阵计算中的数据供给路径。
+第八，Roofline 模型用于判断优化方向。arithmetic intensity 决定 kernel 更接近 memory-bound 还是 compute-bound。对于 memory-bound 场景，可以通过低精度、压缩、提高数据复用、改善访存模式等方式减少数据移动。TMEM 与 Blackwell 的统一矩阵乘加（UMMA）也是改善矩阵计算中的数据供给路径。
 
 
 ## FAQ
