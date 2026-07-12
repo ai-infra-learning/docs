@@ -4,119 +4,18 @@ title: "第三章：GPU 环境下的 OS、Docker 与 Kubernetes 调优"
 
 ## 本章概要
 
-本章围绕一个核心问题：**即使 GPU 代码和库已经高度优化，系统层面的瓶颈仍然会限制大规模 AI 训练的性能**。最快的 GPU 也只有在数据和指令能高效到达的前提下才能发挥全部潜力。系统级调优常被忽视，但在大集群上，仅 OS 配置的小改动就可能带来两位数百分比的性能提升，换算到大型 AI 项目就是数十万甚至上百万美元的计算成本节约。
+即使 GPU kernel 和库已经调到极致，系统层的瓶颈仍会拖累大规模训练与推理。要高效利用 GPU，就得让它周围的每一层——操作系统、驱动运行时、容器、集群调度——都不拖后腿。本章按这几层展开，逐层消除限制 GPU 利用率的因素：
 
-全章从底向上覆盖了四个层次的优化：**操作系统 → GPU 驱动与运行时 → 容器运行时 → Kubernetes 编排**。每层的目标一致——最小化延迟、最大化吞吐量，让 GPU 始终处于满负荷工作状态。
+- **CPU / 操作系统**：让 CPU 稳定喂饱 GPU——NUMA 绑定、pinned memory、透明大页、调度与中断亲和性、虚拟内存与 swap、文件系统缓存、CPU 频率与内存分配器；
+- **GPU 驱动与运行时**：让单张卡用足用稳——持久化模式、MPS / MIG 共享与切分、GPU 时钟与 ECC；
+- **容器运行时**：让容器几乎零开销地用上 GPU——NVIDIA Container Toolkit、overlay FS 与网络开销；
+- **Kubernetes**：在集群尺度编排 GPU——GPU Operator、Device Plugin、DRA、资源隔离与 QoS，以及从节点内 NUMA 到跨节点网络的拓扑感知调度。
 
 ---
 
-## 1. NVIDIA 软件栈全景
+## 1. CPU 与操作系统调优
 
-GPU 集群的运行远不止编写 PyTorch 代码。完整的软件栈从底到顶：
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-cuda-stack.png" alt="NVIDIA CUDA Toolkit、深度学习框架、推理库、NCCL、GPU driver 和操作系统组成的 CUDA 软件栈总览" />
-</Frame>
-
-图源：[NVIDIA Data Center Drivers：Overview of CUDA Toolkit and Associated Products](https://docs.nvidia.com/datacenter/tesla/drivers/595/introduction.html)
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/pytorch-call-chain.svg" alt="PyTorch → GPU 调用链路：从 Python 代码到 GPU 执行的完整软件栈" />
-</Frame>
-
-| 层级 | 组件 | 职责 |
-| --- | --- | --- |
-| 高层框架 | **PyTorch** | 用户代码入口，自动捕获和优化模型 |
-| Python CUDA 库 | **cuTile / cuPyNumeric / Triton / Warp …** | Kernel 编写与领域加速 |
-| 编译与运行时 | **CUDA Toolkit** | 编译器、运行时、优化数学库 |
-| 硬件接口 | **GPU Driver** | 内存分配、任务调度、设备管理 |
-
-当你执行 `torch.matmul(A, B)` 时，调用链路为：PyTorch → cuBLAS → CUDA Runtime → GPU Driver → GPU Kernel 执行。如图右侧所示，**每一层都可能引入瓶颈**。
-
-下面用一个简单的矩阵乘法示例，展示这条调用链路中每一层实际发生了什么：
-
-```python
-import torch
-
-# ① Python 层：用户代码
-A = torch.randn(4096, 4096, device="cuda")  # 在 GPU 上分配并初始化张量
-B = torch.randn(4096, 4096, device="cuda")
-
-# ② PyTorch 层：调度到正确的后端
-#    torch.matmul 检测到输入在 CUDA 设备上，
-#    分发到 aten::mm 的 CUDA 实现
-C = torch.matmul(A, B)
-
-# 实际发生的调用链路：
-#
-# torch.matmul(A, B)
-#   → aten::mm (PyTorch ATen dispatcher)
-#     → at::cuda::blas::gemm (PyTorch CUDA 后端)
-#       → cublasSgemm / cublasGemmEx (cuBLAS 库)
-#         → cudaLaunchKernel (CUDA Runtime)
-#           → ioctl(/dev/nvidia0) (GPU Driver)
-#             → GPU SM 执行 GEMM kernel
-
-# ③ 同步：确保 GPU 计算完成
-torch.cuda.synchronize()
-
-# 此时 C 包含 A × B 的结果，整个过程经历了上述所有层
-print(f"输入: {A.shape} × {B.shape} → 输出: {C.shape}")
-print(f"设备: {C.device}, 数据类型: {C.dtype}")
-```
-
-每一层的耗时都可以用 NVIDIA Nsight Systems（`nsys`）捕获和分析，这也是后续章节 profiling 的基础。
-
-### 1.1 GPU Driver
-
-GPU Driver 是 Linux 内核模块，管理 GPU 硬件的底层操作。安装后创建 `/dev/nvidia0`、`/dev/nvidiactl`、`/dev/nvidia-uvm` 等设备文件。核心职责：
-
-- **内存分配** — 管理 GPU 显存（HBM）的分配与释放。
-- **任务调度** — 将 kernel 分发到 GPU 的 SM 上执行。
-- **多租户分区** — 通过 MIG/MPS 支持多进程共享 GPU。
-- **监控工具** — `nvidia-smi` 查看温度、利用率、ECC 状态、GPU 模式。
-
-保持 driver 更新很重要——新版本通常解锁性能优化并支持最新 GPU 架构和 CUDA 特性。
-
-### 1.2 CUDA Toolkit & Runtime
-
-在 Driver 之上是 CUDA Toolkit，包含编译器和运行时库：
-
-- **`nvcc`** — CUDA 编译器，将 `.cu` 代码分离为 host 和 device 代码。
-- **`cudart`** — CUDA 运行时，负责 kernel 启动、内存管理、流同步。
-- **优化库** — cuDNN（神经网络原语）、cuBLAS（线性代数）、NCCL（多 GPU 集合通信）。
-
-始终使用支持你 GPU compute capability 的最新 CUDA Toolkit——最新版本包含针对你硬件的编译器优化和库改进。
-
-**CUDA 前向与后向兼容性：** CUDA 编译输出同时包含 **PTX**（中间表示，可被新 GPU JIT 编译，提供前向兼容）和 **CUBIN/SASS**（特定架构的机器码，已知架构直接执行，提供后向兼容）。两者打包为 **fatbinary**，同时支持当前和未来硬件。CUBIN 本身不具备前向兼容性，因此发布时应始终包含 PTX。
-
-### 1.3 Python CUDA 库
-
-NVIDIA 提供了一系列 Python 库，降低 GPU 编程门槛：
-
-| 库 | 定位 |
-| --- | --- |
-| **CUDA Python** | 底层 driver/runtime API 的 Python 绑定 |
-| **cuTile** | tile 化矩阵运算抽象，简化分块计算 |
-| **cuPyNumeric** | NumPy 的 GPU 替代品（`import cupynumeric as np`） |
-| **CuPy** | GPU 加速的数组编程 |
-| **Warp** | Python 中编写 GPU kernel |
-| **CUTLASS** | cuBLAS 底层使用的 C++ 模板库，提供可组合的 GEMM/卷积原语 |
-| **Triton** | OpenAI 的 Python DSL，已集成进 PyTorch 编译器后端 |
-
-### 1.4 PyTorch 与高层框架
-
-PyTorch 的编译器栈（`torch.compile`）由三部分组成：
-
-1. **TorchDynamo** — 捕获 Python 代码的计算图
-2. **AOT Autograd** — 提前生成反向传播图
-3. **TorchInductor** — 后端代码生成，使用 Triton 做 kernel 融合和自动调优
-
-PyTorch 抽象了 CUDA 编程的复杂性——你写直观的 Python 代码，底层调用高度优化的 CUDA 例程。
-
-## 2. CPU 与操作系统调优
-
-**GPU 利用率不足的一个常见根源，是 CPU 端未能及时、持续地为 GPU 提供有效的计算任务**。训练和推理的具体形态不同，但影响 GPU 计算的 CPU 侧任务主要集中在几类：
+**GPU 利用率不足的一个常见根源在 CPU 端：CPU 没能及时、持续地为 GPU 供给数据和任务，GPU 于是被迫空等**。训练和推理的具体形态不同，但影响 GPU 计算的 CPU 侧任务主要集中在几类：
 
 - **准备输入**：训练时读取样本、tokenize、图像解码、数据增强和 batch 组装；推理时处理请求解析、tokenize、padding 和动态 batching。输入准备跟不上时，GPU 只能等待下一批数据或请求。
 - **提交 GPU 任务**：CPU 调用 CUDA API 完成 kernel launch、memory copy 和 stream synchronization，并把这些任务排进 CUDA stream。只有 CPU 完成提交后，GPU 才能开始执行对应 kernel。大量小 kernel 或频繁同步会放大 CPU 开销，导致 GPU 间歇性空闲。
@@ -126,17 +25,17 @@ PyTorch 抽象了 CUDA 编程的复杂性——你写直观的 Python 代码，�
 
 如果这些 CPU 侧任务变慢、出现抖动，或者 OS 调度不稳定，昂贵的 GPU 就可能长时间处于空闲，CPU 与操作系统调优的目标，是让输入管道、GPU 任务提交和通信辅助线程更稳定、更高效地运行，从而减少 GPU 等待时间。
 
-### 2.1 NUMA 感知与 CPU 绑定
+### 1.1 NUMA 感知与 CPU 绑定
 
-#### **2.1.1 什么是 NUMA**
+#### **1.1.1 什么是 NUMA**
 
-在笔记本和小型台式机中，通常只有一个 CPU 和一组内存，所有内存访问速度相同——这称为 UMA（Uniform Memory Access，统一内存访问）。但大多数数据中心服务器是 NUMA（Non-Uniform Memory Access，非统一内存访问）系统：每个 CPU 拥有自己的内存控制器，直接连接一部分本地内存。每个 CPU 可以通过自己的内存控制器快速访问本地内存，也可以通过节点间链路访问另一个 CPU 的远程内存，但**本地和远程内存的访问延迟和带宽不同**，这就是"非统一"的含义。
+数据中心服务器通常是多路的 NUMA（Non-Uniform Memory Access，非统一内存访问）系统：每颗物理 CPU 拥有自己的内存控制器，直接连接一部分本地内存。每个 CPU 可以通过自己的内存控制器快速访问本地内存，也可以通过节点间链路访问另一个 CPU 的远程内存，但**本地和远程内存的访问延迟和带宽不同**，这就是"非统一"的含义。
 
 ![双 socket NUMA 架构：每个 CPU Package 拥有独立的内存（DIMM）和核心，构成一个 NUMA 节点](/books/ai-systems-performance-engineering/images/numa.png)
 
 **NUMA 节点**是 CPU、GPU、NIC 和内存的**逻辑分组**，这些组件在物理上彼此靠近。访问同一 NUMA 节点内的资源比跨节点访问要快得多。例如，一个运行在 NUMA 节点 0 的 CPU 上的进程如果需要访问 NUMA 节点 1 的 GPU，数据就必须通过节点间链路传输，会产生更高的延迟。实际上，**跨 NUMA 节点的内存访问延迟几乎可以翻倍**。
 
-#### **2.1.2 查看系统 NUMA 拓扑**
+#### **1.1.2 查看系统 NUMA 拓扑**
 
 你可以用以下两个命令结合查看系统的完整 NUMA 拓扑：
 
@@ -200,7 +99,7 @@ Legend:
 - **CPU Affinity 列** — 该 GPU 关联的 CPU 核心编号，如 GPU0 对应核心 48-63 和 112-127
 - **NUMA Affinity 列** — 该 GPU 属于哪个 NUMA 节点，**这就是你做 `numactl` 绑定时需要的值**
 
-#### **2.1.3 使用 numactl 进行 CPU pinning**
+#### **1.1.3 使用 numactl 进行 CPU pinning**
 
 确认了 GPU 所在的 NUMA 节点后，需要显式指定 NUMA 亲和性（NUMA affinity）——将进程或线程分配到与 GPU 相同 NUMA 节点上的 CPU 核心。这种做法称为 **CPU pinning**。可以使用 `numactl` 实现，两个关键参数：
 
@@ -215,7 +114,7 @@ Legend:
 numactl --cpunodebind=0 --membind=0 python train.py --gpu 4
 ```
 
-#### **2.1.4 验证 NUMA 绑定的性能影响**
+#### **1.1.4 验证 NUMA 绑定的性能影响**
 
 可以使用下面的脚本对比 NUMA 绑定对 CPU→GPU 数据拷贝带宽的影响，保存为 `numa_bench.sh` 后运行：
 
@@ -292,7 +191,7 @@ numactl --cpunodebind=$REMOTE_NODE --membind=$REMOTE_NODE \
 
 </Accordion>
 
-#### **2.1.5 在 PyTorch DataLoader 中绑定 NUMA**
+#### **1.1.5 在 PyTorch DataLoader 中绑定 NUMA**
 
 书中给出了一个完整的 Python 示例（约 100 行），配套代码 [`ch03/bind_numa_affinity.py`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/bind_numa_affinity.py) 是其完整实现。整个流程分三步：
 
@@ -538,7 +437,7 @@ python -m ch03.compare
 
 </Accordion>
 
-### 2.2 页锁定内存（Pinned memory）
+### 1.2 页锁定内存（Pinned memory）
 
 创建 CPU tensor 时，tensor 内容会被放入内存。这里的内存指的是由 MMU（内存管理单元，Memory Management Unit）管理的一套虚拟内存（virtual memory）抽象：
 
@@ -614,13 +513,13 @@ for x, y in loader:
 - [PyTorch DataLoader: Memory Pinning](https://docs.pytorch.org/docs/2.11/data.html#memory-pinning)
 - [PyTorch CUDA semantics: Use pinned memory buffers](https://docs.pytorch.org/docs/2.11/notes/cuda.html#cuda-memory-pinning)
 
-### 2.3 透明大页（Transparent Hugepages）
+### 1.3 透明大页（Transparent Hugepages）
 
 Linux 内存管理通常使用 4 KB 的页；但当进程使用数十或数百 GB 内存时，例如深度学习数据集、预取批次、模型参数等，管理数以百万计的小页会非常低效。
 
 透明大页（Transparent Hugepages，THP）是一种自动使用大页的机制。大页——2 MB 甚至 1 GB 的页——可以通过增大内存块来减少虚拟内存管理的开销。主要好处是减少缺页中断，并减轻 TLB（translation lookaside buffer）的压力。
 
-#### 2.3.1 TLB 地址转换
+#### 1.3.1 TLB 地址转换
 
 TLB 是 CPU 用来把虚拟地址映射到物理地址的缓存。页更少、更大时，同样数量的 TLB 条目可以覆盖更多内存，从而减少 TLB miss。
 
@@ -650,7 +549,7 @@ TLB 是 CPU 用来把虚拟地址映射到物理地址的缓存。页更少、�
 
 </Accordion>
 
-#### 2.3.2 THP 配置
+#### 1.3.2 THP 配置
 
 - **收益幅度**：Hugepages 通常带来的是中等幅度收益，吞吐提升常见在 **3%–5%** 左右。
 - **Pinned memory 限制**：使用大块 pinned memory 时，需要把 `ulimit -l` 调高或设为 unlimited；如果这个限制过低，pin memory 可能失败，进而回退到可交换内存，或者触发 OOM。
@@ -696,7 +595,7 @@ sudo mount -t hugetlbfs none /mnt/huge
 grep -E "HugePages_Total|HugePages_Free|Hugepagesize|Hugetlb" /proc/meminfo
 ```
 
-### 2.4 调度器与中断亲和性
+### 1.4 调度器与中断亲和性
 
 CPU 侧抖动通常来自三个方面：
 
@@ -704,11 +603,11 @@ CPU 侧抖动通常来自三个方面：
 - **CPU 隔离**：这些线程如果和其他 workload 混跑在同一组 CPU 上，容易争抢 CPU core、cache 和内存带宽，响应时间会变得不稳定。
 - **中断亲和性**：GPU/NIC 中断请求（Interrupt Request，IRQ）如果由远离设备的 CPU 处理，或者频繁打断关键线程，会增加额外延迟。
 
-#### 2.4.1 线程调度
+#### 1.4.1 线程调度
 
 在繁忙的系统上，需要确保数据管道线程等重要线程不会被频繁中断。Linux 默认使用**完全公平调度器（Completely Fair Scheduler，CFS）**，对大多数情况都有效。
 
-但如果有一个对延迟非常敏感、例如需要为 GPU 提供数据的线程，可以考虑对该线程使用实时的**先进先出（FIFO）**或**轮转（RR）**优先级调度。这样可以确保高优先级线程在不被普通优先级线程抢占的情况下运行。
+但如果有一个对延迟非常敏感、例如需要为 GPU 提供数据的线程，可以考虑对该线程使用实时的**先进先出（FIFO）**或**轮转（RR）** 优先级调度。这样可以确保高优先级线程在不被普通优先级线程抢占的情况下运行。
 
 <div style={{ maxWidth: "980px", margin: "0 auto" }}>
   <Frame>
@@ -810,7 +709,7 @@ pid 18503's current scheduling priority: 10
 
 </Accordion>
 
-#### 2.4.2 CPU 隔离
+#### 1.4.2 CPU 隔离
 
 CPU 隔离的目标，是将**关键输入线程**、通信辅助线程与其他工作负载尽量分开运行，减少它们受到调度器负载均衡、内核工作队列、定时器和中断请求等系统噪声的干扰。
 
@@ -877,7 +776,7 @@ cat /proc/cmdline
 
 </Accordion>
 
-#### 2.4.3 中断亲和性
+#### 1.4.3 中断亲和性
 
 IRQ（Interrupt Request）是硬件或内核子系统通知 CPU 处理事件的一种机制。CPU 收到中断后，会暂停当前正在执行的普通任务，转去执行对应的中断处理逻辑。
 
@@ -944,7 +843,7 @@ echo 8-15 | sudo tee /proc/irq/<irq>/smp_affinity_list
 
 </Accordion>
 
-### 2.5 虚拟内存与 Swap
+### 1.5 虚拟内存与 Swap
 
 不言而喻，应尽量避免发生内存交换。一旦进程的部分内存被换出到磁盘，性能往往会出现灾难性的、跨数量级的下降。GPU 程序通常会分配大量主机内存用于数据缓存；如果操作系统将其中一部分换出到磁盘，那么当 GPU 相关流程再次需要访问这些数据时，就会遭遇巨大的延迟。
 
@@ -1038,7 +937,7 @@ docker run --cpuset-cpus=8-15 --cpuset-mems=0 --memory=128g --memory-swap=128g <
 
 </Accordion>
 
-### 2.6 文件系统缓存
+### 1.6 文件系统缓存
 
 对于大型训练任务，最佳实践是频繁将 checkpoint 写入磁盘，以便在需要时能从已知的良好 checkpoint 重新启动失败任务。然而，在进行 checkpoint 写入时，大量数据的突发写入可能会填满操作系统 page cache 并导致停顿。
 
@@ -1051,10 +950,15 @@ docker run --cpuset-cpus=8-15 --cpuset-mems=0 --memory=128g --memory-swap=128g <
 - **分片写 checkpoint**：使用 PyTorch Distributed Checkpoint（DCP），让多个 rank 写各自的 checkpoint 分片，避免单 rank 或单文件形成过大的突发写入。
 - **丢弃 checkpoint cache**：写完后调用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`，提示内核尽快丢弃 checkpoint 对应的 page cache。
 
-**完全绕过 page cache**：
+```bash
+# 使用比例配置，适合内存规模差异不大的节点
+sudo sysctl vm.dirty_background_ratio=5
+sudo sysctl vm.dirty_ratio=20
 
-- **Direct I/O**：延迟敏感的训练 workflow 可以评估 `O_DIRECT`、`io_uring` 和 [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/)。
-- **适用条件**：这类方式需要文件系统、存储设备和 I/O 栈支持 direct I/O，适合已经验证过 I/O 路径的场景。
+# 使用绝对字节配置，适合大内存节点，更可控
+sudo sysctl vm.dirty_background_bytes=$((8 * 1024 * 1024 * 1024))
+sudo sysctl vm.dirty_bytes=$((32 * 1024 * 1024 * 1024))
+```
 
 <Accordion title="PyTorch DCP 异步 checkpoint 示例">
 
@@ -1133,17 +1037,12 @@ if checkpoint_future is not None:
 
 </Accordion>
 
-```bash
-# 使用比例配置，适合内存规模差异不大的节点
-sudo sysctl vm.dirty_background_ratio=5
-sudo sysctl vm.dirty_ratio=20
+**完全绕过 page cache**：
 
-# 使用绝对字节配置，适合大内存节点，更可控
-sudo sysctl vm.dirty_background_bytes=$((8 * 1024 * 1024 * 1024))
-sudo sysctl vm.dirty_bytes=$((32 * 1024 * 1024 * 1024))
-```
+- **Direct I/O**：延迟敏感的训练 workflow 可以评估 `O_DIRECT`、`io_uring` 和 [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/)。
+- **适用条件**：这类方式需要文件系统、存储设备和 I/O 栈支持 direct I/O，适合已经验证过 I/O 路径的场景。
 
-### 2.7 CPU 频率与 C-states
+### 1.7 CPU 频率与 C-states
 
 许多计算节点默认会让 CPU 运行在省电模式下：CPU 空闲时可能被降频，或者进入低功耗睡眠状态。这可以节省能耗、降低发热和成本。训练过程中，GPU 在处理当前 batch 时，CPU 不一定始终处于 100% 利用率；但当新的数据准备、kernel launch 或通信任务到来时，CPU 从低频或睡眠状态恢复会引入额外延迟。
 
@@ -1276,7 +1175,7 @@ cat /proc/cmdline
 
 </Accordion>
 
-### 2.8 Host 内存分配器调优
+### 1.8 Host 内存分配器调优
 
 在 GPU 计算中，CPU 需要持续准备 batch 并及时送给 GPU。优化 memory allocator 可以减少内存分配带来的卡顿和抖动，避免 GPU 等待数据，从而维持高 GPU 利用率和整体吞吐。
 
@@ -1439,19 +1338,11 @@ cat /proc/$PID/maps | grep -E "jemalloc|tcmalloc"
 
 </Accordion>
 
-## 3. GPU 驱动与运行时设置
+## 2. GPU 驱动与运行时设置
 
-OS 调优保证 CPU 侧不拖慢 GPU；GPU 驱动与运行时设置决定 context、时钟、隔离和显存分配是否稳定。不同设置的目标不同，不适合一次性全部打开。
+GPU 驱动与运行时里有一些会影响性能的设置，尤其在多 GPU、多用户场景下。这些设置配置得当，能降低额外开销，也能让多个负载更好地共享同一张 GPU。
 
-| 设置 | 主要作用 | 适合场景 | 避免场景 |
-| --- | --- | --- | --- |
-| 持久化模式（Persistence Mode） | 保持 driver state 和 GPU 初始化状态 | 短作业、低流量推理、MIG 节点 | 对单个长训练作业收益有限 |
-| MPS | 多进程共享 GPU 并发执行 | 小推理、多 MPI rank、小 kernel 组合 | 单进程已打满 GPU、强隔离多租户 |
-| MIG | 硬件级 GPU 分区 | 多租户推理、教学/实验平台、资源保证 | 依赖 NVLink/P2P 的分布式训练 |
-| Clock / power limit | 稳定 benchmark 和性能功耗比 | 性能回归测试、容量规划 | 未监控温度/功耗的生产脚本 |
-| CUDA allocator | 减少显存碎片和分配同步 | 变长 batch、推理服务、长期训练 | 把 OOM 当成单纯 allocator 问题 |
-
-### 3.1 持久化模式（Persistence Mode）
+### 2.1 持久化模式（Persistence Mode）
 
 默认情况下，如果没有应用正在使用 GPU，driver 可能让 GPU 进入更低功耗状态，并卸载部分驱动上下文。下一次应用重新使用 GPU 时，driver 需要重新初始化 GPU，**这个冷启动过程可能带来一两秒级别的延迟**。对于**频繁启动/停止 job 的训练集群**，或者**低流量但延迟敏感的推理服务**，这类初始化开销会影响整体性能。
 
@@ -1505,7 +1396,7 @@ kubectl -n gpu-operator exec -it <nvidia-device-plugin-pod> \
 
 参考资料：[NVIDIA Driver Persistence](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)
 
-### 3.2 Multi-Process Service (MPS)
+### 2.2 Multi-Process Service (MPS)
 
 通常，当多个进程共享同一张 GPU 时，GPU 调度器会在它们之间做时间片切换。例如，如果两个 Python 进程各自都有一些 kernel 要在同一张 GPU 上运行，GPU 可能先执行一个进程的 kernel，再执行另一个进程的 kernel，如此往复。如果这些 kernel 很短，并且它们之间存在空闲间隔，GPU 就可能因为反复进行上下文切换、而不是把这些任务重叠执行，导致利用率不足。
 
@@ -1786,11 +1677,11 @@ kubectl rollout restart -n gpu-operator daemonset/nvidia-device-plugin-daemonset
 - [NVIDIA MPS Tools and Interface Reference](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html)
 - [NVIDIA Kubernetes Device Plugin: With CUDA MPS](https://github.com/NVIDIA/k8s-device-plugin#with-cuda-mps)
 
-### 3.3 Multi-Instance GPU (MIG)
+### 2.3 Multi-Instance GPU (MIG)
 
 [MIG](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/) 会把支持的 GPU 划分为最多 7 个隔离实例，每个实例拥有专用计算和 GPU 内存资源。MIG 从 NVIDIA Ampere 架构开始支持，也就是 compute capability `>= 8.0` 的部分数据中心 GPU；具体型号以 NVIDIA 的 [Supported GPUs](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-gpus.html) 列表为准。
 
-#### **MIG 的资源隔离**
+#### **2.3.1 MIG 的资源隔离**
 
 **MIG 适合多租户场景**，不同用户、容器、虚拟机或进程可以运行在不同 GPU 实例上，一个进程不会直接影响另一个进程的调度和资源边界。对云服务和共享集群来说，这种隔离能把一张大 GPU 切成多个可独立分配的小 GPU。
 
@@ -1800,7 +1691,7 @@ kubectl rollout restart -n gpu-operator daemonset/nvidia-device-plugin-daemonset
   <img src="/books/ai-systems-performance-engineering/images/ch03-mig.jpg" alt="MIG 将一张 GPU 划分为多个彼此隔离的 GPU Instance" />
 </Frame>
 
-#### **GPU Instance 和 Compute Instance**
+#### **2.3.2 GPU Instance 和 Compute Instance**
 
 MIG 配置分两层：先创建 GPU Instance（GI），再创建 Compute Instance（CI）。
 
@@ -1809,7 +1700,7 @@ MIG 配置分两层：先创建 GPU Instance（GI），再创建 Compute Instanc
 
 CUDA 应用会把 CI 及其所属 GI 视为一个 CUDA device；多数场景可以用 `-C` 参数直接创建覆盖整个 GI 的默认 CI。
 
-#### **MIG 设备命名规则**
+#### **2.3.3 MIG 设备命名规则**
 
 [MIG 设备名称](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/mig-device-names.html) 描述了实例的资源形态。`xg.ygb` 表示一个 GPU Instance：`xg` 表示使用 `x` 份 GPU 计算切片，`ygb` 表示 GPU 内存容量档位。例如 `3g.40gb` 表示使用 3 份 GPU 计算切片和 40GB 档位的 GPU 内存。如果一个 GI 继续拆成多个 CI，名称会带上 `c`，格式为 `xc.xg.ygb`；例如 `1c.3g.40gb` 表示在 `3g.40gb` GI 内使用 1 份计算切片的 CI。
 
@@ -2274,7 +2165,7 @@ resources:
 
 </Accordion>
 
-### 3.4 GPU 时钟频率与 ECC
+### 2.4 GPU 时钟频率与 ECC
 
 NVIDIA GPU 的 GPU Boost 会在功耗和温度限制内自动调整核心频率。大多数时候，让 GPU 按默认策略动态调频即可。
 
@@ -2340,7 +2231,7 @@ GPU 00000000:01:00.0
             SRAM Threshold Exceeded                    : No
 ```
 
-## 4. 系统调优脚本
+## 3. 系统调优脚本
 
 [`system_tuning.sh`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/system_tuning.sh) 脚本里包含 CPU 频率策略、swap、透明大页（THP）、网络参数、中断亲和性等调优项。
 
@@ -2450,7 +2341,7 @@ echo "Remember to update /etc/default/grub with CPU isolation parameters if need
 
 </Accordion>
 
-## 5. 容器运行时优化
+## 4. 容器运行时优化
 
 AI 系统常用 Docker、Kubernetes 等容器运行时和编排工具来管理软件环境。容器能把 CUDA、Python package、系统库和推理/训练框架版本固定下来，减少“在我机器上能跑”的环境漂移问题。
 
@@ -2458,7 +2349,7 @@ AI 系统常用 Docker、Kubernetes 等容器运行时和编排工具来管理�
 
 **配合 NVIDIA Container Toolkit，Docker 容器内的 GPU 访问是直接的，不会引入传统虚拟化开销。对于现代 GPU 和较新的 NVIDIA Container Toolkit，只要环境配置正确，容器内运行和直接在裸机宿主上运行的 GPU 性能通常几乎一致，差异通常可以控制在 [2%](https://www.redhat.com/en/blog/mlperf-inference-v50-results) 以内**。
 
-### 5.1 NVIDIA Container Toolkit
+### 4.1 NVIDIA Container Toolkit
 
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/) 允许用户构建和运行 GPU 加速容器。它包含 [container runtime library](https://github.com/NVIDIA/libnvidia-container) 和相关工具，可以自动配置容器，让容器使用 NVIDIA GPU。
 
@@ -2598,6 +2489,39 @@ sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
 
 </Accordion>
 
+<Accordion title="使用 CDI 路径">
+
+CDI 是 vendor 中立的设备接口标准，也是 Podman、containerd 和较新 Docker 推荐的方式。用法分两步：先生成 CDI spec，再用 `--device` 按名字请求 GPU，不需要 `--gpus` 或 `--runtime=nvidia`。
+
+**1. 生成 CDI spec**（扫描本机 GPU / MIG 设备并写出 spec；`/etc/cdi` 为静态目录、`/var/run/cdi` 为临时目录）：
+
+```bash
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+spec 里每个设备都有一个完全限定名：`nvidia.com/gpu=all`（全部）、`nvidia.com/gpu=gpu0`（按索引）、`nvidia.com/gpu=mig<GPU>:<MIG>`（MIG 实例）。用 `nvidia-ctk cdi list` 查看：
+
+```bash
+nvidia-ctk cdi list
+```
+
+从 Container Toolkit v1.18 起，`nvidia-cdi-refresh` systemd 服务会在安装、driver 升级、重启时自动重新生成 spec；但**驱动卸载或 MIG 重新配置后需要手动重新生成**。
+
+**2. 运行容器**，用 `--device` 指定 CDI 设备名：
+
+```bash
+# Podman（v4.1+ 原生支持 CDI）
+podman run --rm --device nvidia.com/gpu=all ubuntu nvidia-smi
+
+# Docker：28.3.0 起默认开启 CDI；25.0–28.2 需先在 /etc/docker/daemon.json 打开
+#   { "features": { "cdi": true } }  再 sudo systemctl restart docker
+docker run --rm --device nvidia.com/gpu=all ubuntu nvidia-smi
+```
+
+和 legacy 路径相比，CDI 不再需要 `nvidia-container-runtime-hook` → `nvidia-container-cli` 这条启动时注入链——设备节点、驱动库、权限都由 CDI spec 声明，再由支持 CDI 的 runtime 直接应用到容器。
+
+</Accordion>
+
 <Accordion title="CUDA 版本与 NVIDIA driver 兼容性">
 
 不同容器之间的 CUDA runtime、CUDA 版本可以不一样，但它们底层共享的是宿主机上的 NVIDIA driver。
@@ -2629,7 +2553,7 @@ sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
 </Accordion>
 
 
-### 5.2 避免 Overlay FS 开销
+### 4.2 避免 Overlay FS 开销
 
 和直接在宿主机运行相比，Docker 容器更容易出现差异的地方通常是 I/O。容器常用联合文件系统（union filesystem），它的好处很直接：把只读镜像层和可写容器层透明叠加成一个统一视图，容器看起来像在使用一个完整的文件系统。
 
@@ -2668,7 +2592,7 @@ docker run --rm --gpus all \
 
 这里假设训练数据在宿主机的 `/data/dataset`。`-v /data/dataset:/mnt/dataset:ro` 会把它挂载到容器内的 `/mnt/dataset`，其中 `ro` 表示只读挂载。训练脚本从 `/mnt/dataset` 读取数据，相当于直接从宿主文件系统读取。
 
-### 5.3 HPC 场景的容器运行时
+### 4.3 HPC 场景的容器运行时
 
 HPC 集群对容器运行时提出了更高要求。集群通常遵循最小权限原则：用户应以自身身份运行作业，不能提升权限，也不应接触计算节点上由 root 管理的系统守护进程。同时，HPC 容器运行时还需要更便捷地接入 GPU、高速网络和并行文件系统等宿主资源。因此，在 HPC 场景中，有时候会选择 **Apptainer** 或 **Enroot** 这类面向 HPC 集群环境设计的容器运行时。
 
@@ -2848,11 +2772,11 @@ ENROOT_RESTRICT_DEV=yes NVIDIA_VISIBLE_DEVICES=0,1 enroot start pytorch nvidia-s
 
 </Accordion>
 
-## 6. Kubernetes 编排与拓扑感知调度
+## 5. Kubernetes 编排与调度
 
 GPU 是集群里最贵、最稀缺的资源，调度方式直接影响利用率与训练/推理成本。
 
-### 6.1 GPU Operator
+### 5.1 GPU Operator
 
 在 Kubernetes 集群中管理 GPU 可能是一项艰巨的任务。传统方法往往需要手工安装和配置 GPU 驱动，既费时又容易出错。此外，要利用高级 GPU 特性、并确保 GPU 与其它系统组件之间的高效数据传输，还需要专门的知识和工具。缺少一套规范化的方法，这些挑战会拖累 AI/ML 工作负载的性能与可扩展性。
 
@@ -2919,7 +2843,7 @@ helm install --wait --generate-name \
 - [Time-Slicing GPUs in Kubernetes（GPU Operator）](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html)
 - [GPU Operator with MIG](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html)
 
-### 6.2 Device Plugin
+### 5.2 Device Plugin
 
 GPU Operator 部署的组件里，真正把 GPU 暴露给 Kubernetes 调度的是 device plugin。NVIDIA 的 [k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin) 以 DaemonSet 运行，向 kubelet 注册扩展资源 `nvidia.com/gpu`。启用 MIG 时，device plugin 可以按 profile 暴露 `nvidia.com/mig-*` 资源；启用 GPU sharing 时，则可以把共享后的访问入口暴露为 `nvidia.com/gpu.shared` 等资源。
 
@@ -2937,7 +2861,7 @@ GPU Operator 部署的组件里，真正把 GPU 暴露给 Kubernetes 调度的�
 - **MIG 布局静态**：MIG profile 须在节点侧预先配置，调整布局需重新配置节点，无法按工作负载动态切分。
 - **拓扑感知不足**：对 NVLink、NUMA 等拓扑距离缺乏感知。
 
-### 6.3 Dynamic Resource Allocation (DRA)
+### 5.3 Dynamic Resource Allocation (DRA)
 
 [DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) 是 Kubernetes 的一项功能，用于在 Pod 之间请求和共享资源。这些资源通常是硬件加速器这类附加设备。
 DRA 提供了一种灵活的方式，用于对集群中的设备进行分类、请求和使用。使用 DRA 可以带来如下收益：
@@ -3249,7 +3173,7 @@ Kubelet 收到已绑定的 Pod
 
 </Accordion>
 
-#### 6.3.1 GPU 分配基本示例
+#### 5.3.1 GPU 分配基本示例
 
 最基础的用法是申请整卡：`ResourceClaimTemplate` 或 `ResourceClaim` 通过 `deviceClassName` 引用 `gpu.nvidia.com` 这个 DeviceClass，Pod 再引用该 claim 即可拿到一张 GPU。
 
@@ -3499,7 +3423,7 @@ spec:
 
 </Accordion>
 
-#### 6.3.2 TimeSlicing 与 MPS
+#### 5.3.2 TimeSlicing 与 MPS
 
 DRA 把共享策略直接写进每个 claim 的 `GpuConfig`，因此能**按工作负载单独配置**；而 device plugin 的 TimeSlicing / MPS 由整节点共用一份 ConfigMap 决定，同一节点上所有 Pod 只能套用同一套。DRA 的粒度还能更细——同一个 `ResourceClaimTemplate` 里就能给不同 request 配不同策略：一个 request 走 TimeSlicing、另一个走 MPS，各自落到不同的 GPU。下面这个示例用一个 Pod、4 个容器演示：`ts-ctr0/ts-ctr1` 共享一张走 TimeSlicing 的 GPU，`mps-ctr0/mps-ctr1` 共享另一张走 MPS 的 GPU。
 
@@ -3620,7 +3544,7 @@ helm upgrade -i dra-driver-nvidia-gpu \
 
 `TimeSlicingSettings` 不与任何特性冲突，可与 `MPSSupport` 同时开启；但 `MPSSupport` 与 `DynamicMIG` **互斥**，两者不能同开（想跑动态 MIG 时需去掉 `MPSSupport`）。完整的互斥组合见官方 [feature gate constraints](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/main/site/content/docs/reference/feature-gates.md#constraints)。
 
-#### 6.3.3 静态 MIG
+#### 5.3.3 静态 MIG
 
 静态 MIG 需要先在节点上把 GPU 提前做好 MIG 切分（比如用 [`nvidia-mig-parted`](https://github.com/NVIDIA/mig-parted)），之后 `ResourceClaim` / `ResourceClaimTemplate` 只能申请这些已经切好的 MIG 规格。
 
@@ -3704,7 +3628,7 @@ spec:
 
 </Accordion>
 
-#### 6.3.4 动态 MIG
+#### 5.3.4 动态 MIG
 
 H100 及更新架构可按 claim **现切** MIG，无需提前切分：开启 `DynamicMIG` feature gate 后，DRA driver 会直接依据 `ResourceClaim` 在卡上动态创建对应的 MIG 设备。
 
@@ -3819,7 +3743,7 @@ spec:
   <img src="/books/ai-systems-performance-engineering/images/ch03-dra-counter-3-unavailable.png" alt="KubeCon 幻灯片：counter 被 small-device-1 占用后，large-device 因余量不足变为不可分配；ResourceSlice 不被改写，调度器靠已分配 ResourceClaim 反推余量" />
 </Frame>
 
-#### 6.3.5 ComputeDomain：多节点 NVLink
+#### 5.3.5 ComputeDomain：多节点 NVLink
 
 早期 NVIDIA DGX 的做法是把尽可能多的 GPU 塞进**一台服务器**、用高带宽 NVLink 连起来：单机内扩展很强，但作业规模被限制在一台机器内。GB300 NVL72 和 GB200 NVL72 正是为打破这一限制而生：每一台都提供由 NVLink Switch 连接的密集 GPU fabric，在机架内支持 **NVIDIA Multi-Node NVLink（MNNVL）**，并包含具备 IMEX 能力的 compute tray，实现跨节点的 GPU 显存共享——整个机架因此变成一块**统一的 GPU fabric**，成为超大规模分布式训练与推理的基础。
 
@@ -4058,208 +3982,478 @@ rank 0–3 在 worker-0、rank 4–7 在 worker-1。矩阵里**跨节点**的格
 - [Supporting GB200 on Kubernetes](https://docs.google.com/presentation/d/1Xupr8IZVAjs5bNFKJnYaK0LE7QWETnJjkz6KOfLu87E)：GB200 / Kubernetes 支持相关 slides。
 
 
-### 6.4 拓扑感知调度
+### 5.4 QoS
 
-默认 Kubernetes 调度器只知道资源数量，不理解 GPU、CPU、NUMA、NIC、NVLink domain 的距离。请求 4 张 GPU 成功，不代表这 4 张 GPU 在同一个 NVLink clique，也不代表 CPU 和 NIC 离它们最近。
-
-[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)在 kubelet admission 阶段汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，把 CPU、设备、内存对齐到同一 NUMA 节点。常用策略：
-
-| 策略 | 行为 | 适用场景 |
-| --- | --- | --- |
-| `none` | 不做拓扑对齐（默认） | 非性能敏感作业 |
-| `best-effort` | 尽力对齐，不满足也放行 | 共享集群、推理服务 |
-| `restricted` | 不满足 preferred hint 则拒绝 | 拓扑敏感训练作业 |
-| `single-numa-node` | 资源必须落在单个 NUMA node | CPU/NIC/GPU 本地性要求强 |
-
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-kubernetes-topology-manager.png" alt="Kubernetes Topology Manager 汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，并决定 Pod 是否可以被 kubelet admit" />
-</Frame>
-
-图源：[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)
-
-Topology Manager 要和 [CPU Manager static policy](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/) 配合：只有 Guaranteed Pod 且 CPU request 是整数时，CPU Manager 才会分配 exclusive CPUs，对齐才有意义。
-
-```yaml
-resources:
-  requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "4" }
-  limits:   { cpu: "16", memory: "128Gi", nvidia.com/gpu: "4" }
-```
-
-但 Topology Manager 有两点局限：它在 **kubelet 准入阶段**（调度之后）工作，粒度只到 NUMA 节点；而且它的设备 hint 只来自 device plugin（Device Manager），表达不了“两张 GPU 是否 NVLink 直连”“多个 MIG 是否来自同一张卡”，DRA 设备它也看不到。
-
-DRA 则在**调度阶段**直接表达设备间互联：driver 把拓扑写成设备属性（`resource.kubernetes.io/pcieRoot`、`gpu.nvidia.com/parentUUID`、`resource.kubernetes.io/numaNode` 等），claim 用 `constraints.matchAttribute` 要求选中的设备共享某属性，由 scheduler 跨集群强制满足。
-
-```yaml
-# 要求一组设备落在同一 PCIe root（换成 parentUUID 即“同一张物理卡”）
-constraints:
-- matchAttribute: "resource.kubernetes.io/pcieRoot"
-```
-
-两者互补：DRA 负责按互联拓扑挑对设备/节点；节点内 CPU 与 GPU 的 NUMA 对齐当前仍可借 Topology Manager / CPU Manager（DRA 原生纳管 CPU/内存自 Kubernetes 1.36 起为 alpha）。在 GB200 NVL72 这类系统上拓扑感知尤其关键，[NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html) 说明其 rack 级 NVLink domain 的价值只有在调度和通信路径也对齐时才能体现；[NVIDIA Topograph](https://github.com/NVIDIA/topograph) 则提供了发现集群物理网络拓扑并暴露给调度器的工具。
-
-<Accordion title="练习入口：拓扑感知 Pod YAML">
-
-[`kubernetes_topology_pod.yaml`](https://github.com/cfregly/ai-performance-engineering/blob/main/code/ch03/kubernetes_topology_pod.yaml) 展示了完整的拓扑敏感 Pod 配置：GPU/CPU/memory requests 与 limits、`hostNetwork`、NCCL 环境变量、`IPC_LOCK`、`/dev/shm` memory volume、hostPath 数据目录和 node affinity。
-
-```yaml
-securityContext:
-  capabilities:
-    add: ["IPC_LOCK"]
-
-volumes:
-- name: dshm
-  emptyDir:
-    medium: Memory
-    sizeLimit: 8Gi
-```
-
-</Accordion>
-
-### 6.5 资源隔离与 QoS
-
-[Kubernetes QoS 文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)定义了 `Guaranteed`、`Burstable`、`BestEffort` 三类。节点内存紧张时，Kubernetes 会优先驱逐 `BestEffort`，其次是 `Burstable`，最后是 `Guaranteed`。
+Kubernetes 按 Pod 的 `requests` / `limits` 把它分成三个 [**QoS 级别**](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)：`Guaranteed`、`Burstable`、`BestEffort`。节点内存紧张时，kubelet 按 `BestEffort` → `Burstable` → `Guaranteed` 的顺序驱逐 Pod。
 
 | QoS 级别 | 条件 | GPU 作业建议 |
 | --- | --- | --- |
-| `Guaranteed` | 每个容器 CPU/memory request 等于 limit | 性能敏感训练、CPU pinning |
-| `Burstable` | 设置了部分 request/limit | 弹性推理、实验作业 |
-| `BestEffort` | 无 request/limit | 不适合 GPU 生产作业 |
+| `Guaranteed` | 每个容器的 CPU、memory `requests` 都等于 `limits` | 性能敏感训练、需要独占核 |
+| `Burstable` | 设了 CPU/memory 的 request 或 limit，但未全部满足 `requests == limits`（如 `requests` < `limits`、或只设了一部分） | 弹性推理、实验作业 |
+| `BestEffort` | 完全不设 `requests` / `limits` | 不适合 GPU 生产作业 |
 
-GPU 训练 Pod 通常应该做到：
+GPU 训练 Pod 应尽量落到 `Guaranteed`——每个容器的 CPU、memory `requests` 都等于 `limits`（CPU 取整数还能配合 CPU Manager `static` 独占核）。这样既不会在内存紧张时被优先驱逐，也是后续做 NUMA 保证分配的前提。
 
-- CPU request/limit 使用整数并相等，配合 CPU Manager static policy。
-- memory request/limit 预留 DataLoader、pinned memory、page cache 和 checkpoint 峰值。
-- 给 `/dev/shm` 显式 memory-backed `emptyDir`，不要依赖容器默认 64 MB。
-- 训练节点预留 housekeeping CPU，避免 kubelet/containerd/监控 agent 与 DataLoader worker 抢核。
-- I/O 隔离用本地 NVMe 分区、cgroup v2 I/O controller 或存储层 QoS 补齐；Kubernetes 默认资源模型不直接表达磁盘带宽。
+---
 
-### 6.6 调度器：Kubernetes、Slurm 与 Slinky
+### 5.5 拓扑感知调度
 
-训练平台和推理平台的调度目标不同。训练更像 HPC batch：一组 rank 要同时拿到 GPU、CPU、内存、网络和文件系统带宽；推理更像在线服务：关注 rollout、autoscaling、灰度、SLO、可观测和多租户隔离。调度器选型不是“谁更先进”，而是资源模型和团队操作模型是否匹配。
+为支撑延迟敏感、高吞吐的工作负载，Kubernetes 提供了一套 Resource Manager（资源管理器）。它们为那些对 CPU、设备、内存（hugepages）有特定要求的 Pod，协调并优化节点内资源的对齐。
 
-| 维度 | Slurm | Kubernetes | Slinky |
+Topology Manager 是 kubelet 的一个组件，负责协调这一组承担上述优化的管理器。这组管理器各管一类资源，都作为 Topology Manager 的 **hint provider**，与它协商来完成资源分配决策：
+
+- **CPU Manager**：kubelet 的组件，为 CPU 资源提供独占式分配。详见 [Control CPU Management Policies on the Node](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/)。
+- **Memory Manager**：kubelet 的组件，为内存资源提供独占式分配。详见 [Control Memory Management Policies on a Node](https://kubernetes.io/docs/tasks/administer-cluster/memory-manager/)。
+- **Device Manager**：kubelet 的组件，通过 device plugin API 把硬件设备分配给 Pod（拓扑信息由 device plugin 提供）。详见 [Device Plugin Integration with the Topology Manager](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-integration-with-the-topology-manager)。
+
+如下图，[Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/) 自己不管具体资源，只在 **Pod 准入阶段**做协调：先向这三个 manager 各要一份 NUMA 提示（`GetTopologyHints`），合并后按策略决定是否准入该 Pod；准入后再让它们各自按选定的 NUMA 分配。这样 CPU、内存、设备就尽量落到**同一个 NUMA 节点**，减少跨 NUMA 访问。
+
+<Frame caption="Topology Manager 在 Pod 准入阶段汇总 CPU / Memory / Device Manager 的 NUMA 提示，据此决定 Pod 能否被 kubelet 准入。图源：[Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)">
+  <img src="/books/ai-systems-performance-engineering/images/ch03-kubernetes-topology-manager.png" alt="Kubernetes Topology Manager 汇总 CPU Manager、Device Manager 等 hint provider 的拓扑提示，并决定 Pod 是否可以被 kubelet 准入" />
+</Frame>
+
+Topology Manager 支持四种**策略**（通过 kubelet 的 `--topology-manager-policy` flag 或配置字段 `topologyManagerPolicy` 设置），对齐的严格程度依次递增：
+
+- **`none`（默认）**：不做任何拓扑对齐。
+- **`best-effort`**：为每个容器算出首选 NUMA 亲和；即使对不齐到首选，也照常准入（尽力而为）。
+- **`restricted`**：算出首选亲和；若实际无法命中首选，则拒绝该 Pod。
+- **`single-numa-node`**：判断资源能否落在**单个** NUMA node，能则准入，否则拒绝。
+
+Topology Manager 还有两种**作用域**（通过配置字段 `topologyManagerScope` 设置），决定对齐是「按容器」还是「按 Pod」：
+
+- **`container`（默认）**：逐容器分别对齐，容器之间不成组，各自被独立地对齐到 NUMA。
+- **`pod`**：把 Pod 内所有容器当作整体，一起对齐到单个 NUMA node 或同一组 NUMA node（Pod 的资源总量按 effective requests/limits 计算，即取「所有 app 容器请求之和」与「最大的单个 init 容器请求」中的较大值——也就是 Pod 同一时刻的峰值需求）。配合 `single-numa-node` 可把整个 Pod 放到一个 NUMA node 上，消除 Pod 内的跨 NUMA 通信开销，适合延迟敏感或高吞吐 IPC 应用。
+
+#### 5.5.1 CPU Manager
+
+CPU Manager 是 kubelet 的组件，为 CPU 资源提供**独占式分配**能力。
+
+默认情况下，kubelet 用 **CFS quota**（Linux CFS 调度器基于 cgroup 的 CPU 时间配额）来限制 Pod 的 CPU 上限；当节点上跑着很多 CPU 密集型 Pod 时，工作负载可能迁移到不同的 CPU 核上——取决于 Pod 是否被限流、以及调度时哪些核可用。多数负载对这种迁移不敏感，无需任何干预也能正常工作。但对 CPU cache 亲和、调度延迟明显影响性能的负载，kubelet 允许用 CPU 管理策略来影响核的放置。关键配置：
+
+- CPU Manager 有两种 policy（通过 `cpuManagerPolicy` 配置）：
+  - `none`（默认）：不做额外绑核，沿用 OS 调度器默认的 CPU 亲和（CPU 上限仍由 CFS quota 限制）。
+  - `static`：让 Guaranteed Pod 中「整数 CPU 请求」的容器独占节点上的 CPU 核（独占性由 **cpuset cgroup 控制器**、即写 `cpuset.cpus` 强制）；其余容器共用 shared pool。
+- 启用 `static` 时，kubelet 要求预留一份**大于零**的 CPU（否则独占核被占满后 shared pool 会变空，非独占容器无核可跑）；下面三个参数任选其一或组合，预留的核都会从独占分配池里排除：
+
+| 命令行 flag | 配置字段 | 预留给谁 | 形式 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--kube-reserved` | `kubeReserved` | K8s 组件（kubelet、容器运行时等） | CPU 量 | 预留量从 Node Allocatable 中扣除 |
+| `--system-reserved` | `systemReserved` | OS 系统进程（systemd、sshd 等） | CPU 量 | 同样从 Node Allocatable 扣除，可与 `kubeReserved` 叠加 |
+| `--reserved-cpus` | `reservedSystemCPUs` | 系统 + kubernetes 线程 | 具体 CPU 核（cpuset，如 `0-3`） | CPU 预留的显式核形式，优先级高于上面两者的 CPU 量 |
+
+`cpuManagerPolicyOptions` 用来控制 `static` 策略的行为，可选项（按字母序）：
+
+| 选项 | 成熟度 | 起始版本 | 作用 |
 | --- | --- | --- | --- |
-| 核心模型 | 作业队列 + 节点分配 | Pod/Service + 声明式控制面 | 把 Slurm 能力带入 Kubernetes |
-| 典型入口 | `sbatch`、`srun`、`salloc` | `Job`、`Deployment`、`RayJob`、`Kueue` | Slurm CRD、`slurm-operator`、`slurm-bridge` |
-| GPU 表达 | GRES/TRES，如 `gres/gpu` | extended resource，如 `nvidia.com/gpu` | Slurm 语义或 Kubernetes workload 统一调度 |
-| 队列与公平性 | partition、QoS、fair-share、accounting 成熟 | 需要 Kueue/Volcano/自定义 scheduler 补齐 | 复用 Slurm 策略，同时由 K8s 管 Slurm 组件 |
-| Gang scheduling | 原生适合多节点 batch | Kubernetes v1.35 进入 alpha，默认关闭 | 由 Slurm 负责成组调度 |
-| 服务化能力 | 不是主场 | rollout、HPA、Service、Ingress 成熟 | Slurm 作业与 K8s 服务共存 |
-| 运维代价 | HPC 体系成熟，但云原生集成弱 | 云原生生态成熟，但 GPU batch 语义弱 | 控制面更复杂，需要明确所有权 |
+| `align-by-socket` | alpha（默认隐藏） | 1.25 | 按物理 package / socket 边界对齐 CPU，而非逻辑 NUMA 边界 |
+| `distribute-cpus-across-cores` | alpha（默认隐藏） | 1.31 | 把虚拟核（硬件线程）分散到不同物理核上 |
+| `distribute-cpus-across-numa` | beta（默认可见） | 1.23 | 把 CPU 分散到不同 NUMA 域，在选中的域间尽量均衡 |
+| `full-pcpus-only` | GA（默认可见） | 1.22（1.33 GA） | 总是分配整颗物理核 |
+| `strict-cpu-reservation` | GA（默认可见） | 1.32（1.35 GA） | 不论 QoS，禁止所有 Pod 使用预留的 CPU |
+| `prefer-align-cpus-by-uncorecache` | GA（默认可见） | 1.32 | 尽力按 uncore（末级缓存 LLC）边界对齐 CPU |
 
-**Slurm 的优势在 GPU batch 语义。** [Slurm GRES 文档](https://slurm.schedmd.com/gres.html)说明 GPU、MIG、MPS 都可以通过 Generic Resources 建模。训练作业可以直接表达“每节点 8 张 GPU、每 GPU 多少 CPU、按节点启动 rank”：
+下面是一个启用 `static` 的 KubeletConfiguration 示例：
 
-```bash
-srun \
-  --nodes=16 \
-  --ntasks-per-node=8 \
-  --gpus-per-node=8 \
-  --cpus-per-gpu=12 \
-  --mem-bind=local \
-  --gpu-bind=closest \
-  torchrun --nproc_per_node=8 train.py
+```yaml
+# KubeletConfiguration
+cpuManagerPolicy: static
+cpuManagerPolicyOptions:
+  full-pcpus-only: "true"        # 只按整颗物理核分配
+
+# CPU 预留（static 要求 > 0），两种方式二选一：
+# 方式一：显式指定预留哪几个核，隔离最干净；一旦设置，优先级高于下面 kubeReserved / systemReserved 的 cpu
+# reservedSystemCPUs: "0-3"
+# 方式二：按「量」预留 CPU（不指定具体核）
+kubeReserved:
+  cpu: "1"                       # 留 1 核给 K8s 组件
+  memory: "2Gi"
+systemReserved:
+  cpu: "1"                       # 留 1 核给系统进程
+  memory: "1Gi"
 ```
 
-Slurm 会给作业设置 `CUDA_VISIBLE_DEVICES`，并把 GPU 分配纳入 accounting。MIG 也能作为 GPU-like GRES 暴露，但文档明确提到 Slurm 期望 MIG 设备已经提前分区，不负责动态创建/销毁 MIG profile。Slurm 的 `gres.conf` 还存在一个容易误解的点：GPU affinity 在 scheduler 内部主要按 socket 处理，`Cores=` 配置不等于严格的 core-level 调度保证；rank 到 CPU/GPU/NIC 的精确绑定仍要结合 `--cpu-bind`、`--gpu-bind`、NUMA 策略和作业启动脚本验证。
+#### 5.5.2 Memory Manager
 
-**Kubernetes 的优势在服务化和生态。** GPU 在 K8s 中通常是 `nvidia.com/gpu` 这类 extended resource。它适合 vLLM/Triton/KServe/Ray Serve 这类长期运行服务，也适合用 Operator 管理平台组件。Batch 训练需要额外补齐几件事：
+Memory Manager 是 kubelet 的组件，为 **Guaranteed QoS** 的 Pod 提供内存 / hugepages 的 NUMA 保证分配：它生成内存的 NUMA 亲和 hint 交给 Topology Manager，并通过 cgroup 的 `cpuset.mems` 强制内存只从选定的 NUMA node 分配。关键配置：
 
-- 用 [Kueue](https://kubernetes.io/blog/2022/10/04/introducing-kueue/) 处理队列、quota、fair-sharing 和作业 admission。
-- 用 Topology Manager、CPU Manager static policy、GPU Operator/GFD/[DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) 处理节点内拓扑。
-- 用 gang scheduling 或调度插件保证多 rank 训练不是“部分 Pod 先启动、部分 Pod Pending”。
-- 用节点池、taint/toleration、priority class 和 preemption 管理训练、推理、平台组件的优先级。
+- Memory Manager 有两种 policy（通过 `memoryManagerPolicy` 配置）：
+  - `None`（默认）：不做内存 NUMA 对齐，一律返回默认 hint（等于没有 Memory Manager）。
+  - `Static`（仅 Linux）：给 Guaranteed Pod 的内存 / hugepages 做 NUMA 保证分配并写 `cpuset.mems`；BestEffort / Burstable 仍返回默认 hint。
+- 启用 `Static` 时**必须**配 `reservedMemory`（逐 NUMA node 预留），且预留总量必须**等于** `kubeReserved` + `systemReserved` + `evictionHard` 的 `memory.available` 三者之和，否则 kubelet 启动报错。计算公式如下：
 
-[Kubernetes Gang Scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/gang-scheduling/) 在 v1.35 仍是 alpha 且默认关闭。对大规模同步训练来说，这意味着默认 kube-scheduler 不是 Slurm 的直接替代品；需要 Kueue、[Volcano](https://volcano.sh/en/)、scheduler extender 或厂商调度器补齐 batch 语义。
+$$
+\sum_{i=0}^{n-1} \text{reservedMemory}[i] \;=\; \text{kubeReserved} + \text{systemReserved} + \text{evictionHard(memory.available)}
+$$
 
-**Slinky 适合已有 Slurm 投资但希望统一 Kubernetes 运维面的团队。** [SchedMD 的 Slinky 页面](https://slurm.schedmd.com/slinky.html)把它定义为一组 Slurm/Kubernetes 互操作项目：
+其中 $i$ 是 NUMA node 下标，$n$ 是 NUMA node 总数。左边是**逐 NUMA node 预留量之和**，右边是**节点级别要留出的内存总量**（K8s 组件 + OS 系统进程 + eviction 缓冲，`memory.available` 默认 100Mi）。含义是：节点总共预留多少内存，就得原样按 NUMA node 拆分下去，两边必须严格相等——多一点少一点 kubelet 都会启动报错。
 
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-slinky-crds.webp" alt="Slinky slurm-operator 把 slurmctld、slurmdbd、slurmd、slurmrestd 等 Slurm 组件建模为 Kubernetes CRD 和 Pod" />
-</Frame>
+```yaml
+# KubeletConfiguration
+memoryManagerPolicy: Static
+kubeReserved:
+  memory: "4Gi"                  # 给 K8s 组件留的内存
+systemReserved:
+  memory: "1Gi"                  # 给系统进程留的内存
+# 总预留 = kubeReserved + systemReserved + evictionHard(默认 100Mi) = 5220Mi
+# 按 NUMA node 拆分，求和必须等于该总量，否则 kubelet 启动报错
+reservedMemory:
+- numaNode: 0
+  limits:
+    memory: "3Gi"                # 3072Mi
+- numaNode: 1
+  limits:
+    memory: "2148Mi"             # 3072 + 2148 = 5220Mi
+```
 
-图源：[NVIDIA Technical Blog：Running Large-Scale GPU Workloads on Kubernetes with Slurm](https://developer.nvidia.com/blog/running-large-scale-gpu-workloads-on-kubernetes-with-slurm/)
+#### 5.5.3 Device Manager
 
-| 组件 | 作用 |
-| --- | --- |
-| [`slurm-operator`](https://slinky.schedmd.com/projects/slurm-operator) | 在 Kubernetes 中运行 Slurm control plane 和 worker daemon，用 CRD/Helm 管理 Slurm 集群生命周期 |
-| [`slurm-bridge`](https://slinky.schedmd.com/projects/slurm-bridge/en/main/) | 让 Slurm 作为 Kubernetes scheduler，调度 Slurm 与部分 Kubernetes workload |
-| `slurm-client` | 通过 Slurm REST API 访问 Slurm 的 Go library |
-| `containers` | Slurm 组件容器镜像 |
+Device Manager 通过 device plugin API 把设备（GPU、NIC 等）分配给 Pod。为了让设备也能参与 Topology Manager 的 NUMA 对齐，device plugin API 专门扩展出了一个 `TopologyInfo` 结构：plugin 在 `ListAndWatch` 里逐个上报设备时带上它的 NUMA 归属，Device Manager 据此把设备的 NUMA 偏好转成 hint 交给 Topology Manager。
 
-这带来两种不同部署模式：
+plugin 上报的单个设备（`Device`）长这样：
 
-| 模式 | 用户体验 | 平台体验 | 适合场景 |
-| --- | --- | --- | --- |
-| Slurm on Kubernetes | 研究员仍然用 `sbatch`/`srun` | Kubernetes 管理 Slurm daemon、升级、监控和自愈 | 训练集群已有 Slurm 脚本、QoS、accounting 积累 |
-| Slurm as Kubernetes scheduler | 用户提交 Kubernetes workload | Slurm 统一处理队列、优先级和资源分配 | 需要同一批 GPU 同时承载 Slurm job 和 K8s job |
+```go
+pluginapi.Device{
+    ID:     "25102017",
+    Health: pluginapi.Healthy,
+    Topology: &pluginapi.TopologyInfo{
+        Nodes: []*pluginapi.NUMANode{
+            {ID: 0},
+        },
+    },
+}
+```
 
-NVIDIA 的 [Running Large-Scale GPU Workloads on Kubernetes with Slurm](https://developer.nvidia.com/blog/running-large-scale-gpu-workloads-on-kubernetes-with-slurm/) 报告了生产部署中 Slinky `slurm-operator` 管理超过 8,000 张 GPU、与非容器化 Slurm 集群保持 NCCL 通信性能一致、并把 Slurm metrics 纳入 Prometheus/Grafana 的案例。这个结论的工程含义不是“所有团队都应迁移到 Slinky”，而是：当平台团队已经选择 Kubernetes 作为节点生命周期、镜像、监控、升级和安全边界，Slurm 可以作为 batch 调度能力保留下来。
+- `ID`：设备唯一标识，不透明字符串，由 plugin 自定义（GPU 常用 UUID / minor number）。
+- `Health`：健康状态（`Healthy` / `Unhealthy`），只有 `Healthy` 的设备才计入该资源的 allocatable。
+- `Topology.Nodes`：设备的 NUMA 归属。这里 `{ID: 0}` 表示这块设备挂在 **NUMA node 0** 上；可填多个表示能从多个 NUMA node 访问，留空（`Topology: nil`）则表示无 NUMA 偏好。
 
-<Tip>
-大规模训练的默认选择仍然可以是 Slurm；在线推理和平台服务的默认选择仍然可以是 Kubernetes。Slinky 的价值在于减少“两套集群、两套监控、两套节点生命周期”的重复建设，而不是把 Slurm 或 Kubernetes 其中一个完全替换掉。
-</Tip>
+#### 5.5.4 拓扑感知调度示例 {#topology-aware-example}
 
-Rack-scale GPU 系统还会把调度问题推到拓扑层。[NVIDIA rack-scale scheduling 文章](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)指出，Slurm 和 Kubernetes 都需要额外机制理解 NVLink fabric、IMEX/ComputeDomain 这类跨节点高速互连。GB200 NVL72 上，调度器只分配“GPU 数量”已经不够，还要确保这些 GPU 属于正确的 NVLink partition，并且 NIC、CPU、IMEX daemon 生命周期与作业边界一致。
+下面就演示一个拓扑感知调度的完整示例。
 
-<Frame>
-  <img src="/books/ai-systems-performance-engineering/images/ch03-rack-topology-aware-scheduling.webp" alt="拓扑感知调度会把同一个分布式 workload 尽量放在单个 rack 或 NVLink domain 内，避免跨 rack 拆分导致通信路径变慢" />
-</Frame>
+**节点拓扑假设（2 个 NUMA node）**
 
-图源：[NVIDIA Technical Blog：Running AI Workloads on Rack-Scale Supercomputers](https://developer.nvidia.com/blog/running-ai-workloads-on-rack-scale-supercomputers-from-hardware-to-topology-aware-scheduling/)
+| NUMA node | CPU 核 | 内存 | GPU |
+|---|---|---|---|
+| node 0 | 0–47（48 核） | 512Gi | `gpu0`–`gpu3` |
+| node 1 | 48–95（48 核） | 512Gi | `gpu4`–`gpu7` |
 
-<Accordion title="调度器选型 checklist">
+**1.** 先在每个节点的 `KubeletConfiguration` 里同时打开 CPU、Memory、Topology 三个 manager，并用 `single-numa-node` 策略把一个容器的所有资源都对齐到同一个 NUMA node：
 
-| 问题 | 倾向选择 |
-| --- | --- |
-| 研究员已有大量 `sbatch` 脚本、partition/QoS/accounting 规则 | Slurm |
-| 主要负载是 vLLM/Triton/KServe/Ray Serve 在线服务 | Kubernetes |
-| 同步训练需要严格 gang scheduling、fair-share 和排队 | Slurm 或 Kueue/Volcano 加强后的 Kubernetes |
-| 平台团队希望用 Kubernetes 管 Slurm daemon、镜像、升级和监控 | Slinky `slurm-operator` |
-| 需要 Slurm 统一调度部分 Kubernetes workload | Slinky `slurm-bridge` |
-| GPU 拓扑跨 rack、跨 NVLink partition，且作业强依赖 collective 性能 | 优先选择能表达拓扑域的调度方案，并用 NCCL benchmark 验证 |
+```yaml
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
 
-</Accordion>
+# —— CPU Manager：允许独占绑核 ——
+cpuManagerPolicy: "static"
+reservedSystemCPUs: "0-1,48-49"            # static 要求的 CPU 预留：每个 NUMA node 各留 2 核
+
+# —— Memory Manager：内存 NUMA 保证分配 ——
+memoryManagerPolicy: "Static"
+kubeReserved:
+  memory: "3Gi"
+systemReserved:
+  memory: "1Gi"
+reservedMemory:                            # 总预留 3Gi + 1Gi + 100Mi = 4196Mi，按 NUMA 拆分
+- numaNode: 0
+  limits:
+    memory: "2Gi"
+- numaNode: 1
+  limits:
+    memory: "2148Mi"                       # 2048 + 2148 = 4196Mi
+
+# —— Topology Manager：强制所有资源落到同一 NUMA node ——
+topologyManagerPolicy: "single-numa-node"
+topologyManagerScope: "container"          # 逐容器对齐
+```
+
+**2.** 假设要调度的 Pod 如下，申请 16 核 CPU、128Gi 内存和 4 张 GPU。它的 **CPU 与内存都设了 `requests == limits`**，因此属于 **Guaranteed QoS**（QoS 只看 CPU 和内存；GPU 这类扩展资源本身就要求 `requests == limits`，但不参与 QoS 判定）。只有 Guaranteed 的 Pod 才会触发三个 manager 的 NUMA 保证分配。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-aligned-app
+spec:
+  containers:
+  - name: app
+    image: my-cuda-app:latest
+    resources:
+      requests:
+        cpu: "16"
+        memory: "128Gi"
+        nvidia.com/gpu: "4"
+      limits:
+        cpu: "16"
+        memory: "128Gi"
+        nvidia.com/gpu: "4"
+```
+
+**3. 三个 provider 各自上报 hint**：每个 manager 只为自己那类资源生成 hint——把「哪些 NUMA node 组合能满足请求」列成候选掩码，其中用**最少 node 数**就能满足的标 `Preferred: true`（`{n}` 是 NUMA 位掩码的简记，`{0,1}` 表示同时用到 node0 和 node1）。本例单个 node 就够任一资源（node0 有 46 个可分配核、约 510Gi 内存、4 张 GPU，都 ≥ 请求量），所以三者形状一致：单节点 `{0}`、`{1}` 是首选，跨节点 `{0,1}` 也够但非最优。
+
+```go
+// CPU Manager 返回 map[string][]TopologyHint（请求 16 核）
+"cpu": {
+  {NUMANodeAffinity: {0},   Preferred: true},   // 16 核全从 node0 出 → 单节点，最优
+  {NUMANodeAffinity: {1},   Preferred: true},   // 16 核全从 node1 出 → 单节点，最优
+  {NUMANodeAffinity: {0,1}, Preferred: false},  // 两个 node 各出一部分 → 够但跨 NUMA，非最优
+}
+// Memory Manager 返回（请求 128Gi）
+"memory": {
+  {NUMANodeAffinity: {0},   Preferred: true},   // 128Gi 全从 node0 → 单节点，最优
+  {NUMANodeAffinity: {1},   Preferred: true},   // 128Gi 全从 node1 → 单节点，最优
+  {NUMANodeAffinity: {0,1}, Preferred: false},  // 跨两个 node → 够但非最优
+}
+// Device Manager 返回（请求 4 张 GPU）
+"nvidia.com/gpu": {
+  {NUMANodeAffinity: {0},   Preferred: true},   // gpu0–gpu3 都在 node0，正好 4 张 → 最优
+  {NUMANodeAffinity: {1},   Preferred: true},   // gpu4–gpu7 都在 node1，正好 4 张 → 最优
+  {NUMANodeAffinity: {0,1}, Preferred: false},  // 跨两个 node 凑 4 张 → 够但非最优
+}
+```
+
+**4. Topology Manager 合并并决策**：从每个 provider 各取一条 hint 组成一个组合，把三者的 NUMA 掩码按位**与**（AND）、`Preferred` 也全部相与，得到合并结果，再按 `single-numa-node` 策略筛选。
+
+| 组合 | 掩码 AND | Preferred | 合法? |
+|---|---|---|---|
+| cpu`{0}` · mem`{0}` · gpu`{0}` | `{0}` | true | ✓ 单节点 |
+| cpu`{1}` · mem`{1}` · gpu`{1}` | `{1}` | true | ✓ 单节点 |
+| cpu`{0}` · mem`{1}` · … | `{}`（空） | — | ✗ 无交集 |
+
+合法的单节点方案有 `{0}` 和 `{1}`，Topology Manager 取**最窄且最优**的一个（宽度相同时选低位），即 **NUMA node 0**。于是准入该 Pod，并让三个 provider 都在 node 0 上分配：
+
+- CPU Manager：从 node0 的可分配核（`2–47`）里独占 16 核；
+- Memory Manager：128Gi 内存全部来自 node0；
+- Device Manager：分配 `gpu0`–`gpu3`。
+
+最终 CPU、内存、GPU 全部落在 **NUMA node 0**，没有跨 NUMA 访问。
+
+**无法单节点满足则拒绝**：若把请求改成 `nvidia.com/gpu: 8`，任何单个 node 都只有 4 张 GPU，合并后不存在成立的单节点组合，`single-numa-node` 会**拒绝准入**。
+
+#### 5.5.5 DRA：把拓扑对齐提前到调度阶段
+
+[5.5.4 拓扑感知调度示例](#topology-aware-example) 的对齐发生在**节点准入阶段**：scheduler 选节点时只核对**节点级资源总量**（够几核 CPU、多少内存、几张 GPU），只管数量够不够，不管这些资源在节点内的 NUMA 位置和互联。结果即便节点数量够，Pod 落上去后也可能**没按最优的单 NUMA 方式部署**，资源被迫跨 NUMA、拖慢性能。
+
+DRA 把这层判断**提前到调度阶段**：driver 把设备拓扑写成属性（如 `resource.kubernetes.io/pcieRoot`、`gpu.nvidia.com/parentUUID`），claim 用 `constraints.matchAttribute` 表达对齐要求，scheduler 选节点时就强制满足，直接挑一个能对齐的节点。GPU、NIC 这类设备之间的互联对齐现已可用；设备之外，CPU 和内存也在被逐步纳入 DRA（[KEP-5517 DRANodeAllocatableResources](https://www.kubernetes.dev/resources/keps/5517/)，Kubernetes 1.36 alpha）。
+
+- [`dra-driver-cpu`](https://github.com/kubernetes-sigs/dra-driver-cpu)：用 DRA 替代 kubelet CPU Manager 做独占绑核，可按 core 类型、NUMA、LLC 等属性在调度阶段选核；与 CPU Manager **节点级互斥**（需 `cpuManagerPolicy: none`）。
+- [`dra-driver-memory`](https://github.com/ffromani/dra-driver-memory)：同思路的 Memory Manager 替代，管内存 / hugepages 的 NUMA 分配。
+
+
+**参考资料**
+
+- [Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)
+- [Control CPU Management Policies on the Node](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/)
+- [Control Memory Management Policies on a Node](https://kubernetes.io/docs/tasks/administer-cluster/memory-manager/)
+- [Resource Managers](https://kubernetes.io/docs/concepts/workloads/resource-managers/)
+- [dra-driver-cpu](https://github.com/kubernetes-sigs/dra-driver-cpu)
+- [dra-driver-memory](https://github.com/ffromani/dra-driver-memory)
+- [KEP-5517 DRANodeAllocatableResources](https://www.kubernetes.dev/resources/keps/5517/)
+- [NVIDIA GB200 NVL tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html)
+- [NVIDIA Topograph](https://github.com/NVIDIA/topograph)
+
+### 5.6 优化网络通信
+
+多节点 GPU 作业里，Pod 之间要频繁通信。Kubernetes 默认给每个 Pod 分配独立 IP，跨节点 Pod 之间还可能隔着 overlay 网络或 NAT，给性能敏感的 GPU 通信带来额外开销。
+
+对性能敏感作业，可以让 Pod 直接用宿主机网络（`hostNetwork: true`，Docker 里对应 `--network=host`），容器网络不再隔离，直接使用宿主机的网络接口：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nccl-worker
+spec:
+  hostNetwork: true          # 直接用宿主机网络接口，不做隔离 / NAT
+  containers:
+  - name: worker
+    image: my-nccl-app:latest
+```
+
+这样容器就能像宿主机一样直接访问 InfiniBand 互连，没有额外的地址转换和防火墙层。对 MPI 作业尤其有用——省去为每个 MPI rank 配端口映射的麻烦。
+
+跨节点通信的瓶颈往往在网络栈：**RDMA**（远程直接内存访问）让一台机器的网卡直接读写另一台的内存，绕过 CPU 和内核协议栈；**GPUDirect RDMA** 更进一步，让网卡直接 DMA 到 / 从 GPU 显存，省掉「GPU → CPU 内存 → 网卡」的中转拷贝——这对多机 NCCL all-reduce 的带宽至关重要。要在 Kubernetes 里启用 RDMA，可以装 [Mellanox Kubernetes RDMA device plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin)：它把 InfiniBand 与 GPUDirect RDMA 端点暴露到 Pod 的网络接口上，实现低延迟、零拷贝通信。
 
 ---
 
-## 核心思想：让 GPU 永远不等待
+### 5.7 网络拓扑感知调度
 
-本章所有优化围绕同一目标：消除导致 GPU 空闲的一切因素。
+数据中心网络是分层的交换机结构（节点 → 机架交换机 → spine → core），两个节点相距的交换机层级越多、通信越慢。分布式训练的多个 Pod 一旦被撒到不同机架、不同 spine 下，all-reduce、all-to-all 就会走慢速的跨交换机链路，拖垮整体吞吐。网络拓扑感知调度让调度器理解这套层级，把同一作业的 Pod（作为一个 gang）尽量放进同一个网络性能域，让集合通信走在跳数更少、带宽更高的近端链路上，降低延迟与拥塞。
 
-1. **CPU 不要拖后腿**：NUMA 绑定、CPU pinning、关闭 swap、performance 频率模式。
-2. **数据传输不要成为瓶颈**：pinned memory、hugepages、GPUDirect RDMA/GDS、双缓冲预取。
-3. **驱动不要引入额外延迟**：persistence mode、MPS/MIG 合理使用。
-4. **容器不要增加开销**：bind mount、host networking、正确 CUDA/driver 版本匹配。
-5. **调度不要分配错资源**：Topology Manager、NUMA/NVLink 对齐。
+#### 5.7.1 Kubernetes 官方方案
 
+Kubernetes 官方原生提供的网络拓扑感知调度方案是 [Topology-Aware Workload Scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-aware-scheduling/)（v1.36 alpha）：在 kube-scheduler 上开启 `TopologyAwareWorkloadScheduling` feature gate，用 `PodGroup` 表达 gang 调度和拓扑约束——拓扑约束基于某个 node label key（如 `topology.kubernetes.io/rack`），调度器的 `TopologyPlacement` 插件按该 label 的取值把节点分组，挑一个能装下整组 Pod 的域：
+
+```yaml
+apiVersion: scheduling.k8s.io/v1alpha2
+kind: PodGroup
+metadata:
+  name: training-group
+spec:
+  schedulingPolicy:
+    gang:
+      minCount: 4                          # 整组一起调度
+  schedulingConstraints:
+    topology:
+      - key: topology.kubernetes.io/rack   # 所有 Pod 必须落在同一 rack
 ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: training-workers
+spec:
+  parallelism: 4                            # 副本数要 ≥ minCount
+  completions: 4
+  completionMode: Indexed
+  template:
+    spec:
+      schedulingGroup:
+        podGroupName: training-group        # 模板里指向上面的 PodGroup
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: my-nccl-app:latest
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+```
 
-## FAQ
+v1.36 的一个限制要留意：**每个 PodGroup 只能写一个拓扑约束**——即单层 label，不支持 block → rack → host 这样的多层级。需要多层级、或软约束（preferred）时，用下面的 KAI / Volcano。
 
-<Accordion title="GPU 利用率排查入口：CPU 与 OS">
-GPU 最常见的空闲原因不是 GPU 自身的问题，而是 CPU 没能及时准备好数据。数据加载、tokenize、H2D 传输、内核分发都发生在 CPU 侧，任何一步慢了 GPU 就只能等待。
-</Accordion>
+#### 5.7.2 NVIDIA [KAI Scheduler](https://github.com/NVIDIA/KAI-Scheduler)
 
-<Accordion title="numactl CPU 与内存绑定分工">
-`--cpunodebind` 控制 CPU 线程在哪些核心上跑，`--membind` 控制内存从哪个节点分配。只用 `--cpunodebind` 但不限制内存分配，OS 可能把内存分配到远端节点，每次访问仍需跨节点。两者需要配合使用。
-</Accordion>
+KAI Scheduler 支持网络拓扑感知调度，做法分两步：先用 `Topology` CRD 声明集群的拓扑层级，再在作业上用注解引用它、表达约束。第一步，`Topology` CRD 把一组 node label 从最外层（如 block）到最内层（单机）列成层级，scheduler 据此把节点组织成一棵树：
 
-<Accordion title="DataLoader worker 不初始化 CUDA context">
-DataLoader worker 是独立的 CPU 子进程，负责数据加载和预处理。如果在 worker 中调用 CUDA API，会在每个 worker 中初始化一个 CUDA context，浪费 GPU 内存并可能导致多进程竞争。worker 只做 CPU 工作，CUDA 操作留给主进程。
-</Accordion>
+```yaml
+apiVersion: kai.scheduler/v1alpha1
+kind: Topology
+metadata:
+  name: cluster-topology
+spec:
+  levels:                                      # 从最外层（如 block）到单机
+  - nodeLabel: cloud.provider.com/topology-block
+  - nodeLabel: cloud.provider.com/topology-rack
+  - nodeLabel: kubernetes.io/hostname
+```
 
-<Accordion title="MPS 与 MIG 的适用边界">
-MPS 将多个进程的 GPU context 合并为一个，允许内核并发执行，适合多个小推理任务共享一个 GPU。MIG 在硬件级别将 GPU 分成独立实例，提供强隔离，适合多租户环境。大规模训练需要每个进程独占完整 GPU 并依赖 NVLink P2P 通信，而 MPS 无内存隔离、MIG 会禁用 P2P。
-</Accordion>
+第二步，在作业（这里是 `Job`）上用注解引用这个 topology 并指定约束层级：`kai.scheduler/topology` 选择哪个 topology，`topology-required-placement` 是硬边界（必须落在该层内），`topology-preferred-placement` 是软优先（在硬边界内尽量收得更紧，只有比 required 更靠下的层级才有意义）：
 
-<Accordion title="容器 GPU 性能接近裸机">
-容器性能问题通常不在 GPU 是否被“虚拟化”，而在运行时和数据路径是否配置正确。重点检查 driver/CUDA 版本、GPU device 注入、overlay FS、bind mount、网络路径和 NUMA 绑定。
-</Accordion>
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training
+  annotations:
+    kai.scheduler/topology: cluster-topology
+    kai.scheduler/topology-required-placement: cloud.provider.com/topology-block   # 硬边界：不出 block
+    kai.scheduler/topology-preferred-placement: cloud.provider.com/topology-rack   # 软优先：块内尽量同 rack
+spec:
+  parallelism: 4
+  completions: 4
+  template:
+    spec:
+      schedulerName: kai-scheduler
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: my-nccl-app:latest
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+```
 
-<Accordion title="Kubernetes 默认调度的拓扑盲区">
-默认调度器不感知硬件拓扑。请求 4 个 GPU 可能被分配到不同 NVLink domain 或不同 NUMA 节点上的 GPU，导致 GPU 间通信走慢速的 PCIe/QPI 而非 NVLink。需要配置 Topology Manager 和 NVIDIA GPU Operator 实现拓扑感知调度。
-</Accordion>
+#### 5.7.3 [Volcano](https://github.com/volcano-sh/volcano)
 
-<Accordion title="Swap 策略：swappiness 与 swapoff">
-`vm.swappiness=0` 告诉内核尽量避免 swap，但在极端内存压力下仍可能 swap。`swapoff -a` 完全禁用所有 swap 设备，任何情况都不会 swap；如果内存不够，OOM killer 会直接终止进程。训练场景通常用 `swapoff -a` 配合足够的物理内存。
-</Accordion>
+Volcano 支持网络拓扑感知调度，做法是用 `HyperNode` CRD 把网络**显式建成交换机树**：一个 `HyperNode` 代表一个网络拓扑性能域，通常映射到一个交换机 / TOR；多个 `HyperNode` 按层级连成树。叶子 HyperNode（tier 1）的成员是真实节点，非叶 HyperNode（tier 2、3…）的成员是下层 HyperNode——`tier` 越低，域内节点间通信越快。
+
+<Frame caption="Volcano HyperNode 把网络建成交换机树：叶子（Tier 1，如 s0 / s1）含真实节点，上层（Tier 2，s2）逐级聚合。图源：Volcano Network Topology Aware Scheduling">
+  <img src="/books/ai-systems-performance-engineering/images/ch03-volcano-hypernode.png" alt="Volcano HyperNode 树状拓扑：Tier 2 的 s2 聚合两个 Tier 1 的 s0 和 s1，s0 含 Node0/Node1、s1 含 Node2/Node3" />
+</Frame>
+
+节点间的通信效率取决于跨越的 HyperNode 层级：node0 与 node1 同属 s0，效率最高；node1 与 node2 要跨两层（s0 → s2 → s1），效率较低。下面把这棵树建出来——`s0`、`s1` 是 tier 1 的叶子（各含两个节点），`s2` 是 tier 2、成员是 `s0` 和 `s1`：
+
+```yaml
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s0
+spec:
+  tier: 1                          # s0 位于 Tier 1
+  members:
+  - type: Node                     # 成员是真实节点
+    selector:
+      exactMatch:
+        name: node0
+  - type: Node
+    selector:
+      exactMatch:
+        name: node1
+---
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s1
+spec:
+  tier: 1                          # s1 位于 Tier 1
+  members:
+  - type: Node
+    selector:
+      exactMatch:
+        name: node2
+  - type: Node
+    selector:
+      exactMatch:
+        name: node3
+---
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s2
+spec:
+  tier: 2                          # s2 位于 Tier 2
+  members:
+  - type: HyperNode                # 成员是下层 HyperNode
+    selector:
+      exactMatch:
+        name: s0
+  - type: HyperNode
+    selector:
+      exactMatch:
+        name: s1
+```
+
+作业用 `networkTopology` 声明要落在哪一层内。下面这个作业把所有 Pod 严格锁进**同一个 leaf（tier 1，即单个 s0 或 s1）**：
+
+```yaml
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: training-job
+spec:
+  schedulerName: volcano
+  minAvailable: 2
+  networkTopology:
+    mode: hard              # hard：必须全落进某个 tier ≤ N 的 HyperNode；soft：尽量
+    highestTierAllowed: 1   # 只允许 tier 1：所有 Pod 必须挤进同一个 leaf（s0 或 s1）
+  tasks:
+  - name: worker
+    replicas: 2             # 2 个 Pod = 2 节点，正好一个 leaf（s0/s1 各含 2 节点）装得下
+    template:
+      spec:
+        schedulerName: volcano
+        restartPolicy: OnFailure
+        containers:
+        - name: c0
+          image: my-nccl-app:latest
+          resources:
+            requests:
+              nvidia.com/gpu: "8"
+            limits:
+              nvidia.com/gpu: "8"
+```
+
+**参考资料**
+
+- [Topology-Aware Workload Scheduling（Kubernetes）](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-aware-scheduling/)、[Kubernetes v1.36: Advancing Workload-Aware Scheduling](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)
+- [KAI Scheduler Topology 文档](https://github.com/NVIDIA/KAI-Scheduler/blob/main/docs/topology/README.md)
+- [Volcano Network Topology Aware Scheduling](https://github.com/volcano-sh/website/blob/master/docs/KeyFeatures/NetworkTopologyAware.md)
