@@ -2,14 +2,26 @@
 title: "第三章：GPU 环境下的 OS、Docker 与 Kubernetes 调优"
 ---
 
+## 录屏回看
+
+<iframe
+  src="https://player.bilibili.com/player.html?bvid=BV1ToNC6QE2k&autoplay=0&high_quality=1"
+  width="100%"
+  height="480"
+  scrolling="no"
+  frameBorder="0"
+  allowFullScreen
+/>
+
+
 ## 本章概要
 
-即使 GPU kernel 和库已经调到极致，系统层的瓶颈仍会拖累大规模训练与推理。要高效利用 GPU，就得让它周围的每一层——操作系统、驱动运行时、容器、集群调度——都不拖后腿。本章按这几层展开，逐层消除限制 GPU 利用率的因素：
+即使 GPU kernel 和库已经调到极致，系统层的瓶颈仍会拖累大规模训练与推理。真正决定 GPU 利用率的，往往是操作系统、驱动运行时、容器和集群调度的配置。本章逐层来看这些配置：
 
-- **CPU / 操作系统**：让 CPU 稳定喂饱 GPU——NUMA 绑定、pinned memory、透明大页、调度与中断亲和性、虚拟内存与 swap、文件系统缓存、CPU 频率与内存分配器；
-- **GPU 驱动与运行时**：让单张卡用足用稳——持久化模式、MPS / MIG 共享与切分、GPU 时钟与 ECC；
-- **容器运行时**：让容器几乎零开销地用上 GPU——NVIDIA Container Toolkit、overlay FS 与网络开销；
-- **Kubernetes**：在集群尺度编排 GPU——GPU Operator、Device Plugin、DRA、资源隔离与 QoS，以及从节点内 NUMA 到跨节点网络的拓扑感知调度。
+- **CPU / 操作系统**：保证 CPU 持续为 GPU 供给数据和任务——NUMA 绑定、pinned memory、透明大页、调度与中断亲和性、虚拟内存与 swap、文件系统缓存、CPU 频率与内存分配器；
+- **GPU 驱动与运行时**：提升单卡的性能与利用率——持久化模式、MPS / MIG 共享与切分、GPU 时钟与 ECC；
+- **容器运行时**：让容器以接近裸机的性能访问 GPU——NVIDIA Container Toolkit、overlay FS 与网络开销；
+- **Kubernetes**：在集群层面分配 GPU——GPU Operator、Device Plugin、DRA、资源隔离与 QoS，以及从节点内 NUMA 到跨节点网络的拓扑感知调度。
 
 ---
 
@@ -401,39 +413,22 @@ torchrun --nproc_per_node=4 -m ch03.bind_numa_affinity
 
 <Accordion title="多 GPU DDP 模式输出示例">
 
+在一台双 socket（2 个 NUMA 节点、每节点挂 2 张 GPU）的机器上，每个 rank 会绑到自己 GPU 所在的节点，输出类似：
+
 ```
-PID 1265546 bound to NUMA node 0 (CPUs=[0, 1, ..., 15, 64, ..., 79])
-PID 1265547 bound to NUMA node 0 (CPUs=[0, 1, ..., 15, 64, ..., 79])
-PID 1265548 bound to NUMA node 0 (CPUs=[0, 1, ..., 15, 64, ..., 79])
-PID 1265549 bound to NUMA node 0 (CPUs=[0, 1, ..., 15, 64, ..., 79])
-Worker 0 (PID=1265614) bound to NUMA node 0
-Worker 1 (PID=1265618) bound to NUMA node 0
-Worker 2 (PID=1265622) bound to NUMA node 0
-Worker 3 (PID=1265626) bound to NUMA node 0
+# 4 个 rank 的主进程（一卡一个）
+PID 4021 bound to NUMA node 0 (CPUs=[0-31])    # rank 0 → GPU 0
+PID 4022 bound to NUMA node 0 (CPUs=[0-31])    # rank 1 → GPU 1
+PID 4023 bound to NUMA node 1 (CPUs=[32-63])   # rank 2 → GPU 2
+PID 4024 bound to NUMA node 1 (CPUs=[32-63])   # rank 3 → GPU 3
+# 每个 rank 的 DataLoader worker 跟随该 rank 落到同一节点
+Worker 0 (PID=4110) bound to NUMA node 0       # rank 0 的 worker → node 0
+Worker 0 (PID=4133) bound to NUMA node 1       # rank 2 的 worker → node 1
 ...
 step=0 loss=2.3125
 ```
 
-4 个主进程（每个对应一张 GPU）和各自的 DataLoader worker 都被绑定到了 NUMA 节点 0。在多 NUMA 节点的系统上，不同 rank 会绑定到各自 GPU 对应的不同节点。
-
-</Accordion>
-
-<Warning>
-`numactl` 的策略在 `fork` 子进程中可继承，但 `spawn` 或 `exec` 模式下**不会继承**。Python 框架管理的 worker 进程必须显式重新设置 CPU 和内存策略。
-</Warning>
-
-**性能影响：** 仅消除跨 NUMA 流量和 CPU 核心迁移，训练吞吐量就可提升 **5%–10%**，同时减少性能抖动。
-
-<Accordion title="验证方式：运行配套代码的 NUMA benchmark">
-
-配套代码里，`ch03/numa_topology_script.sh` 用于查看 GPU/NUMA 拓扑，`ch03/bind_numa_affinity.py` 演示进程绑定；H2D 传输对比由 `baseline_pageable_copy.py` 和 `optimized_pageable_copy.py` 承担。运行对比：
-
-```bash
-cd ai-performance-engineering/code
-python -m ch03.compare
-```
-
-你也可以用 `nvidia-smi topo -m` 查看你的系统拓扑，再用 `numactl --show` 确认当前进程的绑定状态。
+前四行是 4 个 DDP rank 的主进程，各自绑到自己 GPU 所在的节点（rank 0、1 → node 0，rank 2、3 → node 1）；后面的 `Worker` 是每个 rank 的 DataLoader worker 进程，由所属 rank 绑定，因此跟随该 rank 落到同一个节点。这样每个 rank 连同它的 worker 都和自己的 GPU 就近对齐。
 
 </Accordion>
 
@@ -1440,7 +1435,7 @@ echo quit | sudo nvidia-cuda-mps-control
 
 **基本 MPS 示例**
 
-[mps_demo.py](/books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py) 会启动多个 Python 子进程，让它们在同一张 GPU 上反复执行矩阵乘法，模拟多个 CUDA 进程共享 GPU 的场景。[run_basic_comparison.sh](/books/ai-systems-performance-engineering/chapters/ch03/mps/run_basic_comparison.sh) 会跑两轮：第一轮不开 MPS，第二轮开启 MPS 后运行同一个 demo。两轮使用相同的 worker 数、矩阵大小和运行时长，最后比较所有 worker 完成的总矩阵乘法次数。
+[mps_demo.py](https://github.com/ai-infra-learning/docs/blob/main/books/ai-systems-performance-engineering/chapters/ch03/mps/mps_demo.py) 会启动多个 Python 子进程，让它们在同一张 GPU 上反复执行矩阵乘法，模拟多个 CUDA 进程共享 GPU 的场景。[run_basic_comparison.sh](https://github.com/ai-infra-learning/docs/blob/main/books/ai-systems-performance-engineering/chapters/ch03/mps/run_basic_comparison.sh) 会跑两轮：第一轮不开 MPS，第二轮开启 MPS 后运行同一个 demo。两轮使用相同的 worker 数、矩阵大小和运行时长，最后比较所有 worker 完成的总矩阵乘法次数。
 
 ```bash
 # 进入 ch03 代码目录
@@ -4457,3 +4452,15 @@ spec:
 - [Topology-Aware Workload Scheduling（Kubernetes）](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-aware-scheduling/)、[Kubernetes v1.36: Advancing Workload-Aware Scheduling](https://kubernetes.io/blog/2026/05/13/kubernetes-v1-36-advancing-workload-aware-scheduling/)
 - [KAI Scheduler Topology 文档](https://github.com/NVIDIA/KAI-Scheduler/blob/main/docs/topology/README.md)
 - [Volcano Network Topology Aware Scheduling](https://github.com/volcano-sh/website/blob/master/docs/KeyFeatures/NetworkTopologyAware.md)
+
+---
+
+## FAQ
+
+<Accordion title="MIG 是专门针对单卡的，还是多卡也能用？">
+MIG 是**单卡内部**的硬件切分：把**一张 GPU** 切成多个彼此隔离的实例（各有独立的 SM、显存和 cache），供多个小任务分别使用。多卡场景下可以在**每张支持 MIG 的卡上分别开启 MIG**，但每个 MIG 实例只属于它所在的那张物理卡，**不能跨卡合并成更大的实例**。此外，开启 MIG 会禁用该卡的 NVLink P2P，所以依赖多卡 NVLink 互联的大规模训练不适合用 MIG（应整卡使用）。一句话：MIG 是「把单卡切小」，不是「把多卡拼大」。
+</Accordion>
+
+<Accordion title="线程运行时修改 nice 值会不会有问题？">
+不会。`renice`（底层 `setpriority` / `sched_setattr`）可以对**正在运行**的进程 / 线程动态调整 nice，内核会立即按新权重重新参与 CFS 调度，无需重启进程。几点注意：**提高优先级（nice 调为负）需要 root 或 `CAP_SYS_NICE`**，降低优先级普通用户即可；nice 只影响 CFS 普通线程之间**相对**的 CPU 时间分配，不改变程序正确性，也不等于独占 CPU；但不要把关键线程（如 DataLoader、通信辅助线程）的优先级调得过低，否则容易被其他进程抢占，反而拖慢对 GPU 的数据供给。
+</Accordion>
