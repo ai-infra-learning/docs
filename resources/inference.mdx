@@ -1,0 +1,50 @@
+---
+title: "推理"
+description: "LLM Serving、缓存、调度、PD 分离、推测解码与量化"
+---
+
+## 系统概览与实践
+
+- [ai-inference-resources](https://github.com/aerlabsAI/ai-inference-resources) - 面向 AI 推理系统工程师的精选资源合集，涵盖 LLM Serving、GPU Kernel 编程、Attention、量化、分布式推理和生产部署。
+- [Inside vLLM: Anatomy of a High-Throughput LLM Inference System](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html)
+- [vLLM源码解析](https://zhuanlan.zhihu.com/p/691038809)
+- [nano-vllm 源码解析](https://www.bilibili.com/video/BV1xY3wzZEFJ/?spm_id_from=333.337.search-card.all.click&vd_source=e9ad6164e9e6dacc7d15834004d914dc)
+
+## KV Cache
+
+- [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+
+## 调度与批处理
+
+- [SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369)
+- [Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve](https://arxiv.org/abs/2403.02310)
+- [DeepSpeed-FastGen: High-throughput Text Generation for LLMs](https://arxiv.org/abs/2401.08671)
+
+## PD 分离
+
+- [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670)
+- [Splitwise: Disaggregated LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677)
+- [TetriInfer: Inference without Interference](https://arxiv.org/abs/2401.11181)
+- [MemServe: Context Caching for Disaggregated LLM Serving with Elastic Memory Pool](https://arxiv.org/abs/2406.17565)
+- [Mooncake: A KVCache-centric Disaggregated Architecture](https://arxiv.org/abs/2407.00079)
+- [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548)
+
+## 推测解码
+
+- [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)
+- [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318)
+- [Break the Sequential Dependency of LLM Inference Using Lookahead Decoding](https://arxiv.org/abs/2402.02057)
+- [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774)
+- [How Speculative Decoding Boosts vLLM Performance by up to 2.8x](https://blog.vllm.ai/2024/10/17/spec-decode.html)
+
+## 量化
+
+- [PyTorch 官方量化资料](https://docs.pytorch.org/docs/main/quantization.html#introduction-to-quantization)
+- [PyTorch 量化实战项目](https://github.com/Laicheng0830/Pytorch_Model_Quantization/blob/main/pose_estimation.py)
+
+## LLM 应用与 RAG
+
+- [Parrot: Efficient Serving of LLM-based Applications with Semantic Variable](https://arxiv.org/abs/2405.19888)
+- [Towards End-to-End Optimization of LLM-based Applications with Ayo](https://arxiv.org/abs/2407.00326)
+- [CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion](https://arxiv.org/abs/2405.16444)
+- [METIS: Fast Quality-Aware RAG Systems with Configuration Adaptation](https://arxiv.org/abs/2412.10543)

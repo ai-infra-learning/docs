@@ -9,10 +9,12 @@ export const ResourceCard = ({ filename, title, description, href }) => {
     <a className="group cursor-pointer pb-8" href={href}>
       <img
         src={`/images/hero-${filename}.png`}
+        alt={`${title} 分类插图`}
         className="block dark:hidden pointer-events-none group-hover:scale-105 transition-all duration-100"
       />
       <img
         src={`/images/hero-${filename}-dark.png`}
+        alt={`${title} 分类插图`}
         className="pointer-events-none group-hover:scale-105 transition-all duration-100 hidden dark:block"
       />
       <h3 className="mt-5 text-gray-900 dark:text-zinc-50 font-medium">
@@ -24,10 +26,10 @@ export const ResourceCard = ({ filename, title, description, href }) => {
 };
 
 <div className="grid sm:grid-cols-2 gap-x-6 gap-y-4">
-  <ResourceCard filename="rocket" title="课程" href="/resources/courses" />
-  <ResourceCard filename="cli" title="视频" href="/resources/videos" />
-  <ResourceCard filename="editor" title="论文" href="/resources/papers" />
-  <ResourceCard filename="components" title="博客" href="/resources/blogs" />
-  <ResourceCard filename="rocket" title="书籍" href="/resources/books" />
-  <ResourceCard filename="components" title="合集" href="/resources/collections" />
+  <ResourceCard filename="rocket" title="LLM 基础" description="Transformer、GPT 实现与入门课程" href="/resources/llm-foundations" />
+  <ResourceCard filename="editor" title="训练" description="预训练、Scaling、分布式训练与 RL" href="/resources/training" />
+  <ResourceCard filename="cli" title="推理" description="Serving、缓存、调度、PD 分离与量化" href="/resources/inference" />
+  <ResourceCard filename="components" title="GPU 编程" description="CUDA、Triton、CUTLASS 与 Kernel 优化" href="/resources/gpu-programming" />
+  <ResourceCard filename="rocket" title="性能分析" description="Roofline、Benchmark、Nsight 与 Profiling" href="/resources/performance-analysis" />
+  <ResourceCard filename="editor" title="Agent" description="Coding Agent、Harness Engineering 与自动化研究" href="/resources/agents" />
 </div>

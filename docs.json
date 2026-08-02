@@ -97,14 +97,14 @@
             ]
           },
           {
-            "group": "资料分类",
+            "group": "主题分类",
             "pages": [
-              "resources/courses",
-              "resources/videos",
-              "resources/papers",
-              "resources/blogs",
-              "resources/books",
-              "resources/collections"
+              "resources/llm-foundations",
+              "resources/training",
+              "resources/inference",
+              "resources/gpu-programming",
+              "resources/performance-analysis",
+              "resources/agents"
             ]
           }
         ]
