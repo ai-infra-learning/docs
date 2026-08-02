@@ -102,6 +102,7 @@
               "resources/llm-foundations",
               "resources/training",
               "resources/inference",
+              "resources/rag",
               "resources/gpu-programming",
               "resources/performance-analysis",
               "resources/agents"

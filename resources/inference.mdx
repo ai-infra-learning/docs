@@ -54,11 +54,9 @@ description: "LLM Serving、缓存、调度、PD 分离、推测解码与量化"
 | [PyTorch 官方量化资料](https://docs.pytorch.org/docs/main/quantization.html#introduction-to-quantization) | 官方文档 | 汇总 PyTorch 量化的核心概念、后训练量化、量化感知训练、相关 API 和后端支持。 |
 | [PyTorch 量化实战项目](https://github.com/Laicheng0830/Pytorch_Model_Quantization/blob/main/pose_estimation.py) | 实践项目 | 以姿态估计模型为例演示 PyTorch 模型量化、校准、转换和量化前后的推理结果比较。 |
 
-## LLM 应用与 RAG
+## LLM 应用系统
 
 | 资源 | 类型 | 简介 |
 |------|------|------|
 | [Parrot: Efficient Serving of LLM-based Applications with Semantic Variable](https://arxiv.org/abs/2405.19888) | 论文 | 用 Semantic Variable 暴露多个 LLM 请求之间的数据流关系，让 Serving 系统执行跨请求分析、调度和缓存优化。 |
 | [Teola: Towards End-to-End Optimization of LLM-based Applications](https://arxiv.org/abs/2407.00326) | 论文 | 将应用工作流表示为细粒度数据流图，跨 LLM 与非 LLM 组件执行并行、流水线和端到端调度优化。 |
-| [CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion](https://arxiv.org/abs/2405.16444) | 论文 | 复用不同知识块的 KV Cache，并选择性重算少量 Token 以融合跨块注意力，在保持生成质量的同时降低 RAG 的 TTFT。 |
-| [METIS: Fast Quality-Aware RAG Systems with Configuration Adaptation](https://arxiv.org/abs/2412.10543) | 论文 | 联合调度查询并按请求调整检索块数量和答案合成策略，在生成质量与响应延迟之间动态权衡。 |
