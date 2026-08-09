@@ -4,26 +4,25 @@ title: "第十五章：多节点大模型推理——并行部署、解码优化
 
 ## 本章概要
 
-本章分析多节点大模型推理中的资源组织、模型并行、MoE 路由与解码优化。Kimi K3 已公开的模型规模用于说明超大 MoE 的系统约束：2.8T 参数和 896 个专家要求模型权重分布在加速器集群中；每个 token 在 MoE 层形成 16 个 token-to-expert assignment，并由运行时完成物理映射、Dispatch、专家计算和 Combine。
-
-> **案例边界：**下文关于 Kimi K3 模型配置的陈述均以所引官方资料为依据。PD 分离、EAGLE、Medusa 和 XGrammar 仅用于分析通用推理技术，不构成对 Kimi K3 线上部署方案的判断。
-
-本章的分析范围包括：
+本章从端到端服务指标出发，分析多节点大模型推理的阶段资源组织、模型并行、MoE 执行路径与解码优化，重点包括：
 
 1. Prefill 与 Decode 的负载特征、资源竞争及分离部署；
-2. TP、PP、EP、DP 和 CP 对权重、专家、上下文及请求的切分方式；
-3. MoE gating 产生逻辑专家选择后，运行时对 assignment 的物理映射与通信；
-4. Dispatch、专家计算和 Combine 组成的 MoE 层关键路径；
-5. 投机解码对 Target Model 串行调用次数的影响；
-6. 受约束解码对输出合法性与解码开销的影响。
+2. Tensor、Pipeline、Expert、Context 和 Data Parallelism（TP、PP、EP、CP 和 DP）的切分与组合，以及主要用于训练激活节省的 Megatron Sequence Parallelism（SP）；
+3. MoE gating 产生逻辑专家选择后，运行时将 token—专家分配记录（token-to-expert assignment）映射到物理设备；
+4. Dispatch、专家计算和 Combine 构成的 MoE 层关键路径；
+5. 投机解码对 Target Model 串行调用次数的影响。
 
-全文围绕两个相互关联的系统问题展开：**并行策略确定计算与状态的物理布局，动态路由确定 token 的运行时执行路径。** Prefill/Decode 分离、投机解码和受约束解码分别对应阶段资源组织、生成效率与输出约束。各项方案最终应以 TTFT、TPOT 和 goodput 等端到端服务指标评估，而不能仅依据局部算子性能。
+本章的主线是：**并行策略确定计算与状态的物理布局，运行时路由确定 token 的执行路径。** Prefill/Decode 分离和投机解码分别优化阶段资源组织与生成效率；所有方案最终均以 TTFT、TPOT 和 goodput 等端到端指标评价，而不能只依据局部算子性能。
+
+<Frame caption="多节点推理的模型布局与运行时路由">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-generated-reading-mainline.svg" alt="多节点推理的模型布局与运行时路由" />
+</Frame>
 
 ---
 
 ## 1. 问题背景与系统目标
 
-本节定义多节点推理的服务目标、容量与通信约束，并给出后续章节采用的系统分析框架。
+本节依次定义端到端服务指标、集群容量与通信约束，以及 Prefill 和 Decode 的负载差异。
 
 ---
 
@@ -43,7 +42,7 @@ title: "第十五章：多节点大模型推理——并行部署、解码优化
 
 > **TTFT 和 TPOT 的 SLO attainment 同时达到目标时，系统能够支持的最大请求到达率。**
 
-该指标衡量系统保持目标达标率时的负载上限，并非在实验结束后简单扣除超时请求。后续并行、路由和解码优化均应验证其能否提高延迟目标内完成的请求数量，而不能仅依据局部指标的改善。
+该指标衡量系统在保持目标达标率时能够承受的负载上限，并非在实验结束后简单扣除超时请求。后续并行、路由和解码优化均应验证其能否提高满足 SLO 时的最大可持续请求到达率，而不能只依据局部指标的改善。
 
 ---
 
@@ -51,19 +50,19 @@ title: "第十五章：多节点大模型推理——并行部署、解码优化
 
 ### 1.2 大模型推理的集群化压力
 
-模型达到千亿至万亿参数规模后，推理系统主要受到三类约束：
+模型达到千亿乃至数万亿参数规模后，推理系统主要受到三类约束：
 
 1. **容量约束**：权重、KV cache、激活值和运行时缓冲区共同占用显存，单张 GPU 无法容纳完整模型；
 2. **通信约束**：模型跨设备切分后，激活值、KV cache 和集合通信结果需要在设备间传输；
 3. **调度与负载均衡约束**：请求长度、并发度和专家选择随时间变化，静态资源分配可能产生排队与热点。
 
-MoE（Mixture of Experts）进一步增加了上述系统压力。MoE 配置大量专家网络，每个 token 仅激活其中一部分，使模型总容量的增长快于单 token 计算量的增长。然而，未被当前 token 选中的专家权重仍需驻留在集群中，激活值也需要传输至目标专家所在设备。
+MoE（Mixture of Experts）进一步放大了这些压力。MoE 配置大量专家网络，每个 token 仅激活其中一部分，使模型总容量的增长快于单 token 计算量的增长。在常规低延迟部署中，全部专家权重通常需要驻留在集群设备内；若采用分层存储或按需加载，还需计入权重预取与传输开销。与此同时，token 激活必须被发送到目标专家所在设备。
 
 | MoE 特征 | 系统压力 | 设计目标 |
 | --- | --- | --- |
 | 总参数量较大 | 单卡无法容纳全部专家权重 | 设计模型与专家切分策略 |
-| 每个 token 仅激活少数专家 | 计算稀疏，但全部权重仍需常驻 | 控制显存与计算成本 |
-| 不同 token 选择不同专家 | GPU 间产生动态且不均匀的数据交换 | 优化 all-to-all 并抑制热点 |
+| 每个 token 仅激活少数专家 | 计算稀疏，但模型总权重仍需部署 | 控制显存与单 token 计算成本 |
+| 不同 token 选择不同专家 | GPU 间产生动态且不均匀的多对多激活交换 | 优化 All-to-All 并抑制热点 |
 
 #### Kimi K3 的模型规模及其系统影响
 
@@ -73,65 +72,30 @@ Kimi K3 的公开配置可用于量化上述系统约束：
 | --- | ---: | --- |
 | **总参数量** | **2.8T（2.8 万亿）** | 全部专家权重必须分布在加速器集群中 |
 | **每 token 激活参数量** | **104B（1040 亿）** | 激活参数数量超过一个 70B Dense 模型的总参数量；这不等同于 FLOPs 或延迟按比例增加 |
-| **专家配置** | **896 个专家，每次激活 16 个** | 每个 token 形成 16 个逻辑专家分配；多个专家可能位于同一物理 rank |
-| **上下文窗口** | **100 万 token** | 长 Prompt 会放大 Prefill、状态管理和缓存压力 |
+| **专家配置** | **896 个专家，每次激活 16 个** | 每个 token 形成 16 个逻辑专家分配；多个专家可能位于同一通信 rank（通常对应一个 GPU 进程） |
+| **上下文窗口** | **100 万 token** | 长 prompt 会放大 Prefill、状态管理和缓存压力 |
 
-> **常驻状态：**稀疏激活不会减少全部专家权重的存储需求。896 个专家的权重仍需在集群中存储、加载和管理，稀疏性仅体现在单个 token 实际执行的专家子集。
+> **规模含义：** 稀疏激活只减少单个 token 实际执行的专家子集，并不减少模型总权重的部署需求。Kimi K3 每个 token 激活约 104B 参数，已超过一个 70B Dense 模型的总参数量；但参数量不能直接换算为 FLOPs、内存访问量或执行延迟。
 
-> **计算规模：**Kimi K3 每个 token 激活约 104B 参数，已超过一个 70B Dense 模型的总参数量。参数量不能直接等价为 FLOPs、内存访问量或执行延迟，但该规模表明：MoE 降低的是单 token 计算成本相对于总参数量的增长率，而非将超大模型推理转换为小模型推理。
+只计算纯权重，2.8T 参数也已达到 TB 级。下表按十进制 GB/TB 和 NVIDIA 公布的单卡显存容量，估算容纳全部权重所需的理论最少 GPU 数量：
 
-只计算纯权重，2.8T 参数也已达到 TB 级：
+| 权重格式 | 理论权重容量 | A100 80GB | H200 141GB | B200 180GB |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 / FP16（2 Bytes） | 约 **5.6 TB** | **70 张** | **40 张** | **32 张** |
+| FP8（1 Byte） | 约 **2.8 TB** | **35 张** | **20 张** | **16 张** |
+| 4-bit（0.5 Byte） | 约 **1.4 TB** | **18 张** | **10 张** | **8 张** |
 
-| 权重格式 | 理论原始容量 |
-| --- | ---: |
-| BF16 / FP16（2 Bytes） | 约 **5.6 TB** |
-| FP8（1 Byte） | 约 **2.8 TB** |
-| 4-bit（0.5 Byte） | 约 **1.4 TB** |
+以 BF16 权重为例，即使完全占用每张 GPU 的显存，也至少需要 70 张 A100 80GB、40 张 H200 或 32 张 B200。若按常见的 8-GPU 节点配置向上取整，分别对应 9 个节点（72 张 A100）、5 个节点（40 张 H200）和 4 个节点（32 张 B200）。
 
-这些数字尚未包含量化 scale、KV cache、激活值、通信缓冲区和运行时开销。因此，部署设计必须解决模型状态的集群级布局，以及 token activation 到目标计算单元的高效传输。
+> **估算边界：** 上述结果只计算权重，并假设权重可以无碎片地跨 GPU 切分。实际部署还需为量化 scale、KV cache、激活值、通信缓冲区、CUDA 上下文和显存碎片预留空间，同时满足专家与并行组的切分约束，因此实际 GPU 数量通常高于该理论下限。这些数字不代表 Kimi K3 的实际部署配置。
 
-> 数据来源：[Kimi K3 官方技术博客](https://www.kimi.com/zh-cn/blog/kimi-k3)与 [Kimi K3 技术报告](https://arxiv.org/abs/2607.24653)。专家比例和激活参数比例由官方数字计算得到；权重容量为不含额外开销的理论估算。
+> 数据来源：[Kimi K3 官方技术博客](https://www.kimi.com/zh-cn/blog/kimi-k3)与 [Kimi K3 技术报告](https://arxiv.org/abs/2607.24653)。GPU 显存规格来自 NVIDIA 官方页面：[A100 80GB](https://www.nvidia.com/en-us/data-center/a100/)、[H200 141GB](https://www.nvidia.com/en-us/data-center/h200/) 和 [DGX B200](https://www.nvidia.com/en-us/data-center/dgx-b200/)；B200 单卡 180GB 由 DGX B200 的 8 GPU、总计 1,440GB HBM3e 计算得到。
 
----
-
-### 1.3 分析框架：模型布局与动态路由
-
-多节点推理可分为模型布局与运行时路由两个相互关联的层次：
-
-<Frame caption="多节点推理的模型布局与运行时路由">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-generated-reading-mainline.svg" alt="多节点推理的模型布局与运行时路由" />
-</Frame>
-
-#### 模型布局
-
-TP、PP、EP、DP 和 CP 分别切分张量、层、专家、请求和上下文，并共同决定：
-
-- 权重与状态能否容纳于目标集群；
-- 各 GPU 承担的计算与状态；
-- 推理过程涉及的通信模式；
-- 单请求延迟与整体吞吐之间的资源分配。
-
-#### 运行时路由
-
-采用 Expert Parallelism 后，专家分布在不同 GPU 上。模型 gating 确定每个 token 对应的逻辑专家，运行时系统进一步负责：
-
-- 通过 all-to-all 将 activation 分发至目标专家；
-- 对热点专家实施容量控制、复制或重新放置；
-- 根据通信、排队和专家负载执行反馈控制。
-
-因此，并行策略定义专家的物理布局，动态路由实现 token-to-expert assignment 的运行时执行。
-
-其余三类优化分别处理阶段资源组织、Decode 串行依赖和结构化输出：
-
-| 技术 | 分析目标 |
-| --- | --- |
-| **Prefill/Decode 分离** | 评估两个负载特征不同的阶段是否应共享 GPU |
-| **投机解码** | 减少 Target Model 的串行调用次数 |
-| **受约束解码** | 保证 JSON、grammar 等输出的语法合法性，并控制附加开销 |
+上述容量与通信约束决定模型能否部署；部署完成后，在线服务还要解决不同阶段如何共享集群资源。一次请求依次经历 Prefill 和 Decode，两者的计算特征与延迟目标并不相同。
 
 ---
 
-### 1.4 必要背景：Prefill 与 Decode 是两种不同的负载
+### 1.3 Prefill 与 Decode 的负载差异
 
 一次 LLM 推理可以分为 Prefill 和 Decode 两个阶段：
 
@@ -142,20 +106,13 @@ TP、PP、EP、DP 和 CP 分别切分张量、层、专家、请求和上下文�
 
 | 维度 | Prefill | Decode |
 | --- | --- | --- |
-| 主要任务 | 处理完整 Prompt，建立 KV cache | 读取并扩展 KV cache，逐 token 生成 |
+| 主要任务 | 处理完整 prompt，建立 KV cache | 读取并扩展 KV cache，逐 token 生成 |
 | 计算形态 | 大规模、并行度较高的矩阵计算 | 多次小规模、存在串行依赖的迭代 |
 | 典型瓶颈 | 更接近 Compute-Bound | 更接近 Memory-Bound |
 | 主要影响指标 | TTFT | TPOT |
-| 调优重点 | Prompt 处理吞吐和首 token 延迟 | 显存带宽、KV cache 容量和稳定输出延迟 |
+| 调优重点 | prompt 处理吞吐和首 token 延迟 | 显存带宽、KV cache 容量和稳定输出延迟 |
 
-Compute-Bound 与 Memory-Bound 是典型概括，不是所有模型和 batch 配置下的绝对结论，实际瓶颈仍需通过 profiling 确认。重要的是：**Prefill 和 Decode 的最优批处理、并行配置与扩容依据并不相同。**
-
-把二者放在同一批 GPU 上时：
-
-- 长 Prefill 可能阻塞正在生成的请求，使 TPOT 变差；
-- 优先执行 Decode 又会推迟新请求，使 TTFT 变差。
-
-这种现象称为 **Prefill-Decode Interference**。对应的两类处理方案是将两个阶段部署到独立资源池，以及在共享资源池中使用 Chunked Prefill 限制干扰。
+Compute-Bound 与 Memory-Bound 是典型概括，不是所有模型和 batch 配置下的绝对结论，实际瓶颈仍需通过 profiling 确认。关键在于，Prefill 和 Decode 的最优批处理、并行配置与扩容依据并不相同，共置部署因而可能产生阶段间资源竞争。第 2 节将量化这种干扰，并比较独立资源池与 Chunked Prefill 两类处理方案。
 
 ---
 
@@ -163,9 +120,7 @@ Compute-Bound 与 Memory-Bound 是典型概括，不是所有模型和 batch 配
 
 ## 2. Prefill/Decode 分离
 
-Prefill 与 Decode 具有不同的计算形态和延迟目标。两个阶段共置时会竞争计算、显存带宽和调度时隙；分离部署则引入 KV cache 传输、跨池调度和独立容量规划。本节分析两类方案的收益条件与新增成本。
-
-> **结论：**PD 分离不减少模型计算量，其作用是隔离 Prefill 与 Decode 的资源竞争，使 TTFT 与 TPOT 可以独立优化。本节数据参考 [AI Infra Learning Docs — PD 分离](https://github.com/ai-infra-learning/docs/blob/main/talks/06-disaggregating-prefill-and-decoding.mdx) 与 [DistServe](https://arxiv.org/abs/2401.09670)。
+Prefill 与 Decode 的计算形态和延迟目标不同。分离部署不减少模型计算量，但可以隔离两个阶段的资源竞争，使 TTFT 与 TPOT 独立优化；相应代价是 KV cache 传输、跨池调度和独立容量规划。本节分析阶段干扰、分离架构及其适用条件，数据参考 [AI Infra Learning Docs — PD 分离](https://github.com/ai-infra-learning/docs/blob/main/talks/06-disaggregating-prefill-and-decoding.mdx) 与 [DistServe](https://arxiv.org/abs/2401.09670)。
 
 ### 2.1 共置部署中的阶段干扰
 
@@ -179,7 +134,7 @@ Prefill 与 Decode 具有不同的计算形态和延迟目标。两个阶段共�
 
 这种结构性冲突称为 **Prefill-Decode Interference**。DistServe 在 13B 模型上向 Decode batch 插入一个 Prefill，得到以下结果：
 
-| Prompt 长度 | 混合 batch 的 Decode 延迟 / 纯 Decode 延迟 |
+| prompt 长度 | 混合 batch 的 Decode 延迟 / 纯 Decode 延迟 |
 | --- | ---: |
 | 128 token | 约 **1.8×** |
 | 1024 token | 约 **12.6×** |
@@ -190,15 +145,13 @@ Prefill 与 Decode 具有不同的计算形态和延迟目标。两个阶段共�
 
 *论文原图：左、右分别为插入长度 128 和 1024 的 Prefill Job 后，混合 batch 的执行时间。来源：[DistServe](https://arxiv.org/abs/2401.09670)，Figure 2。*
 
-> **实验观察：**Prompt 变长时，混合 batch 中的 decode 请求被迫等待更长的 prefill，阶段干扰会迅速放大。
-
-Prompt 变长后，所有 Decode 请求都要等待更大规模的 Prefill 结束。图中的 12.6× 是这组干扰实验的 Decode 延迟倍率，不是 PD 分离的通用加速比。
+> **实验观察：** 在该实验中，prompt 从 128 增至 1024 token 后，混合 batch 的 Decode 延迟倍率由约 1.8× 增至 12.6×。该结果说明长 Prefill 会显著放大阶段干扰，但 12.6× 不是 PD 分离的通用加速比。
 
 ### 2.2 独立 Prefill Pool 与 Decode Pool
 
-Disaggregated Prefill and Decode（Disagg PD）把请求拆成两段执行：
+Prefill/Decode 分离部署（disaggregated prefill and decoding，以下简称 PD 分离）将请求拆成两个阶段执行：
 
-1. Prefill Pool 处理完整 Prompt 并建立 KV cache；
+1. Prefill Pool 处理完整 prompt 并建立 KV cache；
 2. Decode Pool 接收中间状态并继续逐 token 生成；
 3. Scheduler 选择两类 Worker，并协调阶段交接。
 
@@ -210,9 +163,11 @@ Disaggregated Prefill and Decode（Disagg PD）把请求拆成两段执行：
 
 | 维度 | Prefill Pool | Decode Pool |
 | --- | --- | --- |
-| 主要目标 | 降低 TTFT，提高 Prompt 处理能力 | 降低并稳定 TPOT |
-| 并行选择 | 严格 TTFT 下使用 TP；超长上下文可叠加 CP | 常用 DP 扩请求吞吐；配置仍受 TPOT 约束 |
-| 扩容依据 | 输入 token 到达率和 Prompt 长度 | 活跃序列数和输出 token 速率 |
+| 主要目标 | 降低 TTFT，提高 prompt 处理能力 | 降低并稳定 TPOT |
+| 资源配置侧重 | 为长 prompt 提供计算并行度；超长上下文需要分摊序列状态 | 扩展并发请求容量，同时保持单 token 延迟稳定 |
+| 扩容依据 | 输入 token 到达率和 prompt 长度 | 活跃序列数和输出 token 速率 |
+
+两个资源池可以根据各自的容量与延迟约束采用不同的 TP、PP、CP 或 DP 组合，具体定义和组合方式见第 3 节。
 
 > **PD 分离不等于“Prefill 一定用大 batch，Decode 一定用小 batch”。** 它提供的是独立寻找两个阶段计算饱和点和 SLO 边界的能力。
 
@@ -220,44 +175,48 @@ DistServe 报告，在其特定模型、请求分布、TTFT/TPOT SLO 和目标 S
 
 ### 2.3 KV cache Handoff 的新增成本
 
-两个资源池通常各自承载模型权重或模型并行实例，因此分离还会增加权重驻留、实例预热和容量碎片。阶段边界不仅要交接 KV cache，还要传递当前生成位置、采样参数、停止条件和已生成 token ID 等请求元数据。占主导的数据传输时间可以粗略写为：
+两个资源池通常各自承载模型权重或模型并行实例，因此分离还会增加权重驻留、实例预热和容量碎片。阶段边界不仅要交接 KV cache，还要传递当前生成位置、采样参数、停止条件和已生成 token ID 等请求元数据。Handoff 延迟可以粗略拆成固定开销与按数据量增长的传输开销：
 
 $$
-T_{handoff}\approx T_{startup}+\frac{S_{KV}}{B_{effective}}
+T_{handoff}\approx T_{fixed}+\frac{S_{KV}}{B_{effective}}
 $$
 
-其中 $S_{KV}$ 是 KV cache 大小，$B_{effective}$ 是端到端有效带宽。真正的成立条件是：
+其中，$T_{fixed}$ 是每次 Handoff 在批量数据传输前后的固定延迟，包括调度决策、控制元数据交换、源端与目标端同步、通信操作启动和首字节网络延迟；它不表示模型加载或 Worker 冷启动。$S_{KV}$ 是 KV cache 大小，$B_{effective}$ 是端到端有效带宽。
+
+若只比较请求关键路径上的延迟，PD 分离成立的必要条件可近似写为：
 
 $$
-\text{隔离干扰带来的收益}
+\Delta T_{interference}
 >
-T_{handoff}+\text{额外调度与运维成本}
+T_{handoff}+\Delta T_{scheduling}+\Delta T_{queueing}
 $$
 
-DistServe 对 OPT-175B 做过理想化估算：若每个 token 的 KV cache 约为 4.5 MB，2048 token 对应约 9.2 GB；在假设的 8×64 GB/s 聚合路径下，理论传输时间约为 17.6 ms。
+其中 $\Delta T_{interference}$ 表示共置部署中被隔离掉的阶段干扰，后两项表示分离后新增的调度与排队时间。额外权重副本、容量碎片和运维复杂度不属于同一延迟量纲，应通过 goodput、GPU 数量或总体成本单独评估。
+
+DistServe 对 OPT-175B 做过理想化估算：若每个 token 的 KV cache 约为 4.5 MB，2048 token 对应约 9.2 GB；若八条 64 GB/s 链路可被该传输并行且充分利用，理论传输时间约为 17.6 ms。
 
 > **17.6 ms 不是一般部署的实测值。** 它假设聚合带宽充分兑现、没有 Host 中转和链路争用。生产环境应测量 P95/P99 Handoff 延迟，并确认 GPUDirect RDMA 等直接路径真正生效。
 
-Mooncake 将这一思路进一步扩展为 KV-cache-centric 架构：KV cache 不只是请求附属数据，而是可在 GPU VRAM、CPU DRAM 和 SSD 之间路由、复用和分层存储的集群资源。
+进一步地，[Mooncake](https://arxiv.org/abs/2407.00079) 将 KV cache 视为可在 GPU VRAM、CPU DRAM 和 SSD 之间路由、复用和分层存储的集群资源，用于缓解跨池交接与缓存复用问题。该架构同时引入分层存储、传输调度和一致性管理，不等同于基础 PD 分离。
 
 ### 2.4 Chunked Prefill：保留共享资源池
 
-PD 分离不是唯一方案。[SARATHI](https://arxiv.org/abs/2308.16369) 将长 Prompt 拆成受 token budget 限制的 Chunk，每轮先安排延迟敏感的 Decode token，再用剩余预算执行 Prefill：
+PD 分离不是唯一方案。[SARATHI](https://arxiv.org/abs/2308.16369) 将长 prompt 划分为受每轮 token 预算限制的分块（chunk），每轮先安排延迟敏感的 Decode token，再用剩余预算执行 Prefill：
 
 ```text
-每轮 token budget = Decode token + Prefill Chunk token
+每轮 token budget = Decode token + Prefill chunk token
 ```
 
-这样既能限制单次 Prefill 对 Decode 的阻塞，又可以让 Decode 搭载在 Prefill 的矩阵计算中复用权重读取。Chunk 越小，阻塞越短，但矩阵效率和历史 KV 读取成本也可能变差，因此 chunk size 需要通过 profiling 选择。
+这样可以将少量 Decode token 与 Prefill 分块组成混合 batch，既限制单轮 Prefill 的阻塞时间，也摊薄权重读取成本。chunk 越小，阻塞时间越短，但矩阵效率和历史 KV 读取成本可能变差，因此需要通过 profiling 选择 chunk size。
 
 | | Chunked Prefill | PD 分离 |
 | --- | --- | --- |
 | 资源组织 | P/D 共享 GPU | P/D 使用独立资源池 |
 | 优势 | 资源共享充分，无跨池 KV Handoff | 干扰隔离彻底，可独立调优与扩容 |
-| 代价 | 仍有资源竞争，Chunk 参数敏感 | 网络、调度和容量规划更复杂 |
+| 代价 | 仍有资源竞争，chunk 参数敏感 | 网络、调度和容量规划更复杂 |
 | 更适合 | 集群较小、SLO 可折中 | TTFT/TPOT 都严格、负载差异大、网络条件好 |
 
-二者也可以组合：Prefill Pool 内部对超长 Prompt 分块，再将 KV cache 流水传给 Decode Pool。最终选择取决于**在哪个层级共享资源、在哪个层级隔离干扰**。
+二者也可以组合：Prefill Pool 内部对超长 prompt 分块，再将 KV cache 流水传给 Decode Pool。最终选择取决于 **在哪个层级共享资源、在哪个层级隔离干扰**。
 
 ### 2.5 采用条件
 
@@ -288,56 +247,162 @@ PD 分离更适合以下场景：
 
 ```text
 单层权重或计算超过设备能力   → 层内切分：TP
+TP 组内训练激活重复存储      → 序列激活切分：SP
 模型深度导致整体容量不足     → 层间切分：PP
 MoE 专家总状态超过设备容量   → 专家切分：EP
 单实例请求吞吐不足           → 实例复制：DP
-单请求上下文超过设备能力     → 序列切分：CP
+单请求上下文超过设备能力     → Attention 上下文切分：CP
 ```
 
-五种策略的切分对象、通信模式与主要代价如下：
+六种策略的切分对象、通信模式与主要代价如下。SP 通常复用 TP group，是 TP 的激活内存优化，而不是独立扩大的并行维度：
 
 | 策略 | 切分对象 | 主要解决的问题 | 关键通信 | 主要代价 |
 | --- | --- | --- | --- | --- |
-| **Tensor Parallelism（TP）** | 一层内部的权重矩阵和计算 | 单层太宽；希望降低单实例计算延迟 | 每层或子层执行 All-Reduce / All-Gather | 通信频繁，依赖高速互联 |
+| **Tensor Parallelism（TP）** | 一层内部的权重矩阵和计算 | 单层太宽；希望降低单实例计算延迟 | 每层或子层执行 All-Reduce | 通信频繁，依赖高速互联 |
+| **Sequence Parallelism（SP）** | TP 组内非 TP 区域的 sequence activation | LayerNorm、Dropout 等训练激活重复存储 | All-Gather / Reduce-Scatter | collective 次数增加；通常需与 TP 配合 |
 | **Pipeline Parallelism（PP）** | Transformer 层 | 模型太深，单个设备或 TP 组容纳不下 | stage 之间传递激活值 | pipeline bubble，单请求路径变长 |
-| **Expert Parallelism（EP）** | MoE 专家 | 专家总参数量太大 | MoE 层前后执行 all-to-all | 通信密集，容易出现专家负载不均 |
+| **Expert Parallelism（EP）** | MoE 专家 | 专家总参数量太大 | MoE 层前后执行 All-to-All | 通信密集，容易出现专家负载不均 |
 | **Data Parallelism（DP）** | 请求；模型实例整体复制 | 单实例吞吐不足 | 推理副本通常独立工作 | 每个副本都要占用权重和缓存空间 |
-| **Context Parallelism（CP）** | 单个请求的序列位置 | 上下文太长，单卡 KV cache 或 Prefill 压力过大 | 交换 K/V Block 或 Attention 中间结果 | Attention 实现复杂，短序列收益有限 |
+| **Context Parallelism（CP）** | Attention 的上下文位置 | 上下文太长，单卡 KV cache 或 Attention 压力过大 | 交换 K/V Block 或 Attention 中间结果 | Attention 实现复杂，短序列收益有限 |
 
-> **切分维度：**TP 切层内，PP 切层间，EP 切专家，DP 切请求，CP 切序列。
+> **切分维度：** TP 切层内权重与计算，SP 切 TP 组内非 TP 区域的训练激活，PP 切层间，EP 切专家，DP 切请求，CP 切 Attention 上下文。
 
-三种集合通信的语义与典型用途如下：
+四种集合通信的语义与典型用途如下：
 
 | 通信操作 | 直观含义 | 常见用途 |
 | --- | --- | --- |
 | **All-Reduce** | 每张卡先计算局部结果，再求和并让所有卡拿到合并结果 | TP 合并局部计算 |
-| **All-Gather** | 每张卡持有一部分数据，交换后让参与者获得完整数据 | TP/CP 收集分片 |
-| **all-to-all** | 每张卡都向其他卡发送不同的数据 | EP 将 token 分发给专家并收回结果 |
+| **All-Gather** | 每张卡持有一部分数据，交换后让参与者获得完整数据 | SP 从 sequence shard 恢复完整激活 |
+| **Reduce-Scatter** | 先对各卡数据求和，再让每张卡保留结果的一部分 | SP 将 TP 输出规约并切回 sequence shard |
+| **All-to-All** | 每张卡都向其他卡发送不同的数据 | EP 将 token 分发给专家并收回结果 |
 
-<Frame caption="Megatron-LM 中 Tensor Parallelism 与 Pipeline Parallelism 的组合">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-megatron-fig2-tp-pp.png" alt="Megatron-LM 中 Tensor Parallelism 与 Pipeline Parallelism 的组合" />
-</Frame>
-
-*论文原图：Megatron-LM 在每个 Transformer layer 内使用 TP，再沿模型深度使用 PP。图来自训练论文，但“高频层内通信放在小组内、较粗粒度激活跨 stage 传递”的组织方式同样适用于理解推理。来源：[Megatron-LM](https://arxiv.org/abs/2104.04473)，Figure 2。*
-
-> **实验观察：**TP 与 PP 不是二选一：TP 在层内形成高频通信组，PP 沿层深度传递激活，两种通信应映射到不同层级的物理互联。
-
-五种策略可以组合，但不是简单地把并行度相乘。生产级 MoE 实例往往建立多组彼此交叠的通信组：Dense 层使用 TP，MoE 层使用 EP，模型仍放不下时再用 PP；单实例配置稳定后，通过 DP 增加副本；只有超长上下文确有需要时才叠加 CP。
+这些策略可以组合，但并非所有并行度都构成相互独立的乘积。例如，SP 复用 TP group，而 EP 在不同框架中也可能与 TP 或 DP 维度重组。各策略的组合方式将在 3.7 节统一讨论。
 
 ---
 
 ### 3.2 Tensor Parallelism（TP）：层内并行与集合通信约束
 
-> **结论：**TP 让多张 GPU 同时计算同一层，从而分摊权重并缩短计算时间；代价是几乎每层都要同步，因此只能在高速互联域内有效扩展。
+> **结论：** TP 让多张 GPU 同时计算同一层，从而分摊权重并缩短计算时间；代价是几乎每层都要同步，因此只能在高速互联域内有效扩展。
 
-TP 将同一层中的权重矩阵按行或按列切分。每张 GPU 只保存并计算其中一部分，随后通过集合通信合并局部结果。
+TP 将同一层中的权重矩阵按行或按列切分。每张 GPU 只保存并计算其中一部分，随后通过集合通信合并局部结果。TP 的特点是 **计算和通信都发生在每一层内部**。所有参与设备必须保持接近同步：其中一张 GPU 或一条链路变慢，整组设备都会等待。因此，TP 的性能上限很大程度上由互联带宽和集合通信延迟决定。
 
-<Frame caption="Tensor Parallelism 的层内切分">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-generated-tensor-parallelism.svg" alt="Tensor Parallelism 的层内切分" />
+#### 经典案例：Megatron-LM 的 Attention 与 MLP 张量并行
+
+经典 Megatron-LM 将 Transformer 中成对出现的线性层组织为“列并行输入投影 + 行并行输出投影”。设 TP group 包含 $p$ 个 rank，输入 hidden state $X$ 在各 rank 上保持一致。
+
+<Frame caption="Megatron-LM 在 MLP 与 Self-Attention 中的张量并行">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-megatron-fig3-tp-attention-mlp.png" alt="Megatron-LM Figure 3：MLP 与 Self-Attention 的列并行、行并行和 f/g 通信算子" />
 </Frame>
 
+*论文原图：上半部分为 MLP，第一个 GEMM 按列切分、第二个 GEMM 按行切分；下半部分为按 attention head 切分的 Self-Attention。$f$ 在前向为 identity、反向执行 All-Reduce；$g$ 在前向执行 All-Reduce、反向为 identity。来源：[Megatron-LM](https://arxiv.org/abs/1909.08053)，Figure 3。*
 
-TP 的特点是**计算和通信都发生在每一层内部**。所有参与设备必须保持接近同步：其中一张 GPU 或一条链路变慢，整组设备都会等待。因此，TP 的性能上限很大程度上由互联带宽和集合通信延迟决定。
+推理只执行前向传播，因此每个 Transformer layer 的主要 TP 通信是 Attention 和 MLP 输出端各一次 All-Reduce。下面同时给出训练反向传播与 SP 的通信量，作为理解 Megatron 并行实现和显存权衡的补充。
+
+<Accordion title="TP 与 SP 的前向、反向通信量">
+
+**Attention 前向传播：**
+
+1. 将 $W_Q$、$W_K$ 和 $W_V$ 按输出维度切分，每个 rank 计算一组完整 attention head 的 $Q_i$、$K_i$ 和 $V_i$；
+2. 每个 rank 在本地完成 $Q_iK_i^T$、softmax 和与 $V_i$ 的乘法，head 内计算不需要跨 rank 通信；
+3. 将输出投影 $W_O$ 按输入维度切分，每个 rank 得到部分结果 $O_i$；
+4. 对部分结果执行 All-Reduce：
+
+$$
+O=\sum_{i=1}^{p}O_i
+$$
+
+**MLP 前向传播：**
+
+设两层 MLP 为 $Y=\operatorname{GeLU}(XW_1)W_2$。$W_1$ 按输出维度切分，每个 rank 独立计算 $Z_i=\operatorname{GeLU}(XW_{1,i})$；逐元素 GeLU 不需要通信。$W_2$ 按输入维度切分，各 rank 计算部分输出 $Y_i=Z_iW_{2,i}$，随后执行 $Y=\sum_iY_i$ 的 All-Reduce。
+
+为同时比较通信次数与数据量，设 Transformer 边界激活包含 $s\times b\times h$ 个元素，每个元素占 $\beta$ 字节，并记完整激活大小为：
+
+$$
+S=sbh\beta
+$$
+
+以下采用 Ring Collective 的带宽模型，统计每个 rank 为完成一次 collective 需要传输的数据量；不统计链路级聚合流量。对于 $p$ 个 rank：
+
+$$
+V_{AR}=2\frac{p-1}{p}S,\qquad
+V_{AG}=V_{RS}=\frac{p-1}{p}S
+$$
+
+其中 $AR$、$AG$ 和 $RS$ 分别表示 All-Reduce、All-Gather 和 Reduce-Scatter。经典 TP 在 Attention 和 MLP 中各有两个通信边界：输入端的 $f$ 与输出端的 $g$。
+
+| 模块与通信位置 | 前向操作 | 前向通信量 / rank | 反向操作 | 反向通信量 / rank |
+| --- | --- | ---: | --- | ---: |
+| Attention 输入端 $f$，进入 $W_Q,W_K,W_V$ 前 | Identity | $0$ | All-Reduce 输入梯度 | $2\frac{p-1}{p}S$ |
+| Attention 输出端 $g$，完成 $W_O$ 后 | All-Reduce 部分输出 | $2\frac{p-1}{p}S$ | Identity | $0$ |
+| MLP 输入端 $f$，进入 $W_1$ 前 | Identity | $0$ | All-Reduce 输入梯度 | $2\frac{p-1}{p}S$ |
+| MLP 输出端 $g$，完成 $W_2$ 后 | All-Reduce 部分输出 | $2\frac{p-1}{p}S$ | Identity | $0$ |
+
+反向传播中的通信位置与前向互补。行并行输出端的上游梯度可以直接分发给各 rank，各 rank 本地计算本分片的激活梯度和权重梯度；继续反传至列并行输入端时，每个 rank 只得到对复制输入 $X$ 的一部分梯度，必须执行 All-Reduce：
+
+$$
+\frac{\partial L}{\partial X}
+=
+\sum_{i=1}^{p}
+\left(\frac{\partial L}{\partial X}\right)_i
+$$
+
+因此，经典 TP 每个 Transformer layer 合计产生 **前向 2 次 All-Reduce、反向 2 次 All-Reduce**。对应的每 rank 通信量为：
+
+| 范围 | 前向通信量 / rank | 反向通信量 / rank | 前向 + 反向 |
+| --- | ---: | ---: | ---: |
+| Attention | $2\frac{p-1}{p}S$ | $2\frac{p-1}{p}S$ | $4\frac{p-1}{p}S$ |
+| MLP | $2\frac{p-1}{p}S$ | $2\frac{p-1}{p}S$ | $4\frac{p-1}{p}S$ |
+| 每个 Transformer layer | $4\frac{p-1}{p}S$ | $4\frac{p-1}{p}S$ | $8\frac{p-1}{p}S$ |
+
+推理只执行前向，因此主要承担两次输出端 All-Reduce；训练还要承担两次输入梯度 All-Reduce。TP 分片内的权重梯度在本 rank 计算，若同时使用 DP，跨副本的梯度同步属于 DP 通信，不应计入这里的 TP 通信。
+
+#### Sequence Parallelism：切分非 TP 区域的激活
+
+经典 TP 切分 Attention 和 MLP 的大矩阵乘，但 LayerNorm、Dropout 和残差连接仍在各 TP rank 上保存完整的 $s\times b\times h$ 激活。Megatron-LM 的 Sequence Parallelism（SP）沿 sequence 维度切分这些非 TP 区域，使每个 rank 只保存约 $S/p$ 的边界激活；进入 TP 区域时恢复完整 sequence，离开 TP 区域时再切回 sequence shard。
+
+<Frame caption="Megatron-LM 中 Tensor Parallelism 与 Sequence Parallelism 的组合">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-megatron-fig5-sequence-parallelism.png" alt="Megatron-LM Figure 5：Attention 与 MLP 两侧通过 All-Gather 和 Reduce-Scatter 在 TP 与 SP 区域之间转换" />
+</Frame>
+
+*论文原图：Attention 与 MLP 是 Tensor Parallel 区域，LayerNorm、Dropout 和残差连接是 Sequence Parallel 区域。$g$ 在前向执行 All-Gather、反向执行 Reduce-Scatter；$\bar g$ 在前向执行 Reduce-Scatter、反向执行 All-Gather。来源：[Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198)，Figure 5。*
+
+SP 将经典 TP 边界上的一次 All-Reduce 拆为一次 Reduce-Scatter 和一次 All-Gather。只计算这些边界 collective 时，Attention 与 MLP 两侧的前向、反向通信量如下：
+
+| 模块与通信位置 | 前向操作 | 前向通信量 / rank | 反向操作 | 反向通信量 / rank |
+| --- | --- | ---: | --- | ---: |
+| Attention 输入端 $g$，SP → TP | All-Gather sequence shard | $\frac{p-1}{p}S$ | Reduce-Scatter 输入梯度 | $\frac{p-1}{p}S$ |
+| Attention 输出端 $\bar g$，TP → SP | Reduce-Scatter 部分输出 | $\frac{p-1}{p}S$ | All-Gather 输出梯度 | $\frac{p-1}{p}S$ |
+| MLP 输入端 $g$，SP → TP | All-Gather sequence shard | $\frac{p-1}{p}S$ | Reduce-Scatter 输入梯度 | $\frac{p-1}{p}S$ |
+| MLP 输出端 $\bar g$，TP → SP | Reduce-Scatter 部分输出 | $\frac{p-1}{p}S$ | All-Gather 输出梯度 | $\frac{p-1}{p}S$ |
+
+但这还不是保留完整 SP 显存收益时的全部反向通信。列并行层的权重梯度需要完整序列输入：
+
+$$
+\nabla W_i=X^T\nabla Y_i
+$$
+
+如果前向只保存 sequence shard $X_i$，而不保留 All-Gather 后的完整 $X$，反向计算权重梯度前必须再次 All-Gather 输入激活。这在每个 Transformer layer 中通常发生两次：Attention 的 QKV 列并行投影一次，MLP 的 $W_1$ 列并行投影一次。
+
+| 反向额外通信位置 | 用途 | 通信量 / rank |
+| --- | --- | ---: |
+| Attention QKV 权重梯度计算前 | All-Gather 保存的输入 shard，重建完整 $X$ | $\frac{p-1}{p}S$ |
+| MLP $W_1$ 权重梯度计算前 | All-Gather 保存的输入 shard，重建完整 $X$ | $\frac{p-1}{p}S$ |
+
+因此需要区分两种统计口径：
+
+| 范围 | 前向通信量 / rank | 反向通信量 / rank | 前向 + 反向 |
+| --- | ---: | ---: | ---: |
+| 经典 TP | $4\frac{p-1}{p}S$ | $4\frac{p-1}{p}S$ | $8\frac{p-1}{p}S$ |
+| TP+SP，仅统计替代 All-Reduce 的边界 collective | $4\frac{p-1}{p}S$ | $4\frac{p-1}{p}S$ | $8\frac{p-1}{p}S$ |
+| TP+SP，只保存 sequence shard 并在反向重建输入 | $4\frac{p-1}{p}S$ | $6\frac{p-1}{p}S$ | $10\frac{p-1}{p}S$ |
+
+论文所说“TP 与 TP+SP 通信带宽相同”，对应第二行：4 次 All-Reduce 等价于 4 次 All-Gather 加 4 次 Reduce-Scatter。实际 Megatron Core 为保留激活显存收益，只保存前向输入 shard，并在反向为权重梯度额外执行 2 次 activation All-Gather；在上述等尺寸近似下，总通信量比经典 TP 高约 25%。实现会将 activation All-Gather 与输入梯度 GEMM 重叠，并将输入梯度 Reduce-Scatter 与权重梯度 GEMM 重叠，因此网络字节数增加不等于关键路径时间按相同比例增加。
+
+如果保留前向 All-Gather 后的完整输入，反向可以避免这两次额外通信，但会失去相应的激活显存节省；冻结权重或仅执行推理时不计算权重梯度，也不需要这两次反向 activation All-Gather。
+
+> **实现边界：** 这里的 SP 是 Megatron-LM 中与 TP 配合使用、以降低训练激活显存为目标的 Sequence Parallelism，不等同于为超长上下文切分 Attention 计算的 Context Parallelism。通信量采用等尺寸边界张量与理想 Ring Collective 模型；QKV/门控投影融合、重计算、梯度累积、collective 算法和框架融合方式均可能改变实际通信字节数与关键路径。来源：[原始 SP 论文](https://arxiv.org/abs/2205.05198) 与 [Megatron Core Tensor Parallel API](https://docs.nvidia.com/megatron-core/developer-guide/0.18.0/apidocs/core/core.tensor_parallel.layers.html)。
+
+</Accordion>
 
 #### TP 同时解决容量和延迟问题
 
@@ -365,19 +430,19 @@ $$
 | 普通跨节点集群 | InfiniBand / RoCE / Ethernet | 延迟更高，应谨慎扩大 TP 组 |
 | 跨机架 NVLink Switch System | 最多可形成 576 GPU 的全连接域 | 说明技术可达规模，不等于 576-way TP 是生产最优配置 |
 
-Blackwell 第五代 NVLink 的聚合双向 GPU-to-GPU 带宽最高可达 1.8 TB/s；NVL72 将高速互联域扩展到 72 张 GPU。即便硬件允许更大规模 TP，生产配置仍应优先考虑**收益递减点**，而不是追求理论上最大的并行度。
+Blackwell 第五代 NVLink 的聚合双向 GPU-to-GPU 带宽最高可达 1.8 TB/s；NVL72 将高速互联域扩展到 72 张 GPU。即便硬件允许更大规模 TP，生产配置仍应优先考虑 **收益递减点**，而不是追求理论上最大的并行度。
 
-因此，TP 的实用原则是：
+TP 的实用原则是：
 
-> **把高频集合通信留在最快的互联域内，并在“节省的计算时间”不再覆盖“新增通信时间”之前停止扩大 TP。**
+> **把高频集合通信限制在最快的互联域内，并在节省的计算时间无法覆盖新增通信时间之前停止扩大 TP。**
 
-因此，常见部署将 TP group 限制在单个 8-GPU 节点或一个 NVSwitch 域内，并使用 PP、EP 或 DP 实现跨节点扩展。
+因此，常见部署将 TP group 限制在单个 8-GPU 节点或一个 NVSwitch 域内，再使用 PP、EP 或 DP 实现跨节点扩展。
 
 ---
 
 ### 3.3 Pipeline Parallelism（PP）：模型容量与流水线延迟
 
-> **结论：**PP 让不同设备保存不同层，主要解决整个模型放不下的问题；单个 token 仍要依次经过全部 stage，因此它通常不用于降低 Decode 延迟。
+> **结论：** PP 让不同设备保存不同层，主要解决整个模型放不下的问题；单个 token 仍要依次经过全部 stage，因此它通常不用于降低 Decode 延迟。
 
 PP 将连续的 Transformer 层分配给不同 GPU 或 GPU 组。例如，一个 60 层模型可以被拆成三个 stage：
 
@@ -386,7 +451,7 @@ PP 将连续的 Transformer 层分配给不同 GPU 或 GPU 组。例如，一个
 </Frame>
 
 
-PP 的主要价值是**分摊模型状态**。只要 stage 间的激活值能够传输，模型就可以跨越多个节点，因此 PP 对互联带宽的要求通常低于每层都要同步的 TP。
+PP 的主要价值是 **分摊模型状态**。只要 stage 间的激活值能够传输，模型就可以跨越多个节点，因此 PP 对互联带宽的要求通常低于每层都要同步的 TP。
 
 #### Prefill 与 Decode 中的 PP 差异
 
@@ -407,9 +472,9 @@ PP 的主要价值是**分摊模型状态**。只要 stage 间的激活值能够
 
 ### 3.4 Expert Parallelism（EP）：专家布局与激活通信
 
-> **结论：**EP 将不同专家分布在不同 GPU 上，以满足 MoE 专家权重的容量约束；每个 MoE 层因此需要执行 token activation 的分发与结果回收。
+> **结论：** EP 将不同专家分布在不同 GPU 上，以满足 MoE 专家权重的容量约束；每个 MoE 层因此需要执行 token activation 的分发与结果回收。
 
-EP 是 MoE 特有的并行方式。假设一个 MoE 层有 16 个专家，分布在 4 张 GPU 上，每张 GPU 保存 4 个专家。Gating Network 为每个 token 选择 top-k 专家后，系统需要完成两次数据重排：
+EP 是 MoE 特有的并行方式。假设一个 MoE 层有 16 个专家，分布在 4 张 GPU 上，每张 GPU 保存 4 个专家。gating network 为每个 token 选择 top-k 专家后，系统需要完成两次数据重排：
 
 1. **Dispatch**：把 token 的激活向量发送到目标专家所在的 GPU；
 2. **Combine**：专家计算完成后，把结果送回原来的 token 顺序并合并。
@@ -419,11 +484,81 @@ EP 是 MoE 特有的并行方式。假设一个 MoE 层有 16 个专家，分布
 </Frame>
 
 
-EP 让专家总数可以随 GPU 数增加，而单个 token 仍只计算少数专家。例如，100 个专家分布在 100 张 GPU 上，每个 token 只选择 2 个专家，单 token 的计算量仍然接近一个规模小得多的 Dense 模型。
+EP 允许专家总数随 GPU 数量扩展，而单个 token 仍只执行 Top-k 专家。例如，100 个等规模专家分布在 100 张 GPU 上、每个 token 选择 2 个专家时，专家计算量由这 2 个专家决定，而不是由全部 100 个专家决定。
 
-但 EP 的代价同样明确：**每个 MoE 层都要执行通信密集的 all-to-all**。随着 GPU 和专家数量增加，通信拓扑、消息粒度和负载均衡会逐渐成为瓶颈。
+代价是每个 MoE 层都需要执行通信密集的 All-to-All。随着 EP group 扩大，通信拓扑、消息粒度和专家负载偏斜会逐渐成为关键瓶颈。
 
-> **规模案例：**Kimi K3 包含 2.8T 总参数和 896 个专家，每个 token 形成 16 个逻辑专家分配，并激活约 104B 参数。EP 将专家权重分布到可管理的显存范围；运行时按物理 rank 聚合 assignment，并在每个 MoE 层执行 Dispatch 与 Combine。该配置将容量约束转换为专家通信与负载均衡问题。
+<Accordion title="All-to-All 通信量模型与数值例子">
+
+设一个 EP group 包含 $P$ 个 rank，一个 MoE 层在整个 EP group 内处理 $T$ 个 token，每个 token 选择 $k$ 个专家，hidden size 为 $H$，每个激活元素占 $b$ 字节。忽略路由元数据、对齐和压缩时，Dispatch 的逻辑数据量为：
+
+$$
+S_{dispatch}^{logical}\approx T k H b
+$$
+
+Combine 将专家输出送回 token 的来源 rank。若专家输入与输出 hidden size 相同，两轮逻辑数据总量为：
+
+$$
+S_{dispatch+combine}^{logical}\approx 2T k H b
+$$
+
+逻辑数据量包含本地 assignment。设需要跨 rank 传输的 assignment 比例为 $r_{remote}$，则实际进入网络的数据量近似为：
+
+$$
+S_{network}\approx 2T k H b\,r_{remote}
+$$
+
+在专家均匀放置、路由目的地近似均匀且没有专家副本时，本地命中概率约为 $1/P$，因此：
+
+$$
+r_{remote}\approx\frac{P-1}{P}
+$$
+
+此时每个 rank 在 Dispatch 与 Combine 两轮中平均发送的数据量约为：
+
+$$
+S_{rank}\approx\frac{2T k H b}{P}\frac{P-1}{P}
+$$
+
+每个源 rank 的数据还会分散到多个目的 rank。均匀情况下，单个 source-destination pair 的平均 Dispatch 消息大小约为：
+
+$$
+M_{peer}\approx\frac{T k H b}{P^2}
+$$
+
+该公式说明，扩大 EP group 虽然降低了每个 rank 保存的专家数量，但会把相同数据拆成更多小消息；All-to-All 可能由消息启动延迟而非总带宽主导。
+
+**数值例子：** 假设一个 MoE 层在 8-rank EP group 中处理 4096 个 token，采用 Top-2 路由，$H=8192$，激活为 BF16（$b=2$ Bytes）。
+
+| 指标 | 估算结果 |
+| --- | ---: |
+| Dispatch 逻辑数据量 $TkHb$ | **128 MiB** |
+| 远端 Dispatch 数据量，$r_{remote}=7/8$ | **112 MiB** |
+| Dispatch + Combine 远端数据量 | **224 MiB / MoE layer** |
+| 每 rank 两轮平均发送量 | **28 MiB** |
+| 每个 source-destination pair 的平均 Dispatch 消息 | **约 2 MiB** |
+
+如果其他条件不变，只把 Top-2 改为 Top-16，逻辑与远端通信量都会增加 8 倍：Dispatch + Combine 的远端数据量约为 **1.75 GiB / MoE layer**。这只是容量估算，不代表延迟也严格增加 8 倍，因为 kernel 效率、通信计算重叠和链路饱和程度也会变化。
+
+平均通信量不足以决定 All-to-All 延迟。令 $n_{i\rightarrow j}$ 表示从 rank $i$ 发往 rank $j$ 的 assignment 数，则：
+
+$$
+S_{i\rightarrow j}=n_{i\rightarrow j}Hb
+$$
+
+Dispatch 的关键路径更接近最繁忙 rank 或链路，而不是全组平均值：
+
+$$
+T_{dispatch}\gtrsim T_{fixed}+
+\max_i\left(
+\frac{S_i^{send}}{B_i^{send}},
+\frac{S_i^{recv}}{B_i^{recv}}
+\right)
+$$
+
+其中 $T_{fixed}$ 包括 collective 调度、同步和小消息启动延迟。因此，相同的 $TkHb$ 可能产生完全不同的延迟：均匀路由主要受带宽和消息粒度影响，热点专家则会使少数目的 rank 的接收流量和专家队列同时增长。路由元数据、capacity padding、通信对齐、节点内本地复制以及跨节点比例还会进一步改变实测字节数。
+
+</Accordion>
 
 <Frame caption="DeepSpeed-MoE 在 8 到 64 张 GPU 上的推理扩展">
   <img src="/books/ai-systems-performance-engineering/images/ch15-deepspeed-moe-fig10-scaling.png" alt="DeepSpeed-MoE 在 8 到 64 张 GPU 上的推理扩展" />
@@ -431,7 +566,7 @@ EP 让专家总数可以随 GPU 数增加，而单个 token 仍只计算少数�
 
 *论文原图：52B、128 专家的 MoE 模型在 8–64 张 GPU 上的延迟和单 GPU 吞吐；DeepSpeed-MoE 的优化路径与 PyTorch 基线对比。来源：[DeepSpeed-MoE](https://arxiv.org/abs/2201.05596)，Figure 10。该图验证的是特定系统实现，不代表所有 MoE 都能获得相同扩展曲线。*
 
-> **实验观察：**增加 GPU 只有在专家并行通信和 kernel 实现同步优化时才能转化为有效扩展；GPU 数量本身不保证延迟下降或单卡吞吐稳定。
+> **实验观察：** 增加 GPU 只有在专家并行通信和 kernel 实现同步优化时才能转化为有效扩展；GPU 数量本身不保证延迟下降或单卡吞吐稳定。
 
 #### 单 token 稀疏性与集群级设备利用率
 
@@ -440,9 +575,9 @@ EP 让专家总数可以随 GPU 数增加，而单个 token 仍只计算少数�
 这两个结论并不矛盾：
 
 - **算法视角**：每个 token 的计算量是稀疏的；
-- **系统视角**：专家权重仍需常驻，所有 GPU 可能同时活跃，并持续参与 all-to-all。
+- **系统视角**：在常规低延迟部署中，专家权重仍需在设备侧可用；高并发下，多数 GPU 可能同时活跃并持续参与 All-to-All。
 
-因此，MoE 的主要收益是用较低的单 token 计算量换取更大的模型容量，而不是让生产集群中的大部分 GPU 长期闲置。MoE 推理的工程难点也由此集中在**通信效率和专家负载均衡**上。
+因此，MoE 的主要收益是用较低的单 token 计算量换取更大的模型容量，而不是让生产集群中的大部分 GPU 长期闲置。MoE 推理的工程难点也由此集中在 **通信效率和专家负载均衡** 上。
 
 #### EP 与动态路由的职责边界
 
@@ -453,38 +588,13 @@ Gating 结果通常不会完全均匀。如果某些专家收到的 token 明显
 - **EP 是静态放置问题**：哪些专家保存在哪些 GPU 上；
 - **动态路由是运行时调度问题**：当前 token 如何到达专家，热点如何限流、复制或迁移。
 
-因此，EP 只回答了“专家放在哪里”，并没有自动解决 all-to-all 效率和负载均衡。Capacity Factor、热点专家复制、专家重放置等机制将在下一节集中分析。
+因此，EP 只回答了“专家放在哪里”，并没有自动解决 All-to-All 效率和负载均衡。完成单实例的其余切分与混合并行配置后，第 4 节将继续分析 Capacity Factor、热点专家复制和专家重放置等运行时机制。
 
 ---
 
-### 3.5 Data Parallelism（DP）：实例复制与请求吞吐扩展
+### 3.5 Context Parallelism（CP）：序列切分与跨设备通信
 
-> **结论：**DP 不再切分单个请求，而是复制完整模型实例，让不同副本并行处理不同请求。它提高整体吞吐，但不会缩短某个请求的模型路径。
-
-推理中的 DP 与训练中的 DP 目标不同：
-
-- 训练 DP 复制模型，并通过梯度同步保持副本一致；
-- 推理 DP 让不同副本独立处理不同请求，副本之间通常不需要同步前向结果。
-
-这里的“副本”不一定只占一张 GPU。一个副本本身可以由 TP、PP 和 EP 组成。例如，一个模型实例需要 8 张 GPU 才能运行，那么两个 DP 副本一共需要 16 张 GPU。
-
-#### DP 对请求吞吐与单请求延迟的影响
-
-如果一个副本可以处理 10 req/s，8 个相互独立的副本在理想情况下可以接近 80 req/s。但某个请求仍然只由其中一个副本处理，因此其模型前向路径没有变短。
-
-| 优势 | 代价 |
-| --- | --- |
-| 扩展方式直观，吞吐可随副本数接近线性增长 | 每个副本都需要一份完整的模型状态和 KV cache 空间 |
-| 不同副本之间通常没有推理通信 | GPU 数量和硬件成本随副本数增长 |
-| 便于故障隔离和水平扩缩容 | 需要负载均衡，并考虑 Prefix/KV cache 的局部性 |
-
-DP 最适合用在**单个模型实例已经调优完成，但业务并发继续增长**的阶段。它通常是扩展吞吐的最后一层，而不是解决单实例容量问题的第一步。
-
----
-
-### 3.6 Context Parallelism（CP）：序列切分与跨设备通信
-
-> **结论：**CP 将一个请求的序列位置分到多张 GPU，分摊超长上下文的计算和状态；但全局 Attention 仍需跨卡交换信息。
+> **结论：** CP 将一个请求的序列位置分到多张 GPU，分摊超长上下文的计算和状态；但全局 Attention 仍需跨卡交换信息。
 
 超长上下文会同时带来两类压力：
 
@@ -498,40 +608,213 @@ CP 将一个请求的序列位置分布到多张 GPU，使每张 GPU 只保存�
 </Frame>
 
 
-<Accordion title="Ring Attention 的实际 K/V 数据流">
+#### 经典 CP 方法与实现流程
 
-<Frame caption="Ring Attention 的 query 固定与 K/V 环形传递">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-ring-attention-fig2.png" alt="Ring Attention 的 query 固定与 K/V 环形传递" />
+自回归 Transformer 中，每个 Query 需要访问此前所有相关 Key/Value。CP 方法都沿 sequence 维度分摊输入，但必须通过通信恢复全局 Attention 依赖。常见实现包括全量收集、环形分块、sequence—head 维转置和二维混合；Striped Attention 则针对因果 Ring 的负载不均改进数据布局。
+
+> **术语说明：** DeepSpeed-Ulysses、Ring Attention 和 USP 的论文通常使用 Sequence Parallelism 描述长序列 Attention 切分；本章按 Megatron 的术语将它们归入 CP，因为它们切分 Attention 上下文。这里的 SP 专指 3.2 节中复用 TP group、切分非 TP 区域训练 activation 的 Megatron Sequence Parallelism。
+
+<Accordion title="经典 CP 方法的执行流程">
+
+**1. All-Gather KV：实现最直接的基线**
+
+每个 rank 保留本地 Query，并收集所有 rank 的 K/V：
+
+```text
+本地 Q_i, K_i, V_i
+        │
+        │ All-Gather K/V
+        ▼
+本地 Q_i + 全局 K/V
+        │
+        ▼
+计算本地 Query 对全局上下文的 Attention
+```
+
+前向完成后，每个 rank 只输出本地 Query 对应的结果；反向需要将不同 rank 产生的 K/V 梯度归并到 K/V 所属 rank，语义上对应 Reduce-Scatter。该方法通信轮次少、实现简单，但 Attention 期间每个 rank 都临时持有完整 K/V，峰值显存随全局序列长度增长，因此只适合 CP degree 较小或上下文尚未达到极端规模的场景。
+
+**2. Ring Attention：固定 Query，循环 K/V Block**
+
+Ring Attention 将序列切成 $C$ 个连续块。rank $i$ 的 Query block $Q_i$ 始终留在本地，K/V block 沿 CP ring 循环：
+
+```text
+初始化：Q_i 固定，当前持有 K_i/V_i
+
+每一轮：
+1. 用 Q_i 与当前 K/V Block 计算局部 Attention；
+2. 异步把当前 K/V 发送给下一个 rank；
+3. 从上一个 rank 接收下一块 K/V；
+4. 使用在线 Softmax 统计量合并局部结果；
+5. 重复 C 轮，直到处理全部 K/V Block。
+```
+
+<Frame caption="Ring Attention 的 Query 固定与 K/V 环形传递">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-ring-attention-fig2.png" alt="Ring Attention 的 Query 固定与 K/V 环形传递" />
 </Frame>
 
-该论文主要讨论训练与长上下文机制，这里只用于解释 CP 的数据流，不作为推理解码加速证据。来源：[Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889)，Figure 2。
+*论文原图：每个 rank 固定本地 Query，并在计算当前 Attention Block 的同时发送、接收下一块 K/V。来源：[Ring Attention with Blockwise Transformers for Near-Infinite Context](https://arxiv.org/abs/2310.01889)，Figure 2。*
 
-**实验观察：**序列切分后各 rank 仍需获得远端 K/V；CP 省下的是单卡状态与计算压力，代价是持续的数据交换。
+不同 K/V Block 的 Softmax 不能独立计算后直接相加。每个 Query 行需要维护历史最大值、归一化分母和 Value 累加量，通过在线 log-sum-exp 合并各块结果。因此 Ring Attention 保持精确全注意力，不是稀疏或近似 Attention。
+
+Ring 在计算期间只需保存当前 K/V Block；采用双缓冲时通常同时保留当前块和下一块，而不必物化完整全局 K/V。该方法需要约 $C$ 轮点对点通信。采用双缓冲时，当前 Block 的 Attention 计算可以与下一块 K/V 的传输重叠；如果网络传输慢于 Block 计算，设备仍会等待通信。反向传播沿对应的环形路径交换 K/V 及其梯度，并把不同 Query Block 对同一 K/V Block 的梯度归并回所属 rank。
+
+**3. Striped Attention：为因果 Attention 均衡 Ring 计算量**
+
+连续分块的 Ring Attention 在因果场景中存在负载不均：靠前的 Query Block 只能访问少量历史 K/V，靠后的 Query Block 需要处理更多有效 Block。Striped Attention 不按连续区间分配 token，而是按位置交错分配：
+
+$$
+\operatorname{rank}(i)=i\bmod C
+$$
+
+例如 3 个 rank 处理 12 个位置时，各 rank 分别保存 $\{0,3,6,9\}$、$\{1,4,7,10\}$ 和 $\{2,5,8,11\}$。每个 rank 的 token 分布覆盖整条序列，使因果三角形的有效计算更均匀地分散到各轮。它仍使用 Ring 的 K/V P2P 通信并保持精确 Attention，代价是位置布局更不连续，数据准备、位置编码和 kernel 实现更复杂。来源：[Striped Attention](https://arxiv.org/abs/2311.09431)。
+
+**4. DeepSpeed-Ulysses：在 sequence 与 attention head 之间执行 All-to-All 转置**
+
+Ulysses 在 Attention 外保持 sequence-sharded 布局。设 CP degree 为 $C$，注意力头数为 $A$：
+
+```text
+初始布局：每个 rank 持有 [s/C, A]，即部分序列、全部 heads
+       │
+       │ QKV 投影后执行 All-to-All
+       ▼
+Attention 布局：每个 rank 持有 [s, A/C]，即完整序列、部分 heads
+       │
+       │ 本地计算所负责 heads 的完整序列 Attention
+       ▼
+逆 All-to-All
+       │
+       ▼
+恢复 [s/C, A] 的 sequence-sharded 布局
+```
+
+第一次 All-to-All 同时收集序列分片并切分 attention heads，第二次 All-to-All 收集不同 heads 的输出并重新切回 sequence shard。该方法没有 Ring 的多轮流水，但依赖高效 All-to-All，并通常要求 attention head 数能被 Ulysses degree 整除。GQA/MQA 的 KV head 或 query group 数较少时，可用的 All-to-All degree 可能受到更严格限制。来源：[DeepSpeed-Ulysses](https://arxiv.org/abs/2309.14509)。
+
+**5. USP 与 Hierarchical CP：组合 Ulysses 和 Ring**
+
+USP 将总 CP group 组织为二维网格：
+
+$$
+C=U\times R
+$$
+
+其中 $U$ 为 Ulysses degree，$R$ 为 Ring degree。初始每个 rank 保存约 $s/(UR)$ 个 token；先在 Ulysses group 内执行 All-to-All，得到 $s/R$ 长度、部分 heads 的布局，再在 Ring group 内循环 K/V Block，最后执行逆 All-to-All 恢复原始 sequence shard。
+
+```text
+[s/(U·R), 全部 heads]
+        │ Ulysses All-to-All
+        ▼
+[s/R, 1/U heads]
+        │ Ring 维度循环 K/V
+        ▼
+[s/R, 1/U heads] 的 Attention 输出
+        │ 逆 All-to-All
+        ▼
+[s/(U·R), 全部 heads]
+```
+
+这种二维方法可以把 Ulysses All-to-All 放在 NVLink/NVSwitch 域内，把 Ring P2P 放在跨节点链路上；同时用较小的 $U$ 满足 GQA/MQA 的 head 整除约束，再通过 $R$ 扩大总 CP degree。代价是进程网格、拓扑映射和通信计算重叠更复杂。来源：[USP](https://arxiv.org/abs/2405.07719)。Megatron Core 中的 `a2a+p2p` 和 Hierarchical CP 采用相近的工程分层思想。
+
 </Accordion>
 
-#### 全局 attention 的跨分片计算
+#### 方法差异与选型
 
-自回归 Transformer 中，每个 token 需要关注此前的所有相关 token。简单地把序列切开，并不能让各分片完全独立计算。Ring Attention、Blocked Attention 等方法通过分块和流水化通信，使各 GPU 在处理本地 Query 的同时逐步获得所需的远端 K/V。
+| 方法 | Attention 内的数据布局 | 主要通信 | 峰值 K/V 显存 | 主要优势 | 主要限制 |
+| --- | --- | --- | --- | --- | --- |
+| All-Gather KV | 本地 Query + 完整 K/V | All-Gather / Reduce-Scatter | 高，临时保存完整 K/V | 实现简单，通信轮次少 | 超长序列下峰值显存高 |
+| Ring Attention | 本地 Query + 流动 K/V Block | 多轮 P2P Send/Recv | 低，约 1–2 个本地 K/V Block | 易扩展到较大 CP degree，可流水重叠 | Ring 轮数和启动延迟随 degree 增长 |
+| Striped Attention | 交错 Query 位置 + 流动 K/V 条带 | 多轮 P2P Send/Recv | 低 | 改善 causal Ring 的计算负载不均 | 非连续位置布局增加实现复杂度 |
+| Ulysses | 完整 sequence + 部分 attention heads | 两次 All-to-All 布局转换 | 中等，不复制全部 heads | 通信阶段少，适合高速全互联 | 受 Q/KV head 数和整除性限制 |
+| USP / `a2a+p2p` | Ulysses head shard + Ring sequence shard | 组内 All-to-All + 组间 P2P | 低 | 匹配分层网络，突破纯 Ulysses degree 限制 | 配置和调优最复杂 |
 
-因此，CP 更准确的理解是：
+Megatron Core 将这些路径统一为不同 `cp_comm_type`：`all_gather` 对应全量 K/V 收集，`p2p` 对应 Ring 路径，`a2a` 对应 Ulysses 式 sequence/head 转置，`a2a+p2p` 对应分层混合。选择时应同时考虑上下文长度、CP degree、Q/KV head 数、节点内外网络差异以及计算能否覆盖通信。
 
-> **它用额外的跨卡通信换取序列维度上的显存分摊和 Prefill 并行。**
+> **CP 的能力边界：** 上述方法都分摊了每设备的 Attention 状态与计算，但没有改变精确全注意力 $O(s^2)$ 的全系统总计算复杂度。它们主要改变的是每卡显存、计算分配和通信方式。对短 prompt 或逐 token Decode，Query 计算量较小，通信更难被隐藏，CP 不一定带来延迟收益。NVIDIA 工程实现参考：[Megatron Core Context Parallelism](https://docs.nvidia.com/megatron-core/developer-guide/0.15.0/user-guide/features/context_parallel.html)。
 
-CP 对超长 Prompt 很有价值，可以降低单卡 KV cache 压力并缩短 TTFT；但对短 Prompt，额外通信和调度成本可能大于并行收益。它通常不直接消除 Decode 的逐 token 依赖，因此主要价值仍在长上下文 Prefill。
+#### CP 与 SP 的职责边界及组合
+
+CP 和 SP 都沿 sequence 维度切分数据，但目标和执行阶段不同：
+
+| 维度 | Sequence Parallelism（SP） | Context Parallelism（CP） |
+| --- | --- | --- |
+| 主要目标 | 降低训练时非 TP 区域的 activation 显存 | 分摊超长上下文的 Attention 计算和 KV 状态 |
+| 切分范围 | LayerNorm、Dropout、Residual 等非 TP 区域 | Attention 的全局上下文位置 |
+| 进入 Attention 后 | 在 TP group 内 All-Gather，恢复当前 CP 分片的完整输入 | Ring 类方法保持上下文分片并交换 K/V；Ulysses 类方法恢复完整 sequence，但只保留部分 heads |
+| 主要通信 | TP group 内的 All-Gather / Reduce-Scatter | P2P K/V 交换、All-Gather 或 sequence—head All-to-All |
+| 主要使用阶段 | 训练 | 训练和推理 |
+| 与 TP 的关系 | 通常复用 TP group，不增加独立 rank 维度 | 构成独立的 CP rank 维度，可与 TP 组合 |
+
+因此，SP 的 sequence 切分主要是一种 activation 存储布局：进入 TP 计算区域时会临时恢复当前 CP 分片的完整输入。CP 则改变 Attention 的执行布局：Ring 类方法始终保留上下文分片并交换 K/V Block；Ulysses 类方法会为部分 attention heads 临时恢复完整 sequence，但不会在单个 rank 上同时复制全部 sequence 和全部 heads。
+
+二者可以同时使用。以下以保持上下文分片的 Ring 类 CP 为例。设全局序列长度为 $s$，TP/SP 大小为 $p$，CP 大小为 $c$。在 LayerNorm 等 SP 区域，每个 rank 保存：
+
+$$
+\left[\frac{s}{cp},b,h\right]
+$$
+
+进入 Attention 前，SP 在 TP group 内执行 All-Gather，只恢复当前 CP rank 负责的上下文分片：
+
+$$
+\left[\frac{s}{cp},b,h\right]
+\xrightarrow{\text{TP-group All-Gather}}
+\left[\frac{s}{c},b,h\right]
+$$
+
+QKV 列并行后，每个 TP rank 计算当前 CP 分片上的部分 attention head：
+
+$$
+\left[\frac{s}{c},b,\frac{h}{p}\right]
+$$
+
+随后 CP group 交换远端 K/V，使本地 Query 能够关注全局上下文。Attention 输出完成 TP 行并行投影后，再通过 Reduce-Scatter 切回 $[s/(cp),b,h]$ 的 SP 布局。
+
+SP 复用 TP group，因此不应作为 world size 的独立乘数。忽略 EP 等框架相关维度时，组合关系通常写为：
+
+$$
+\text{World Size}=TP\times CP\times PP\times DP,\qquad \text{SP Size}=\text{TP Size}
+$$
+
+> **组合边界：** SP 主要减少训练 activation 的长期存储，CP 主要分摊 Attention 上下文。二者组合后，SP 的 All-Gather 只恢复 CP-local sequence，而不是全局 sequence；全局依赖仍由 CP 通信完成。
 
 ---
 
-### 3.7 Hybrid Parallelism：通信模式与物理拓扑的匹配
+### 3.6 Data Parallelism（DP）：实例复制与请求吞吐扩展
 
-> **结论：**高频、细粒度通信应留在最快的互联域；跨节点尽量使用频率更低、消息更大的通信。混合并行是在容量、延迟、吞吐和物理拓扑之间寻找可行解。
+> **结论：** DP 不再切分单个请求，而是复制完整模型实例，让不同副本并行处理不同请求。它提高整体吞吐，但不会缩短某个请求的模型路径。
 
-生产环境中的超大 MoE 通常组合多种并行方式，各切分维度承担不同职责：
+推理中的 DP 与训练中的 DP 目标不同：
 
-- **TP** 处理单层或单个专家过宽的问题；
-- **PP** 只在模型深度仍无法容纳时继续切分；
-- **EP** 分布 MoE 专家，并控制 all-to-all 范围；
-- **CP** 只在超长上下文确有需求时加入；
-- **DP** 在单实例配置稳定后增加副本，扩展请求吞吐。
+- 训练 DP 复制模型，并通过梯度同步保持副本一致；
+- 推理 DP 让不同副本独立处理不同请求，副本之间通常不需要同步前向结果。
+
+这里的“副本”不一定只占一张 GPU。一个副本本身可以由 TP、PP、EP 和 CP 组成。例如，一个模型实例需要 8 张 GPU 才能运行，那么两个 DP 副本一共需要 16 张 GPU。
+
+#### DP 对请求吞吐与单请求延迟的影响
+
+如果一个副本可以处理 10 req/s，8 个相互独立的副本在理想情况下可以接近 80 req/s。但某个请求仍然只由其中一个副本处理，因此其模型前向路径没有变短。
+
+| 优势 | 代价 |
+| --- | --- |
+| 扩展方式直观，吞吐可随副本数接近线性增长 | 每个副本都需要一份完整的模型状态和 KV cache 空间 |
+| 不同副本之间通常没有推理通信 | GPU 数量和硬件成本随副本数增长 |
+| 便于故障隔离和水平扩缩容 | 需要负载均衡，并考虑 Prefix/KV cache 的局部性 |
+
+DP 最适合用在 **单个模型实例已经调优完成，但业务并发继续增长** 的阶段。它通常是扩展吞吐的最后一层，而不是解决单实例容量问题的第一步。
+
+---
+
+### 3.7 Hybrid Parallelism：配置顺序、拓扑映射与验证
+
+> **结论：** 高频、细粒度通信应留在最快的互联域；跨节点尽量使用频率更低、消息更大的通信。混合并行是在容量、延迟、吞吐和物理拓扑之间寻找可行解。
+
+生产环境中的超大 MoE 通常组合多种并行方式：TP、PP、EP 和 CP 共同满足单实例的容量与延迟约束；训练时可在 TP group 内叠加 SP 以分摊激活；单实例配置稳定后，再通过 DP 扩展请求吞吐。
+
+<Frame caption="Megatron-LM 中 Tensor Parallelism 与 Pipeline Parallelism 的组合">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-megatron-fig2-tp-pp.png" alt="Megatron-LM 中 Tensor Parallelism 与 Pipeline Parallelism 的组合" />
+</Frame>
+
+*论文原图：Megatron-LM 在每个 Transformer layer 内使用 TP，再沿模型深度使用 PP。图来自训练论文，但“高频层内通信限制在小组内、较粗粒度激活跨 stage 传递”的组织方式同样适用于理解推理。来源：[Megatron-LM](https://arxiv.org/abs/2104.04473)，Figure 2。*
+
+> **实验观察：** TP 与 PP 并非二选一：TP 在层内形成高频通信组，PP 沿模型深度传递激活，两类通信应映射到不同层级的物理互联。
 
 <Accordion title="64-GPU Rank Mesh 示例">
 为了让维度关系可计算，假设某个推理框架将 PP、TP 与 EP 组织为相互正交的 rank mesh，并使用 64 张 GPU 运行一个模型实例：
@@ -544,12 +827,13 @@ $$
 | --- | --- | --- |
 | **PP = 4** | 模型层拆成 4 个 stage | 分摊模型深度和权重容量 |
 | **TP = 2** | 每个 stage 内建立 2-GPU TP group | 分摊层内权重与计算 |
-| **EP = 8** | 每个 MoE 层的专家在 8 个 EP rank 间分布 | 分摊专家参数并限定 all-to-all 范围 |
+| **SP = 2** | 训练时复用同一个 2-GPU TP group | 分摊非 TP 区域的 activation；不增加 world size |
+| **EP = 8** | 每个 MoE 层的专家在 8 个 EP rank 间分布 | 分摊专家参数并限定 All-to-All 范围 |
 | **DP = 1** | 64 张 GPU 共同组成一个实例 | 暂不复制模型 |
 
 如果每个 MoE 层有 64 个专家，在没有额外副本时，每个 EP rank 保存 8 个专家。再部署 2 个 DP 副本，需要两套 64-GPU 实例，共 128 张 GPU。
 
-不同框架对 EP、TP 与 DP 的 rank group 组织并不完全相同，EP 有时会占用或重组 DP 维度。上例只用于展示一个维度明确、乘积闭合的 mesh，实际配置必须以目标推理框架的并行语义为准。
+不同框架对 EP、TP 与 DP 的 rank group 组织并不完全相同，EP 有时会占用或重组 DP 维度。SP 通常使用 TP group 的相同 rank，只改变 activation 布局，因此不出现在 $PP\times TP\times EP$ 的 world-size 乘积中。上例只用于展示一个维度明确、乘积闭合的 mesh，实际配置必须以目标框架的并行语义为准。
 </Accordion>
 
 #### 混合并行的配置顺序
@@ -558,10 +842,11 @@ $$
 
 1. **先满足容量约束**：确定权重和最大 KV cache 是否能放入目标设备；
 2. **让 TP 停留在高速互联域内**：扩大到继续增加 GPU 不再降低端到端延迟为止；
-3. **PP 保持最小**：只在 TP/EP 后模型仍放不下时增加 stage；
-4. **MoE 尽量用 EP 分布专家**：同时控制 all-to-all 范围和每个专家的 token 数；
-5. **仅为超长上下文增加 CP**：用实测判断通信成本是否值得；
-6. **最后通过 DP 扩吞吐**：复制已经调优好的模型实例。
+3. **训练 activation 成为瓶颈时叠加 SP**：复用 TP group 分摊非 TP 区域的激活，并验证更多 collective 的延迟；
+4. **PP 保持最小**：只在 TP/EP 后模型仍放不下时增加 stage；
+5. **MoE 尽量用 EP 分布专家**：同时控制 All-to-All 范围和每个专家的 token 数；
+6. **仅为超长上下文增加 CP**：用实测判断通信成本是否值得；
+7. **最后通过 DP 扩吞吐**：复制已经调优好的模型实例。
 
 这不是严格的执行顺序，而是一条经验性原则：**高频、细粒度的通信留在最快的互联域；跨节点通信尽量选择频率更低、消息更大的形式。**
 
@@ -569,9 +854,9 @@ $$
 
 | 集群拓扑 | 更合理的选择 |
 | --- | --- |
-| **单个 NVL72 域** | TP 和 EP 都可以在 72-GPU 高速互联域内组织，但 TP 仍需寻找收益递减点 |
-| **两台 8-GPU 节点，节点间 InfiniBand** | TP 通常限制在每台机器的 8 张 GPU 内；跨节点更适合用 PP、EP 或 DP |
-| **普通 Ethernet 集群** | 应进一步减少高频跨节点集合通信，优先考虑较小 TP 和更粗粒度的切分 |
+| **单个 NVL72 域** | TP、SP 和 EP 可以在高速互联域内组织；TP 仍需寻找收益递减点，CP 仅在长上下文确有需求时加入 |
+| **两台 8-GPU 节点，节点间 InfiniBand** | TP/SP 通常限制在节点内；跨节点可使用 PP、EP、DP，长上下文 CP 宜采用拓扑感知的 Ring 或分层方案 |
+| **普通 Ethernet 集群** | 应进一步减少高频跨节点 collective，优先使用较小 TP 和更粗粒度的切分 |
 
 这体现了软硬件协同设计的基本原则：并行策略不是抽象的数学分解，而是通信频率、消息大小和物理链路共同决定的系统配置。
 
@@ -582,41 +867,19 @@ $$
 - 端到端 TTFT、TPOT 和 goodput；
 - Tensor Core 利用率和 kernel 执行时间；
 - NVLink/NIC 吞吐与集合通信占比；
-- Pipeline bubble 和 GPU 空闲区间；
+- pipeline bubble 和 GPU 空闲区间；
 - 不同专家收到的 token 数及最长尾部延迟；
 - 单卡显存余量和 KV cache 可用容量。
 
 Nsight Systems 适合检查端到端时间线和通信/计算重叠，Nsight Compute 适合分析具体 kernel。并行度增加后，如果计算时间下降但通信、空闲或尾延迟上升，端到端性能仍可能变差。
 
----
-
-### 3.8 并行策略对比与选择
-
-| 策略 | 最适合解决的问题 | 不应该期待的效果 |
-| --- | --- | --- |
-| **TP** | 层太宽；在高速互联域内降低层内计算时间 | 跨慢速网络无限扩展仍保持线性加速 |
-| **PP** | 模型太深，必须跨设备分摊层数 | 自动降低单请求 Decode 延迟 |
-| **EP** | 专家总参数量过大 | 稀疏激活自动带来均匀负载和低通信成本 |
-| **DP** | 单实例吞吐不足，需要更多独立副本 | 降低某个请求的前向计算路径 |
-| **CP** | 上下文过长，Prefill 和 KV cache 压力过大 | 短序列或逐 token Decode 一定受益 |
-
-混合并行的本质，是在容量、延迟、吞吐和通信之间做约束优化。没有一种配置能脱离模型结构、请求分布和硬件拓扑独立成立。最可靠的方法不是照搬某个并行度，而是从容量约束出发，限制高频通信的物理范围，再用 profiling 找到端到端性能的收益递减点。
-
-<Accordion title="并行配置评估项">
-
-- 高频集合通信是否限制在高速互联域内；
-- 并行度增加后的计算收益是否覆盖新增通信与同步成本；
-- 单 token 稀疏计算是否在高并发下形成专家热点；
-- Prefill Pool 与 Decode Pool 是否分别采用符合其负载特征的并行配置；
-- Dense 与 MoE 模型的权重布局、通信模式和负载均衡要求是否分别评估。
-
-</Accordion>
+混合并行是在容量、延迟、吞吐和通信之间进行约束优化。配置应从容量约束出发，限制高频通信的物理范围，再通过 profiling 确定端到端性能的收益递减点。需要特别注意：SP 不减少理论通信字节数，也不能替代 CP；DP 扩展整体吞吐，但不缩短单请求路径；EP 解决专家布局，却不自动保证均匀负载。对于 MoE，静态布局确定后仍需处理 All-to-All 和专家负载不均，第 4 节将分析相应的运行时机制。
 
 ---
 
-## 4. MoE 推理的动态路由策略
+## 4. MoE 执行路径：路由、通信与负载均衡
 
-EP 定义逻辑专家在集群中的物理布局，模型 gating 为 token 选择逻辑专家，Runtime Router 则将 token-to-expert assignment 映射到物理 rank。每个 batch 在 EP group 内执行 Dispatch 和 Combine，因此路由效率同时取决于专家放置、通信拓扑与负载分布。
+EP 定义逻辑专家到物理 rank 的静态布局，模型 Gating 为 token 选择逻辑专家，Runtime Router 再将 token-to-expert assignment 映射到具体 rank 或等价副本。对于包含远端 assignment 的 MoE 层，系统还需在 EP group 内完成 Dispatch 和 Combine；因此，关键路径同时受专家放置、通信拓扑和负载分布影响。本节依次分析执行路径、通信优化、负载均衡和运行时反馈控制。
 
 ---
 
@@ -629,7 +892,7 @@ MoE 系统中经常把两件不同的事都称为路由：
 | **模型路由（Gating）** | 根据 token 的 hidden state 选择 Top-k 逻辑专家 | 是；改选不同专家可能改变输出 |
 | **系统路由（Runtime Routing）** | 把 token 送到专家所在 GPU，或在同一专家的多个副本中选一个 | 选择等价副本或通信路径时通常不改变语义 |
 
-> **结论：**Gating 决定“应该调用哪个专家”，Runtime Router 决定“怎样到达这个专家”。性能优化首先应在不改变逻辑专家选择的范围内进行。
+> **结论：** Gating 决定“应该调用哪个专家”，Runtime Router 决定“怎样到达这个专家”。性能优化首先应在不改变逻辑专家选择的范围内进行。
 
 在每个 MoE 层中，完整路径是：
 
@@ -647,16 +910,16 @@ MoE 系统中经常把两件不同的事都称为路由：
 
 两者不能分开看。即使网络足够快，热点专家仍会拖慢整个 batch；即使 token 分配很均匀，不合理的专家放置也可能让大量流量穿越慢速跨节点链路。
 
-因此，MoE 路由优化有两个目标：
+因此，MoE 运行时优化有两个目标：
 
-1. **减少必须跨慢速链路传输的数据，并把通信隐藏在计算后面；**
+1. **减少跨慢速链路的数据量，并通过分块流水使通信与专家计算重叠，尽可能将通信时间移出关键路径；**
 2. **让各专家的完成时间尽量接近，而不只是让 token 数在统计上平均。**
 
 第二点尤其重要：两个专家收到相同数量的 token，不代表耗时一定相同。不同 GPU 状态、kernel 效率、网络拥塞和专家实现都可能造成服务时间差异。
 
 #### Kimi K3：在 896 个专家中动态选择 16 个
 
-Kimi K3 的 Stable LatentMoE 包含 896 个专家，每个 token 激活 16 个专家，每 token 总计激活约 104B 参数。这个规模可以把动态路由的压力具体化。假设某个 MoE 层一次处理 $T$ 个 token，则路由器需要产生：
+根据前述 Kimi K3 公开配置，若每个相关 MoE 层对每个 token 选择 16 个路由专家，且不计共享专家或其他固定分支，则包含 $T$ 个 token 的一次层执行会产生：
 
 $$
 N_{assignment}=16T
@@ -668,34 +931,15 @@ $$
 \frac{16T}{896}=\frac{T}{56}
 $$
 
-个 token。这会形成两种不同的压力：
+个 token。batch 较小时，单个专家收到的 token 较少，通信与 kernel 启动成本难以摊薄；batch 增大后，专家 GEMM 和消息粒度通常更有利，但总通信量、显存占用和热点专家的绝对排队长度也随之上升。因此，最优 batch 取决于固定开销的摊销收益能否覆盖带宽、容量和尾延迟成本。
 
-- **batch 较小**：每个专家只收到少量 token，形成大量目的地分散的小消息，通信与 kernel 启动成本难以摊薄；
-- **batch 较大**：大多数专家同时活跃，通信总量增大，路由偏斜又容易制造热点。
-
-Kimi K3 使用 Quantile Balancing 改善训练期专家分配，但训练阶段的均衡机制不能证明线上推理同样均衡。真实业务中的主题、请求长度和并发不断变化，仍需通过专家级 token 数、队列时间与 all-to-all 耗时验证运行时负载。
-
-#### EP 通信量的简化模型
-
-设一个 MoE 层处理 $T$ 个 token，每个 token 选择 $k$ 个专家，hidden size 为 $H$，每个激活元素占 $b$ 字节。忽略路由元数据、对齐和压缩时，逻辑 Dispatch 数据量近似为：
-
-$$
-S_{dispatch}\approx T\times k\times H\times b
-$$
-
-Combine 需要将专家输出送回原 token 位置，因此两轮逻辑数据总量约为：
-
-$$
-S_{total}\approx 2T k H b
-$$
-
-这不是实际跨节点字节数：多个逻辑专家可能位于同一 rank，本地 assignment 无需经过网络，跨节点比例还取决于专家放置、等价副本和路由分布。这个模型揭示了两个趋势：Top-k 增大时通信量近似线性增长；小 batch 即使总字节数不大，也可能因消息过碎而受启动延迟限制。
+Kimi K3 使用 Quantile Balancing 改善训练期专家分配，但训练阶段的均衡机制不能证明线上推理同样均衡。真实业务中的主题、请求长度和并发不断变化，仍需通过专家级 token 数、队列时间与 All-to-All 耗时验证运行时负载。
 
 ---
 
 ### 4.2 通信优化：拓扑感知与通信计算重叠
 
-> **结论：**all-to-all 优化不是单纯追求更高峰值带宽，而是同时减少跨慢链路流量、增大消息粒度，并让传输与专家计算重叠。
+> **结论：** All-to-All 优化不是单纯追求更高峰值带宽，而是同时减少跨慢链路流量、增大消息粒度，并让传输与专家计算重叠。
 
 **1. 让路由和专家放置感知拓扑**
 
@@ -703,23 +947,23 @@ $$
 
 这种层级化通信需要同时设计：
 
-- 哪些专家放在同一 GPU、同一节点或同一机架；
-- Gating 是否优先选择本地可用的等价副本；
-- all-to-all 是一次全局执行，还是拆成节点内与节点间两个阶段。
+- 哪些逻辑专家及其副本放在同一 GPU、节点或机架；
+- Runtime Router 是否优先选择本地可用的等价副本；
+- All-to-All 是一次全局执行，还是拆分为节点内重排和节点间交换。
 
-<Frame caption="DeepSpeed-MoE 的分层 all-to-all">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-deepspeed-moe-fig8-hierarchical-alltoall.png" alt="DeepSpeed-MoE 的分层 all-to-all" />
+<Frame caption="DeepSpeed-MoE 的分层 All-to-All">
+  <img src="/books/ai-systems-performance-engineering/images/ch15-deepspeed-moe-fig8-hierarchical-alltoall.png" alt="DeepSpeed-MoE 的分层 All-to-All" />
 </Frame>
 
-*论文原图：DeepSpeed-MoE 将全局 all-to-all 拆成节点内交换、数据布局转换和并发的节点间交换，以减少通信跳数并利用不同层级链路。来源：[DeepSpeed-MoE](https://arxiv.org/abs/2201.05596)，Figure 8。*
+*论文原图：DeepSpeed-MoE 将全局 All-to-All 拆成节点内交换、数据布局转换和并发的节点间交换，以减少通信跳数并利用不同层级链路。来源：[DeepSpeed-MoE](https://arxiv.org/abs/2201.05596)，Figure 8。*
 
-> **实验观察：**层级化 all-to-all 的价值不是减少逻辑 assignment，而是让更多流量留在节点内快链路，并组织跨节点交换以减少慢链路跳数。
+> **实验观察：** 分层 All-to-All 不改变逻辑 assignment；其主要作用是利用节点内快链路完成局部重排，并聚合跨节点消息，减少慢链路上的小消息和中间转发。只有结合专家副本或放置优化时，跨节点 assignment 的比例才可能进一步下降。
 
-“优先本地”不能简单覆盖模型的路由分数。如果为了减少通信而把 token 送到不同权重的低分专家，模型输出可能发生变化。只有路由到**同一专家的等价副本**时，局部性优化才不会改变模型语义。
+“优先本地”不能覆盖模型的路由分数。如果为了减少通信而把 token 送到不同权重的低分专家，模型输出可能发生变化。只有路由到 **同一专家的等价副本** 时，局部性优化才不会改变模型语义。
 
 **2. 将通信分块并与计算重叠**
 
-把一个大规模 all-to-all 拆成多个 Chunk 后，可以形成流水线：
+将 Dispatch 拆成多个 chunk 后，专家可以在首批输入到达时启动计算，并与后续 chunk 的传输形成流水：
 
 ```text
 时间片 1：传输 Chunk A
@@ -727,23 +971,21 @@ $$
 时间片 3：计算 Chunk B，同时传输 Chunk C
 ```
 
-Double Buffer 为正在计算和正在传输的数据分别准备缓冲区，使专家计算与下一批激活交换并行推进。收益取决于两者是否真正重叠；如果它们争用同一内存带宽或被同一个 CUDA Stream 串行化，配置了异步 API 也不会产生实际重叠。
+Double Buffer 为正在计算和正在传输的数据分别准备缓冲区，使专家计算与下一批激活交换并行推进。该优化要求专家 kernel 能在部分输入到达后增量执行，且 chunk 足够大以摊薄通信和 kernel 启动开销；如果通信与计算争用同一内存带宽，或被同一个 CUDA stream 串行化，异步 API 也不会产生实际重叠。
 
 **3. 避免单一全局 Barrier**
 
-朴素实现可能让所有 GPU 在一次全局 all-to-all 前后同步，任何慢链路或热点 GPU 都会让整组设备等待。Butterfly / Shifted all-to-all 将交换拆成多个阶段，让不同链路在每个阶段传输部分数据，以提高链路利用率并减少全局等待。
-
-具体实现可以使用支持对应原语的 NCCL all-to-all API，也可以用 grouped send/receive 组合实现；可用接口取决于 NCCL 与推理框架版本。不存在对所有拓扑都最优的算法：消息大小、GPU 数、节点数、rail 配置和专家分布都会改变结果。
+朴素实现可能让所有 GPU 在全局 All-to-All 前后同步，任何慢链路或热点 GPU 都会让整组设备等待。部分系统使用分阶段交换或 grouped send/receive，避免所有 rank 在单一全局屏障前后同时等待。这类方法可能改善链路并发度，但也会增加阶段数、转发和同步开销；是否有效取决于消息大小、GPU 与节点数量、rail 配置、专家分布，以及通信库和推理框架版本。
 
 **4. 将高相关专家放在一起**
 
-如果流量分析发现某些专家经常被同一个 token 同时选择，把它们放在同一 GPU 或同一节点可以减少跨节点传输。这类 Expert Collocation 需要依据真实 Gating 统计，而不是只按专家编号平均分配。
+如果流量分析发现某些专家经常被同一个 token 同时选择，可以将它们放在同一节点。若通信实现支持“跨节点聚合一次、节点内再分发”，这种 Expert Collocation 能减少慢链路上的重复消息和启动开销；若每个 assignment 仍独立跨节点发送，单纯共置专家并不会自动减少网络字节数。
 
-代价是专家放置会与负载均衡发生冲突：把高相关专家放在一起可以减少通信，却可能让某个节点承载更多热门专家。因此，放置策略需要同时优化局部性和负载。
+专家共置还可能让某个节点承载更多热门专家，因此放置策略必须同时优化通信局部性和负载均衡。
 
 **5. 压缩传输数据**
 
-在 all-to-all 前把激活转换为 FP8 或 NVFP4，可以减少网络流量；接收端再恢复为后续计算所需格式。只有当节省的传输时间大于量化、打包、解包和反量化成本时，这种方法才有收益。
+在 All-to-All 前把激活转换为 FP8 或 NVFP4，可以减少网络流量；接收端再恢复为后续计算所需格式。只有当节省的传输时间大于量化、打包、解包和反量化成本时，这种方法才有收益。
 
 与模型权重量化一样，通信压缩也需要验证数值误差。不能因为压缩发生在网络路径上，就默认它对模型质量没有影响。
 
@@ -752,7 +994,7 @@ Double Buffer 为正在计算和正在传输的数据分别准备缓冲区，使
 - [ ] TP/EP 通信组是否与 NVLink、NIC 和 NUMA 拓扑一致；
 - [ ] 跨节点路径是否真正启用了 GPUDirect RDMA；
 - [ ] 多端口 InfiniBand/RoCE 是否正确使用多 Rail 或 Bonding；
-- [ ] all-to-all 是否被单个全局 Barrier 串行化；
+- [ ] All-to-All 是否被单个全局 Barrier 串行化；
 - [ ] 通信与专家计算是否在时间线上真实重叠；
 - [ ] 是否存在少数链路长期拥塞，而其他链路空闲；
 - [ ] 压缩带来的网络收益是否覆盖转换开销和精度损失。
@@ -761,13 +1003,13 @@ Double Buffer 为正在计算和正在传输的数据分别准备缓冲区，使
 
 ### 4.3 负载均衡：基于完成时间的优化目标
 
-> **结论：**MoE 层的延迟由最慢专家决定。均衡 token 数只是手段，真正要均衡的是包含排队、通信和计算在内的完成时间。
+> **结论：** MoE 层的延迟由最慢专家决定。均衡 token 数只是手段，真正要均衡的是包含排队、通信和计算在内的完成时间。
 
 #### 训练均衡与线上负载的差异
 
 训练阶段可以加入 Load-Balancing Loss 和 Gating Noise，鼓励模型更均匀地使用专家。但线上流量并不服从训练数据的稳定分布：某一时段的请求可能集中在代码、数学或某个垂直领域，使相关专家持续过热。
 
-例如，一个专家所在 GPU 利用率达到 99%，其他 GPU 平均只有 60%。即使集群平均利用率不高，MoE 层仍要等待最慢专家完成，剩余设备的空闲无法自动转化为更高吞吐。
+例如，假设热点专家所在 GPU 的利用率达到 99%，而其他 GPU 平均仅为 60%。即使集群平均利用率不高，MoE 层仍需等待热点专家完成，其他设备的空闲也无法自动转化为更高吞吐。
 
 设专家 $e$ 收到的 assignment 数为 $n_e$，一个直观的负载偏斜指标是：
 
@@ -775,13 +1017,13 @@ $$
 R_{imbalance}=\frac{\max_e n_e}{\operatorname{mean}_e n_e}
 $$
 
-$R_{imbalance}=1$ 表示按 assignment 数完全均衡，数值越大说明热点越严重。但 assignment 数相同也不保证完成时间相同，因为不同 rank 的排队、链路和 kernel 效率可能不同。MoE 层延迟可以粗略理解为：
+$R_{imbalance}=1$ 表示按 assignment 数完全均衡，数值越大说明热点越严重。但 assignment 数相同也不保证完成时间相同，因为不同 rank 的排队、链路和 kernel 效率可能不同。在忽略通信与专家计算重叠时，MoE 层关键路径可以粗略表示为：
 
 $$
-T_{MoE}\approx T_{dispatch}+\max_e T_{expert,e}+T_{combine}
+T_{MoE}\approx T_{dispatch}+\max_e\left(T_{queue,e}+T_{compute,e}\right)+T_{combine}
 $$
 
-其中最慢专家的完成时间位于关键路径上。因此，运行时应同时观察 assignment 数、队列时间和专家服务时间，而不是只看平均 GPU 利用率。
+最慢专家的排队与计算时间位于关键路径上。因此，运行时应同时观察 assignment 数、队列时间和专家服务时间，而不是只看平均 GPU 利用率。
 
 <a id="capacity-factor"></a>
 
@@ -806,7 +1048,7 @@ $$
 
 *论文原图：Capacity Factor 决定每个专家可处理的 token 容量。1.0 时不均匀路由更容易产生溢出；1.5 增加缓冲容量，但也增加空槽、计算和通信成本。来源：[Switch Transformers](https://arxiv.org/abs/2101.03961)，Figure 3。该图来自训练语境，用于说明 Capacity 的定义与权衡，不直接等价于线上推理结果。*
 
-> **实验观察：**Capacity Factor 提供的是热点缓冲空间，不是免费的均衡能力；增大容量会减少溢出，但也会增加预留和执行浪费。
+> **实验观察：** Capacity Factor 提供的是热点缓冲空间，而不是负载均衡能力。增大容量可以减少溢出；在固定容量和 padding 型实现中，它也会增加空槽、通信与计算浪费，而 dropless 或变长 grouped GEMM 实现的代价结构可能不同。
 
 例如，一个 batch 有 $T=5600$ 个 token，Kimi K3 每个 token 选择 $k=16$ 个专家，总专家数 $E=896$。完全均衡时，每个专家平均收到 100 个 token-to-expert assignment；若 $c=1.2$，容量上限约为 120。
 
@@ -827,7 +1069,7 @@ Capacity Factor 不是“负载均衡算法”，而是给热点设置缓冲边�
 
 ### 4.4 Expert Replication：热点分流与语义一致性
 
-> **结论：**复制同一个逻辑专家的权重，并在等价副本之间选择负载较低者，可以用额外显存换取热点容量，而不必改选其他专家。
+> **结论：** 复制同一个逻辑专家的权重，并在等价副本之间选择负载较低者，可以用额外显存换取热点容量，而不必改选其他专家。
 
 如果某些专家在较长时间内持续过热，可以把同一组权重复制到其他 GPU，并让路由系统在多个等价副本之间分流。
 
@@ -837,7 +1079,7 @@ Capacity Factor 不是“负载均衡算法”，而是给热点设置缓冲边�
 2. **语义相对稳定**：多个副本权重完全相同时，选择哪个副本不改变专家函数；
 3. **消耗额外显存**：副本越多，可用于其他专家和 KV cache 的空间越少。
 
-专家副本通常由推理引擎管理，模型的 Gating Network 仍然选择逻辑专家，系统层再把逻辑专家映射到某个物理副本。这样比直接把副本当作不同专家索引更容易保持模型语义。
+专家副本通常由推理引擎管理，模型的 gating network 仍然选择逻辑专家，系统层再把逻辑专家映射到某个物理副本。这样比直接把副本当作不同专家索引更容易保持模型语义。
 
 副本管理还需处理：
 
@@ -852,7 +1094,7 @@ Capacity Factor 不是“负载均衡算法”，而是给热点设置缓冲边�
 
 ### 4.5 Adaptive Routing：运行时反馈控制
 
-> **结论：**观测专家队列、完成时间和链路拥塞，再选择物理副本、通信路径或较慢时间尺度的专家放置；但不能把系统负载直接凌驾于模型 Gating 之上。
+> **结论：** 观测专家队列、完成时间和链路拥塞，再选择物理副本、通信路径或较慢时间尺度的专家放置；但不能把系统负载直接凌驾于模型 Gating 之上。
 
 传统 Gating 根据 token 的模型分数选择逻辑专家。Adaptive Routing 在保持这一语义边界的前提下，还会考虑专家队列、处理时间、GPU 利用率和通信拥塞。
 
@@ -863,31 +1105,31 @@ Capacity Factor 不是“负载均衡算法”，而是给热点设置缓冲边�
 
 **通常不改变模型语义的调整：**
 
-- 在**同一专家的等价副本**之间选择负载较低者；
-- 改变通信路径或 all-to-all 调度顺序；
+- 在 **同一专家的等价副本** 之间选择负载较低者；
+- 改变通信路径或 All-to-All 调度顺序；
 - 调整专家物理放置，但保持权重和逻辑映射不变。
 
 **可能影响模型质量的调整：**
 
 - 因主专家繁忙而改选不同权重的次优专家；
-- 动态修改 Gating Score 或 Top-k；
+- 动态修改 gating score 或 Top-k；
 - 跳过某些专家计算；
 - 因容量不足丢弃 token 的专家分支。
 
-这一区分非常重要。系统层路由优化不应把“负载更均匀”当作唯一目标，还要明确哪些动作会改变模型输出，并建立对应的质量回归测试。
+系统层路由优化不能只追求负载均衡；还必须标记可能改变模型输出的动作，并为其建立独立的质量回归测试。
 
-**监控指标：**仅看 GPU 利用率不足以定位专家热点。更有价值的指标包括：
+**监控指标：** 仅看 GPU 利用率不足以定位专家热点。更有价值的指标包括：
 
 | 指标 | 能发现的问题 |
 | --- | --- |
 | 每个专家收到的 token 数 | Gating 分布是否偏斜 |
 | 每个专家的队列长度和服务时间 | 是否存在实际 straggler |
-| Dispatch/Combine 字节数与耗时 | all-to-all 是否成为主瓶颈 |
+| Dispatch/Combine 字节数与耗时 | All-to-All 是否成为主瓶颈 |
 | 各 GPU 的 kernel 时间线 | 计算不均还是通信等待 |
 | NVLink/NIC 每链路利用率 | 是否存在拓扑热点 |
 | 溢出、改路由和副本命中次数 | 动态策略是否过于频繁 |
 
-Nsight Systems 可以观察不同 GPU 的 all-to-all 和专家计算时间线；Prometheus/Grafana 更适合持续收集专家级指标和建立告警。所有动态放置、路由偏置和副本变更都应记录日志，以便关联性能变化与模型质量变化。
+Nsight Systems 可以观察不同 GPU 的 All-to-All 和专家计算时间线；Prometheus/Grafana 更适合持续收集专家级指标和建立告警。所有动态放置、路由偏置和副本变更都应记录日志，以便关联性能变化与模型质量变化。
 
 自适应路由会引入额外的观测、决策和配置管理成本。控制回路过快会追逐短时噪声，过慢又无法及时处理热点。
 
@@ -895,43 +1137,43 @@ Nsight Systems 可以观察不同 GPU 的 all-to-all 和专家计算时间线；
 
 | 时间尺度 | 适合的动作 |
 | --- | --- |
-| 每个 token / batch | 在等价副本之间选路、执行 Capacity 检查 |
+| 每个 token / batch | 在等价副本之间选路、执行 capacity 检查 |
 | 秒到分钟 | 调整路由权重、batch 策略或流量分配 |
 | 分钟到小时 | 创建热点专家副本、迁移专家、调整物理放置 |
 | 离线 | 根据长期 gating 统计重新规划专家布局或训练均衡策略 |
 </Accordion>
 
-吞吐能否随 GPU 数接近线性增长，取决于 all-to-all、负载均衡和模型计算是否同时扩展。只增加专家和 GPU，而不解决网络与 straggler，通常不会得到线性收益。
+吞吐能否随 GPU 数接近线性增长，取决于 All-to-All、负载均衡和模型计算是否同时扩展。只增加专家和 GPU，而不解决网络与 straggler，通常不会得到线性收益。
 
 ---
 
-### 4.6 MoE 动态路由优化汇总
+### 4.6 MoE 运行时优化汇总
 
 | 问题 | 主要手段 | 核心权衡 |
 | --- | --- | --- |
-| all-to-all 过慢 | 拓扑感知、分层交换、分块流水、通信压缩 | 实现复杂度、缓冲区和精度 |
+| All-to-All 过慢 | 拓扑感知、分层交换、分块流水、通信压缩 | 实现复杂度、缓冲区和精度 |
 | 专家负载不均 | Capacity Factor、训练期均衡损失 | 延迟与模型质量 |
 | 持续热点 | Expert Replication | 额外显存与副本管理 |
 | 动态流量变化 | Adaptive Routing + Telemetry | 控制开销、稳定性与语义一致性 |
 
-MoE 路由优化的最终目标，不是让每个专家收到完全相同数量的 token，而是让**每个 MoE 层以尽可能短且稳定的时间完成，同时避免为了性能随意改变模型语义**。只有通信局部性、专家负载和运行时控制共同有效，EP 带来的模型容量扩展才能真正转化为服务吞吐。
+MoE 运行时优化的目标不是让每个专家收到完全相同数量的 token，而是在保持模型语义边界的前提下，缩短并稳定每个 MoE 层的完成时间。只有通信局部性、专家负载和运行时控制同时有效，EP 带来的容量扩展才能转化为服务吞吐。
 
 ---
 
-## 5. Speculative Decoding 与并行 token 生成
+## 5. Speculative Decoding：候选生成与批量验证
 
 自回归解码要求当前位置的输出作为下一位置的输入，因而 Target Model 调用位于串行关键路径。投机解码使用低成本方法生成多个候选，再由 Target Model 批量验证，以减少串行调用次数。
 
-> **结论：**投机解码的收益取决于候选生成成本、平均接受长度与批量验证效率。本节算法与案例参考 [AI Infra Learning Docs — Speculative Decoding](https://github.com/ai-infra-learning/docs/blob/main/talks/04-speculative-decoding.mdx)。
+> **结论：** 投机解码的收益取决于候选生成成本、平均接受长度与批量验证效率。本节算法与案例参考 [AI Infra Learning Docs — Speculative Decoding](https://github.com/ai-infra-learning/docs/blob/main/talks/04-speculative-decoding.mdx)。
 
 ### 5.1 Draft-and-Verify
 
 标准 Decode 生成 100 个 token，通常需要约 100 次模型前向。投机解码将部分高成本 Target Model 调用转换为以下流程：
 
 1. Draft Model 顺序提出 $k$ 个候选；
-2. Target Model 把候选当作一小段 Prefill，一次计算所有位置；
-3. 从前向后接受连续候选，遇到第一个拒绝位置时停止；
-4. 生成修正 token，开始下一轮。
+2. Target Model 将候选视为一段短 Prefill，一次计算所有候选位置及其后一个位置；
+3. 从前向后接受连续候选；若某个候选被拒绝，则在该位置生成修正 token 并结束本轮；
+4. 若 $k$ 个候选全部通过，则再从 Target 的下一个位置采样一个 bonus token，使本轮最多推进 $k+1$ 个 token。
 
 <Frame caption="标准投机解码的 Draft-and-Verify 流程">
   <img src="/books/ai-systems-performance-engineering/images/ch15-generated-speculative-flow.svg" alt="标准投机解码的 Draft-and-Verify 流程" />
@@ -941,7 +1183,7 @@ Draft 阶段仍具有自回归依赖，因为后一个候选依赖前一个候�
 
 ### 5.2 接受率与平均推进长度
 
-为建立简化分析模型，假设系统仅在前序候选全部通过时检查下一个候选，且每个被检查候选均以相同条件概率 $\alpha$ 被接受。若每轮最多提出 $k$ 个候选，平均推进长度近似为：
+为建立简化分析模型，假设系统仅在前序候选全部通过时检查下一个候选，且每个被检查候选均以相同条件概率 $\alpha$ 被接受。即使首个候选被拒绝，本轮也会生成一个修正 token；若 $k$ 个候选全部通过，则额外生成一个 bonus token。因此平均推进长度近似为：
 
 $$
 E[L]=1+\alpha+\alpha^2+\cdots+\alpha^k
@@ -962,9 +1204,9 @@ $$
   <img src="/books/ai-systems-performance-engineering/images/ch15-speculative-sampling-fig1-draft-length.png" alt="Draft 长度对采样时间、接受率和循环开销的影响" />
 </Frame>
 
-*论文原图：Draft 长度增大时，Target 调用减少，但接受率下降、Draft 成本上升，最终收益会饱和。来源：[Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318)，Figure 1。*
+*论文原图：Draft 长度增大时，Target 调用减少，但接受率下降、Draft 成本上升，最终收益会饱和。来源：[Accelerating Large Language Model Decoding with Speculative sampling](https://arxiv.org/abs/2302.01318)，Figure 1。*
 
-> **实验观察：**更长的 draft 同时增加潜在推进长度和失败浪费；最优 $k$ 由任务可预测性与 Draft/Verify 成本共同决定。
+> **实验观察：** 更长的 draft 同时增加潜在推进长度和失败浪费；最优 $k$ 由任务可预测性与 Draft/Verify 成本共同决定。
 
 > **平均推进 3.69 个 token 不等于 3.69× 加速。** 还要扣除 Draft、验证、采样和调度成本。
 
@@ -1000,7 +1242,9 @@ $$
 
 > **“质量无损”指标准算法理论上保持 Target Model 的输出分布。** 近似接受、跳层、低精度或随机数处理差异仍可能改变结果。
 
-### 5.4 候选来源
+### 5.4 候选来源与接受语义
+
+候选生成方式与接受规则是两个需要分别分析但并非任意组合的维度：前者决定候选成本和命中率，后者决定最终输出是否严格保持 Target Model 分布。严格的接受—拒绝校正要求能够获得或构造与候选机制相匹配的 proposal 分布；只输出候选集合而没有可用概率的机制，通常需要专门校正或采用近似接受。双模型、Prompt Lookup、Self-Speculative、EAGLE 和 Medusa 的主要差异在候选来源：
 
 | 方法 | 候选来源 | 核心特点 |
 | --- | --- | --- |
@@ -1010,7 +1254,7 @@ $$
 | EAGLE | 预测 Target 未来 hidden state | 复用 Embedding 与 LM Head |
 | Medusa | 多个未来位置预测头 | Draft 阶段并行生成候选树 |
 
-EAGLE 与 Medusa 的主要差异在于候选预测对象。
+具备兼容 proposal 分布的候选机制可以使用严格的接受—拒绝校正；其他实现通常采用专门设计或近似接受规则，后者可能改变原始采样分布。EAGLE 与 Medusa 的主要差异在候选预测对象，其分布保证仍取决于具体接受算法。
 
 <a id="eagle"></a>
 
@@ -1044,7 +1288,7 @@ shifted token 用于消除由采样结果引起的分支歧义。例如，状态
 
 *论文原图：Vicuna-7B、MT-Bench、temperature=0 条件下，直接预测 token、feature 和 feature+shifted-token 的对比。来源：[EAGLE](https://arxiv.org/abs/2401.15077)，Figure 4。*
 
-> **实验观察：**在该实验配置下，单独预测 feature 的结果优于直接预测 token；加入 shifted token 后，预测输入包含实际采样分支信息，准确率和端到端加速比进一步提高。
+> **实验观察：** 在该实验配置下，单独预测 feature 的结果优于直接预测 token；加入 shifted token 后，预测输入包含实际采样分支信息，准确率和端到端加速比进一步提高。
 
 实验中，加速比从 token 预测的约 1.5×，提高到 feature 的约 1.9×，加入 shifted token 后约为 2.8×。这些是特定实验结果，不是固定加速承诺。
 
@@ -1070,246 +1314,89 @@ Head 1 对 $x_{t+2}$ 的预测不以最终采样的 $x_{t+1}$ 为条件，因此
 
 Medusa 的 Typical Acceptance 会接受 Target 认为“足够典型”的候选，但不再严格保持原始采样分布，需要单独评估生成质量。
 
-### 5.7 方案选择
+### 5.7 适用条件与选型指标
 
-投机解码更适合 Target 很大、输出较长、batch 较小或中等、任务可预测性较高的场景。评估时至少测量平均推进长度、Draft/Verify 耗时、端到端延迟、吞吐、显存占用和输出质量。
-
-投机解码以低成本候选生成替代部分高成本 Target Model 串行调用。EAGLE 预测未来 hidden state；Medusa 使用多个预测头生成不同未来位置的 token 候选。端到端收益由候选生成成本、平均接受长度和验证效率共同决定，候选数量本身不能直接推导加速比。
-
----
-
-## 6. Constrained Decoding 的性能影响
-
-当输出必须满足 JSON Schema、函数参数定义或代码 grammar 时，仅依赖提示词无法保证语法合法性。Constrained Decoding 在采样阶段维护 grammar state，并通过 token mask 排除当前状态下的非法 token。
-
-> **保证范围：**语法合法性依赖 backend 支持目标 grammar、tokenizer 映射正确、未回退到无约束路径且输出未被长度上限截断。该机制不保证字段值满足业务语义。
-
-### 6.1 Grammar state 与 token mask
-
-提示词中的格式要求不构成语法合法性保证。例如，目标输出为：
-
-```json
-{"city": "Shenzhen", "days": 3}
-```
-
-无约束解码可能生成 `{city: "Shenzhen", "days": three}`。Constrained Decoding 将 JSON Schema 或 CFG 编译为可执行状态，执行流程如下：
-
-1. 模型输出全词表 logits；
-2. grammar engine 根据已生成前缀确定当前状态；
-3. 计算允许的 token 集合，并屏蔽其余 logits；
-4. 从合法集合中采样并更新状态。
-
-<Frame caption="Constrained Decoding 的语法状态与 token mask">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-generated-constrained-decoding.svg" alt="Constrained Decoding 的语法状态与 token mask" />
-</Frame>
-
-难点在于 Grammar 通常以字符或字段描述，而 Tokenizer 的一个 token 可能跨越多个语法符号。Grammar Engine 必须把规则正确映射到 token ID。
-
-> **高性能实现通常让状态机向前推进，而不是生成错误后再频繁回溯。**
-
-### 6.2 性能开销与优化
-
-| 开销 | 发生时间 | 优化方向 |
+| 方案 | 更适合的条件 | 主要代价或限制 |
 | --- | --- | --- |
-| Grammar 编译 | Schema 首次使用 | 缓存编译结果 |
-| 状态更新 | 每个 Decode Step | 预计算状态转移 |
-| token mask | 每个 Decode Step | 压缩合法集合，与 Sampling 融合或下推 GPU |
-| Backend Fallback | 不支持某类 Grammar 时 | 记录实际 Backend，避免静默回退到 Python 慢路径 |
+| 双模型 Draft | 已有与 Target 分布接近的小模型 | 额外权重、显存与跨模型调度 |
+| Prompt Lookup | prompt 中存在大量可复用片段 | 对开放式生成收益有限 |
+| Self-Speculative | 希望复用 Target 且可接受近似计算路径 | 跳层策略与质量验证复杂 |
+| EAGLE | 可训练 feature-level Draft，并希望复用 LM Head | 需要额外训练和 feature 预测模块 |
+| Medusa | 可修改 Target 并训练多个预测头 | 候选树、Tree Attention 与接受规则增加实现复杂度 |
 
-<Frame caption="XGrammar 每 token mask 生成延迟">
-  <img src="/books/ai-systems-performance-engineering/images/ch15-xgrammar-fig9-mask-latency.png" alt="XGrammar 每 token mask 生成延迟" />
-</Frame>
-
-*论文原图：XGrammar 在论文实验中的 mask 延迟约为 36–191 微秒/token，部分基线达到毫秒量级。来源：[XGrammar](https://arxiv.org/abs/2411.15100)，Figure 9；硬件为 AMD Ryzen 9 7950X 与 NVIDIA RTX 4090。*
-
-> **实验观察：**grammar 相同并不意味着开销相同；预编译、状态表示和 token mask 实现可以造成一个或多个数量级的延迟差异。
-
-这组结果说明，约束解码不是没有成本，而是实现方式可以让相同功能相差一个或多个数量级。最终应测量 Grammar Compile Time、TTFT、TPOT、P95/P99 延迟、CPU 利用率和输出合法率。
-
-### 6.3 生成时约束与生成后校验
-
-| 方案 | 优势 | 代价 |
-| --- | --- | --- |
-| 生成时约束 | 在 backend 支持、映射正确且输出未截断时保证指定语法合法 | 每步增加状态更新和 mask 开销；不保证业务语义正确 |
-| 生成后校验 | 解码路径简单 | 失败后可能修复或重新生成整段内容 |
-
-选择标准不是单独比较 tokens/s，而是比较**得到一个最终可用结果的总成本**。格式错误容易低成本修复时，后处理可能更简单；输出必须一次合法或重试代价很高时，Constrained Decoding 更可靠。
+投机解码通常更适合 Target Model 较大、输出较长、batch 较小或中等且任务可预测性较高的场景。选型时应同时测量平均推进长度、Draft 与 Verify 耗时、端到端延迟、吞吐、显存占用和输出质量；候选数量本身不能直接推导加速比。
 
 ---
 
-## 7. 核心结论
+## 6. 核心结论与系统决策框架
 
-多节点推理是一组围绕 goodput 展开的系统决策，涉及模型布局、数据通信、请求调度及复杂度控制。方案有效性应依据端到端服务能力，而非单项局部性能判断。
+多节点推理应围绕 SLO 约束下的 goodput 进行端到端优化。模型容量、阶段资源竞争、通信拓扑、专家负载和解码串行性分别位于不同层次，不能用单一局部指标替代整体判断。
 
----
+### 6.1 从服务目标到执行优化
 
-### 7.1 SLO 约束下的 goodput 是主要评价指标
+| 层次 | 关键决策 | 采用条件 | 主要验证指标 |
+| --- | --- | --- | --- |
+| **服务目标** | 定义 TTFT、TPOT 与 SLO attainment | 进入任何架构优化之前 | goodput、P95/P99 TTFT、P95/P99 TPOT |
+| **阶段资源组织** | 共置、Chunked Prefill 或 PD 分离 | 隔离收益需要覆盖 KV Handoff 与双池成本 | 两侧队列、Handoff 延迟、资源利用率 |
+| **模型布局** | 组合 TP、SP、PP、EP、CP，再用 DP 扩吞吐 | 先满足容量，再匹配通信与物理拓扑 | 显存余量、集合通信占比、端到端延迟 |
+| **MoE 运行时** | 优化 Dispatch/Combine、负载均衡与专家副本 | All-to-All 或 straggler 位于关键路径 | 专家完成时间、链路利用率、溢出与副本命中率 |
+| **投机解码** | 选择候选生成器与接受规则 | Target 串行成本高，且候选生成与验证成本可被摊销 | 平均推进长度、Draft/Verify 时间、输出质量 |
 
-增大 batch size 或增加 GPU 可能提高 token 吞吐，也可能恶化排队时间、TTFT 或 TPOT。系统优化应验证在既定 TTFT 与 TPOT 约束下，按时完成的请求数量是否增加。
+这些决策存在依赖关系，但不存在适用于所有负载的固定实施顺序。服务目标和容量约束应先明确；随后应根据 profiling 结果处理当前关键瓶颈，而不是机械地依次引入所有优化。若更上游的容量、排队或通信问题仍占据关键路径，下游局部加速通常难以稳定转化为 goodput。
 
-评估指标必须同时覆盖尾延迟、资源利用率、通信时间和 tokens/s。局部 kernel 性能提升只有在改善端到端服务指标时才构成有效优化。
-
----
-
-### 7.2 PD 分离的适用条件由干扰收益与新增成本共同决定
-
-Prefill 与 Decode 使用同一个模型，却具有不同的计算形态和延迟目标。PD 分离通过独立资源池隔离相互干扰，让两个阶段分别选择 batch、并行策略和扩容方式。
-
-但分离不会减少模型 FLOPs，还会增加 KV cache Handoff、跨池调度和容量平衡。它成立的条件是：
-
-$$
-\text{隔离干扰带来的 goodput 收益}
->
-\text{KV 传输与新增系统成本}
-$$
-
-小集群、低负载或网络条件较差时，Chunked Prefill 等共享资源方案可能更合适。分离是一种有条件的架构选择，不是默认答案。
-
----
-
-### 7.3 并行策略从切分维度出发
-
-五种并行策略解决不同约束：
-
-| 策略 | 切分对象 | 主要目标 |
-| --- | --- | --- |
-| **TP** | 层内张量 | 分摊单层权重和计算，降低层内计算时间 |
-| **PP** | Transformer 层 | 分摊模型深度和整体容量 |
-| **EP** | MoE 专家 | 分布专家权重 |
-| **DP** | 请求与模型副本 | 扩展整体请求吞吐 |
-| **CP** | 序列位置 | 分摊超长上下文的计算和状态 |
-
-它们不是可互换的“加速开关”。层太宽不能靠 DP 解决，模型太深也不能期待 PP 自动降低单请求 Decode 延迟。
-
-混合并行的可靠配置顺序是：
-
-1. 先满足权重和 KV cache 的容量约束；
-2. 再判断单请求延迟与服务吞吐目标；
-3. 将不同通信模式映射到合适的物理链路；
-4. 最后用 profiling 找到并行度的收益递减点。
-
----
-
-### 7.4 并行度的有效上限由通信拓扑决定
-
-增加并行度会减少单卡计算，也会增加同步与数据交换。TP 几乎每层都要通信，因此最依赖 NVLink/NVSwitch 等高速互联；PP 的 stage 间通信频率较低，更容易跨节点；EP 的 all-to-all 则同时受到拓扑、消息粒度和负载偏斜影响。
-
-| 物理范围 | 更适合承载的通信 |
-| --- | --- |
-| 单机 NVLink / NVSwitch | TP、局部 EP 等高频集合通信 |
-| 跨节点 InfiniBand / RoCE | PP、分层 EP、KV cache Handoff 等较粗粒度传输 |
-| Host-staged 路径 | 只应作为兼容性回退，需要谨慎评估大规模通信 |
-
-> **更多 GPU 不等于更高的有效并行度。** 当新增通信时间超过节省的计算时间后，继续扩大并行组会让性能下降。
-
----
-
-### 7.5 EP 与动态路由分别负责专家布局和 assignment 执行
-
-MoE 的单 token 计算是稀疏的，但全部专家权重仍需常驻；在高并发服务中，大多数专家也可能同时活跃。
-
-采用 EP 后，一个 MoE 层还要执行：
-
-```text
-Gating 选择逻辑专家
-        ↓
-Dispatch all-to-all
-        ↓
-专家计算
-        ↓
-Combine all-to-all
-```
-
-因此，MoE 的扩展上限通常由两件事共同决定：
-
-- **通信是否高效**：跨慢链路流量、消息粒度与通信计算重叠；
-- **最慢专家是否过慢**：热点、排队和 GPU 状态共同形成 straggler。
-
-负载均衡的目标不是让每个专家收到完全相同数量的 token，而是让各专家尽量同时完成。Runtime Router 可以在同一专家的等价副本之间选路，但如果为了性能改选不同权重的专家，就可能改变模型语义，必须单独做质量验证。
-
----
-
-### 7.6 解码优化的收益取决于有效计算量的减少
-
-标准 Decode 每次只能推进一个 token。Speculative Decoding、EAGLE 和 Medusa 都希望让一次 Target Model 调用验证多个候选，从而减少串行调用次数。
-
-它们的核心贡献分别是：
-
-- **标准投机采样**：使用低成本 Draft Model 生成候选，并通过接受—拒绝校正保持 Target Model 分布；
-- **EAGLE**：预测未来 hidden state，再复用 LM Head 产生候选；
-- **Medusa**：多个预测头并行提出未来位置，通过 Candidate Tree 与 Tree Attention 验证。
-
-决定收益的不是“提出了几个候选”，而是：
-
-> **平均接受长度节省的 Target 时间，能否覆盖 Draft、验证、显存和调度成本。**
-
-受约束解码解决另一个问题：在 backend 支持、tokenizer 映射正确且输出未截断时，它用 grammar state 与 token mask 保证指定结构合法，减少格式错误后的整段重试；这不保证业务语义正确。评价时不能只看 tokens/s，而应比较得到一个最终可用结果的总成本。
-
----
-
-### 7.7 复杂度增量需要对应可测量的端到端收益
+### 6.2 复杂度预算与验证顺序
 
 | 优化 | 新增复杂度 |
 | --- | --- |
 | PD 分离 | KV Handoff、跨池调度、两侧容量平衡 |
 | 混合并行 | 多组通信域、拓扑映射和调试难度 |
+| MoE 自适应路由 | 专家级监控、控制回路、副本管理与质量验证 |
 | 投机解码 | Draft Model/Head、接受逻辑和额外显存 |
-| 受约束解码 | Grammar Engine、token mask 与 Backend 兼容性 |
-| Adaptive Routing | 专家级监控、控制回路、副本管理与质量验证 |
 
-合理的优化过程是：
-
-1. 用 profiling 找到最大的端到端瓶颈；
-2. 选择直接缓解该瓶颈的最小改动；
-3. 同时测量延迟、goodput、显存、网络和质量；
-4. 只有收益稳定覆盖复杂度后，再引入下一项优化。
-
----
-
-### 7.8 系统决策框架
-
-| 层次 | 关键决策 | 目标 |
-| --- | --- | --- |
-| **服务目标** | TTFT、TPOT 与 goodput SLO | 定义什么才算有效请求 |
-| **资源组织** | Prefill/Decode 是否分离 | 隔离冲突负载，独立扩缩容 |
-| **模型布局** | TP、PP、EP、DP、CP 的组合方式 | 满足模型与上下文容量约束，并控制通信成本 |
-| **运行时控制** | 请求路由、专家路由、负载均衡和监控 | 让 token 高效到达计算，降低尾延迟 |
-| **执行优化** | 投机解码、受约束解码 | 减少串行成本，提高一次可用率 |
-
-综合而言，多节点推理需要在统一的端到端服务目标下联合优化计算、通信、缓存与调度；单设备峰值性能不足以代表系统级服务能力。
+实施时应先通过 profiling 定位端到端瓶颈，再选择直接缓解该瓶颈的最小改动；每次变更同时测量延迟、goodput、显存、网络和输出质量。只有收益稳定覆盖新增复杂度后，才继续引入下一项机制。
 
 ---
 
 ## 常见技术问题
 
-<Accordion title="MoE 稀疏激活与集群容量需求">
-稀疏性作用于单 token 计算，而非全部专家的常驻参数。全部专家权重仍需分布在集群中，高并发下多数专家也可能同时活跃。参见[模型规模与系统压力](#moe-scale)。
+以下问题集中说明正文中最容易混淆的概念、适用条件和指标边界。
+
+<Accordion title="MoE 每个 token 只激活少数专家，为什么部署时仍需要大量 GPU 和显存？">
+MoE 的稀疏性作用于单 token 的计算路径，而不是模型总权重。每个 token 只执行 Top-k 专家，但全部专家权重仍需分布在集群中；在常规低延迟部署中，这些权重通常需要在设备侧保持可用。高并发下，不同 token 会选择不同专家，多数 GPU 也可能同时活跃。因此，MoE 降低的是单 token 计算量相对于总参数量的增长速度，并不会把超大模型转化为小模型部署。参见[模型规模与系统压力](#moe-scale)。
 </Accordion>
 
-<Accordion title="Expert Parallelism 与动态路由的职责边界">
-EP 定义逻辑专家所在的物理 rank，Runtime Router 负责 assignment 到专家及其等价副本的运行时映射。前者属于模型布局，后者属于执行调度。参见[EP 的职责边界](#expert-parallelism)。
+<Accordion title="Expert Parallelism、模型 Gating 和 Runtime Router 分别负责什么，哪些调整可能改变模型输出？">
+EP 定义逻辑专家到物理 rank 的静态布局；模型 Gating 根据 hidden state 选择逻辑专家；Runtime Router 再把 token-to-expert assignment 映射到专家所在 rank 或同一专家的等价副本。在等价副本之间选路、调整通信路径或移动同权重专家通常不改变模型语义；改选不同权重的专家、修改 Top-k、跳过专家或丢弃分支则可能改变输出，必须单独进行质量验证。参见[EP 的职责边界](#expert-parallelism)。
 </Accordion>
 
-<Accordion title="TP 与 PP 的切分和通信差异">
-TP 切分层内矩阵，几乎每层都需要同步；PP 切分模型深度，仅在 stage 间传递激活。TP 更依赖高速互联，PP 主要用于满足模型整体容量约束。参见[并行策略](#parallelism)。
+<Accordion title="TP 和 PP 都能降低单卡权重占用，为什么 TP 通常限制在高速互联域，而 PP 更适合跨节点？">
+TP 切分同一层的矩阵计算，Attention 和 MLP 几乎每层都需要集合通信，因此对带宽和同步延迟高度敏感。PP 沿模型深度切分层，只在 stage 边界传递激活，通信频率更低、消息通常更粗粒度，更容易映射到跨节点链路。TP 还可能降低单层计算延迟；PP 主要解决模型整体容量，通常不会缩短单请求 Decode 路径。参见[并行策略](#parallelism)。
 </Accordion>
 
-<Accordion title="PD 分离与 Chunked Prefill 的选择条件">
-PD 分离提供更彻底的阶段隔离，但会增加 KV cache Handoff、双池容量和实例成本。只有隔离收益覆盖新增成本时，PD 分离才优于共享资源方案。参见[PD 分离](#pd-disaggregation)。
+<Accordion title="Megatron Sequence Parallelism 为什么能节省显存，但实际训练通信量可能高于经典 TP？">
+SP 复用 TP group，把 LayerNorm、Dropout 和残差等非 TP 区域的 activation 沿 sequence 维切分，使每个 rank 长期保存约 $1/p$ 的激活。进入 TP 区域时需要 All-Gather，离开时通过 Reduce-Scatter 切回分片。为保留完整显存收益，反向计算列并行权重梯度前还需重新 All-Gather 输入 activation；因此实际网络字节数可能高于只统计边界 collective 的理论值。实现通常将这些通信与梯度 GEMM 重叠，所以通信量增加不等于关键路径按相同比例变长。参见[并行策略](#parallelism)。
 </Accordion>
 
-<Accordion title="投机解码中“质量无损”的适用范围">
-标准接受与修正算法在理论上保持 Target Model 的输出分布。该结论不表示 Draft Model 的候选始终正确，也不覆盖近似接受、跳层和低精度实现。参见[Target 分布的保持](#speculative-distribution)。
+<Accordion title="SP 和 CP 都沿 sequence 维切分数据，核心区别是什么，能否在同一个模型实例中同时启用？">
+SP 主要改变训练 activation 的存储布局：进入 TP 计算区域时会临时恢复当前 CP 分片的完整输入。CP 改变 Attention 的执行布局：Ring 类方法保持上下文分片并交换 K/V，Ulysses 类方法则恢复完整 sequence、同时只保留部分 attention heads。两者可以同时启用；SP 通常复用 TP group，不增加独立 world-size 维度，而 CP 构成独立的 rank 维度。组合后，SP 的 All-Gather 只恢复 CP-local sequence，全局 Attention 依赖仍由 CP 通信完成。参见[并行策略](#parallelism)。
 </Accordion>
 
-<Accordion title="EAGLE 与 Medusa 的候选生成差异">
-EAGLE 外推未来 hidden state 并复用 LM Head；Medusa 使用多个预测头并行生成不同未来位置的 token 候选，再验证 Candidate Tree。参见 [EAGLE](#eagle) 与 [Medusa](#medusa)。
+<Accordion title="什么时候应采用 Prefill/Decode 分离，什么时候保留共享资源池并使用 Chunked Prefill？">
+当共置部署已出现明显阶段干扰、TTFT 与 TPOT 都有严格 SLO、集群规模足以独立调节两个资源池，且 KV cache 能通过高带宽路径传输时，PD 分离更有价值。它提供更彻底的隔离，但会增加 KV Handoff、权重副本、双池容量平衡和调度复杂度。集群较小、负载较低或网络条件不足时，Chunked Prefill 可以在共享资源池内限制长 Prefill 的阻塞，并保持更高的资源复用率。最终应比较 goodput、尾延迟、Handoff 延迟和两侧队列，而不是只比较 tokens/s。参见[PD 分离](#pd-disaggregation)。
 </Accordion>
 
-<Accordion title="Medusa Top-5 覆盖率的指标边界">
-Top-5 覆盖率是离线候选覆盖指标，不等同于线上接受率或固定加速比。该数据仅表明目标 token 经常位于前若干候选中，可用于支持 Candidate Tree 的设计。参见 [Medusa](#medusa)。
+<Accordion title="投机解码所说的“质量无损”具体保证什么，哪些实现不在这个保证范围内？">
+标准投机采样通过接受概率和拒绝后的修正分布，在理论上保持 Target Model 的输出分布；它并不要求 Draft Model 的每个候选都正确。“质量无损”不自动覆盖 Typical Acceptance、近似接受、跳层 Self-Speculative、低精度误差或不同的随机数处理。候选机制还必须提供或构造与校正算法兼容的 proposal 分布，否则需要专门校正或单独评估质量。参见[Target 分布的保持](#speculative-distribution)。
 </Accordion>
 
-<Accordion title="Capacity Factor 的配置权衡">
-较大的 Capacity Factor 会增加空槽和执行浪费，较小的取值则更容易触发溢出、改路由、延后或丢弃。该参数定义容量边界，不构成完整的负载均衡算法。参见 [Capacity Factor](#capacity-factor)。
+<Accordion title="EAGLE 与 Medusa 都用于投机解码，它们预测的对象、候选结构和训练要求有什么不同？">
+EAGLE 预测 Target Model 未来的 LM Head 输入 hidden state，再复用 Target 的 LM Head 生成 token 候选；shifted token 用于标识采样后实际进入的分支。Medusa 则在同一个 hidden state 上增加多个预测头，直接预测不同未来位置的 token，并通过 Candidate Tree 与 Tree Attention 批量验证多条路径。EAGLE 需要训练 feature-level Draft 模块，Medusa 需要修改并训练多个预测头；两者的分布保证仍取决于具体接受算法。参见 [EAGLE](#eagle) 与 [Medusa](#medusa)。
+</Accordion>
+
+<Accordion title="Medusa 的 Top-5 覆盖率超过 80% 是否意味着线上接受率超过 80%，或一定能获得固定加速比？">
+不能。Top-5 覆盖率是离线候选集合是否包含目标 token 的统计指标，不等同于候选沿同一路径连续通过的线上接受率。端到端加速还取决于候选树大小、Target 验证成本、平均连续接受长度、batch、显存和调度开销。该指标只说明保留多个候选有助于构建 Candidate Tree，不能直接推导线上加速比。参见 [Medusa](#medusa)。
+</Accordion>
+
+<Accordion title="Capacity Factor 是否越大越安全，它与真正的专家负载均衡有什么区别？">
+Capacity Factor 为每个专家设置 batch 内的容量边界。增大取值可以减少溢出，但在固定容量、padding 型实现中会增加空槽、通信和计算浪费；减小取值则更容易触发改路由、延后或丢弃。dropless 或变长 grouped GEMM 的代价结构可能不同。Capacity Factor 只能提供热点缓冲空间，不能消除 Gating 偏斜、网络拥塞或专家服务时间差异，因此不构成完整的负载均衡算法。参见 [Capacity Factor](#capacity-factor)。
 </Accordion>
