@@ -1,6 +1,6 @@
 ---
 title: "Agent"
-description: "Agent 框架、运行时与开发工具"
+description: "Agent 框架、Sandbox、运行时与开发工具"
 ---
 
 ## Agent 框架
@@ -8,3 +8,15 @@ description: "Agent 框架、运行时与开发工具"
 | 项目 | 简介 | 参考资料 |
 |------|------|----------|
 | [vercel/eve](https://github.com/vercel/eve) | Vercel 开源的文件系统优先持久化 Agent 框架，通过约定目录组织 Instructions、Tools、Skills、Channels 和 Schedules，方便检查、扩展和运行 Agent 项目。 | [官方文档](https://eve.dev/) |
+
+## Agent Sandbox
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [kvcache-ai/AgentENV](https://github.com/kvcache-ai/AgentENV) | 面向大规模 Agent 环境的分布式运行平台，基于 Firecracker microVM 提供快速启动、暂停、恢复、快照和 Fork，并兼容 E2B API。 | [官方文档](https://kvcache-ai.github.io/AgentENV/latest/) |
+| [opensandbox-group/OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) | 面向 Coding Agent、GUI Agent、评测和 RL 训练的通用 Sandbox 平台，提供统一 API、多语言 SDK，以及 Docker 和 Kubernetes Runtime。 | [官方文档](https://open-sandbox.ai/getting-started/) |
+| [TencentCloud/CubeSandbox](https://github.com/TencentCloud/CubeSandbox) | 基于 RustVMM 与 KVM 的轻量级 Agent Sandbox，支持硬件级隔离、E2B API、快照以及单节点和多节点部署。 | [官方文档](https://cubesandbox.com/guide/introduction.html) |
+| [agent-substrate/substrate](https://github.com/agent-substrate/substrate) | Kubernetes 上的高密度 Agent Runtime，将大量有状态 Actor 复用到较少的 Worker，并提供亚秒级暂停恢复、状态持久化和请求路由。 | [项目说明](https://github.com/agent-substrate/substrate#readme) |
+| [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) | Kubernetes SIG Apps 的 Sandbox CRD 与控制器，为有状态单实例环境提供稳定身份、持久化、生命周期管理和预热池，并将底层隔离交给 gVisor、Kata 等 Runtime。 | [官方文档](https://agent-sandbox.sigs.k8s.io/docs/) |
+| [openkruise/agents](https://github.com/openkruise/agents) | 面向 Kubernetes Agent Sandbox 生命周期管理的 Operator，提供资源池、动态扩缩、休眠与 Checkpoint、会话路由，以及 E2B 和 Kubernetes API。 | [官方文档](https://openkruise.io/kruiseagents/introduction) |
+| [volcano-sh/agentcube](https://github.com/volcano-sh/agentcube) | Volcano 社区面向 Agent 工作负载提出的管理系统，聚焦低延迟调度、有状态休眠恢复、高密度资源利用和命令式执行 API。 | [项目提案](https://github.com/volcano-sh/volcano/issues/4686) |

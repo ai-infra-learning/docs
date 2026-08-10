@@ -3,6 +3,23 @@ title: "推理"
 description: "LLM Serving、KV Cache、调度与推理优化项目"
 ---
 
+## 推理引擎
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [vllm-project/vllm](https://github.com/vllm-project/vllm) | 高吞吐、显存高效的 LLM 推理与 Serving 引擎，提供 PagedAttention、连续批处理、分布式推理以及 OpenAI 兼容服务接口。 | [官方文档](https://docs.vllm.ai/) |
+| [sgl-project/sglang](https://github.com/sgl-project/sglang) | 面向语言模型和多模态模型的高性能推理框架，覆盖 RadixAttention、结构化输出、推测解码和分布式 Serving。 | [官方文档](https://docs.sglang.io/) |
+| [NVIDIA/TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | 面向 NVIDIA GPU 的 LLM 推理引擎，提供优化 Kernel、量化、In-flight Batching 以及多 GPU、多节点推理能力。 | [官方文档](https://nvidia.github.io/TensorRT-LLM/) |
+
+## 推理平台
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | 面向数据中心级 GPU 集群的分布式推理框架，负责请求路由、Prefill-Decode 分离、Worker 编排和跨节点推理。 | [官方文档](https://docs.nvidia.com/dynamo/latest/) |
+| [llm-d/llm-d](https://github.com/llm-d/llm-d) | Kubernetes 原生的分布式 LLM 推理栈，围绕推理引擎提供智能路由、Prefill-Decode 分离、KV Cache 感知调度和集群部署能力。 | [官方网站](https://www.llm-d.ai/) |
+| [volcano-sh/kthena](https://github.com/volcano-sh/kthena) | Kubernetes 原生 AI Serving 平台，通过声明式资源管理模型服务，并提供推理路由、资源调度与多节点部署能力。 | [官方文档](https://kthena.volcano.sh/docs/intro) |
+| [ome-projects/ome](https://github.com/ome-projects/ome) | 面向 LLM Serving 的 Kubernetes Operator，管理模型生命周期、Serving Runtime、服务部署和 GPU 调度，支持 SGLang、vLLM、TensorRT-LLM 与 Triton。 | [官方文档](https://ome-projects.github.io/ome/docs/overview/) |
+
 ## KV Cache
 
 | 项目 | 简介 | 参考资料 |
