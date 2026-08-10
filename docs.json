@@ -91,12 +91,6 @@
         "tab": "学习资源",
         "groups": [
           {
-            "group": "概览",
-            "pages": [
-              "resources/index"
-            ]
-          },
-          {
             "group": "主题分类",
             "pages": [
               "resources/llm-foundations",
@@ -106,6 +100,18 @@
               "resources/gpu-programming",
               "resources/performance-analysis",
               "resources/agents"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "开源项目",
+        "groups": [
+          {
+            "group": "主题分类",
+            "pages": [
+              "projects/agents",
+              "projects/cluster-infrastructure"
             ]
           }
         ]
