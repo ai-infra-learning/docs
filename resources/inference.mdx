@@ -19,6 +19,7 @@ description: "LLM Serving、缓存、调度、PD 分离、推测解码与量化"
 | [LMCache 技术：计算与存储解耦下的分布式缓存演进](https://mp.weixin.qq.com/s/jt3FP6WoQHDGGNVAKr0wKg) | 论文合集 | 以 LMCache 为主线串联 CacheGen、CacheBlend、TraCT 等相关工作，梳理 KV Cache 压缩、知识融合、传输与分布式缓存系统的演进。 |
 | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) | 论文 | 提出 PagedAttention，以分页方式管理非连续 KV Cache，减少内存碎片和冗余复制，是 vLLM 高吞吐 Serving 的核心工作。 |
 | [CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion](https://arxiv.org/abs/2405.16444) | 论文 | 复用不同知识块的 KV Cache，并选择性重算少量 Token 以融合跨块注意力，在保持生成质量的同时降低 RAG 的 TTFT。 |
+| [SnapKV: LLM Knows What You are Looking for Before Generation](https://arxiv.org/abs/2404.14469) | 论文 | 从提示末尾的观察窗口识别各 Attention Head 关注的位置，仅保留聚类后的重要 KV，在无需微调的情况下压缩长上下文 KV Cache。 |
 
 ## 调度与批处理
 

@@ -8,3 +8,6 @@ description: "LLM Serving、KV Cache、调度与推理优化项目"
 | 项目 | 简介 | 参考资料 |
 |------|------|----------|
 | [LMCache/LMCache](https://github.com/LMCache/LMCache) | 面向 LLM 推理的 KV Cache 管理层，可将缓存卸载到 CPU、磁盘或远程存储，并在请求和 Serving 实例之间持久化与复用，减少重复 Prefill 计算并降低首 Token 延迟。 | [官方文档](https://docs.lmcache.ai/) |
+| [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | 面向大规模 LLM 推理的分布式 KV Cache 系统，提供 CPU、SSD、分布式存储三级缓存、跨节点复用和异步预取，已集成 vLLM、SGLang、TensorRT-LLM 与 Dynamo。 | [使用文档](https://github.com/taco-project/FlexKV#readme) |
+| [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | 提供高性能 Transfer Engine 和分布式 Mooncake Store，更偏向 KV Cache 的传输与存储底座；既可独立使用，也可作为 LMCache 后端。 | [官方文档](https://kvcache-ai.github.io/Mooncake/) |
+| [SGLang HiCache](https://github.com/sgl-project/sglang) | SGLang 内置的分层 KV Cache 系统，在 GPU、CPU 与分布式存储之间缓存和复用 KV 数据，扩展可用缓存容量并减少重复 Prefill。 | [官方文档](https://docs.sglang.io/docs/advanced_features/hicache) |
