@@ -1,0 +1,91 @@
+---
+title: "LLM 推理"
+description: "LLM Serving、模型量化和 KV Cache 面试题"
+---
+
+## KV Cache 与数值精度
+
+### 面试题
+
+> 同一模型采用不同权重精度或 KV Cache 精度时，KV Cache 的显存占用、容量、性能和精度有什么区别？请结合 vLLM 的 `--dtype`、`--quantization` 和 `--kv-cache-dtype` 说明。
+
+### 核心结论
+
+权重精度和 KV Cache 精度是两个独立变量。固定 KV Cache dtype 时，权重精度不会改变单个 token 的 KV Cache 大小；权重量化通过减少模型权重占用，间接为 KV Cache 释放更多显存。KV Cache dtype 则直接决定每个缓存值占用的字节数，同时影响 Attention 的访存量和数值误差。
+
+### 三个参数的控制边界
+
+| 参数 | 控制内容 | 常见参数值 | 对 KV Cache 的影响 |
+|------|----------|------------|--------------------|
+| [`--dtype`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-dtype) | 模型的基础浮点 dtype。未量化模型的浮点权重、普通激活和未量化层使用该 dtype。 | `auto`、`float16`、`bfloat16`、`float32` | `--kv-cache-dtype=auto` 时，KV Cache 跟随模型 dtype；显式设置 KV dtype 后不再由它决定。 |
+| [`--quantization`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-quantization) | 量化方案、量化权重格式以及对应的计算 kernel。 | `awq`、`gptq`、`fp8`、`bitsandbytes` | 不直接改变 KV Cache dtype。权重占用下降后，剩余显存可以分配给更多 KV block。 |
+| [`--kv-cache-dtype`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-kv-cache-dtype) | KV Cache 的存储 dtype。 | `auto`、`float16`、`bfloat16`、`fp8`、`fp8_e4m3`、`fp8_e5m2` | 直接改变单个 token 的 KV Cache 大小、可缓存 token 数和 KV 量化误差。 |
+
+`--quantization` 可以由 checkpoint 的 `quantization_config` 自动识别。表格和命令显式列出该参数，是为了清楚展示权重量化与 KV Cache 量化的边界。`--quantization awq` 通常表示加载已经完成 AWQ 量化的 checkpoint，并不会在服务启动时完成需要校准数据的 AWQ 量化。
+
+### KV Cache 显存计算
+
+标准 MHA 或 GQA 模型中，单个序列的 KV Cache 大小近似为：
+
+```text
+M_KV = 2 × L × T × H_KV × D_H × bytes/value
+```
+
+`2` 表示 Key 和 Value，`L` 是 Transformer 层数，`T` 是缓存 token 数，`H_KV` 是 KV head 数，`D_H` 是每个 head 的维度。同一模型和相同 token 数下，只有 `bytes/value` 会随 KV Cache dtype 直接变化。
+
+| KV Cache dtype | 每个值占用 | 相对显存 | 相同显存下的理论 token 容量 |
+|----------------|------------|----------|--------------------------------|
+| FP16 | 2 bytes | 100% | 1× |
+| BF16 | 2 bytes | 100% | 1× |
+| FP8 | 1 byte | 约 50% | 约 2× |
+
+FP16 和 BF16 的显存占用相同，但数值特性不同。FP16 的尾数精度更高，BF16 的指数范围更大。FP8 将 KV Cache 主体显存降到约一半；实际容量提升会受到 scale、内存对齐、block 碎片和运行时预留空间影响，因此不一定达到严格的 2 倍。
+
+### 权重精度变化
+
+固定 `--kv-cache-dtype` 后，BF16、FP8 或 AWQ INT4 权重使用相同的 KV Cache 形状和存储 dtype，因此单个 token 的 KV Cache 显存不变。低精度权重减少常驻模型显存，vLLM 可以在相同 GPU 显存预算中分配更多 KV block，从而提高最大上下文容量或并发量。
+
+权重量化仍会改变 KV Cache 中保存的数值。每层的 Key 和 Value 由 `K = XW_K` 和 `V = XW_V` 计算；`W_K`、`W_V` 的量化误差会传递到 K/V。此时缓存布局和字节数不变，数值结果可能与原始 BF16/FP16 模型不同。
+
+权重量化主要影响模型 GEMM 和权重读取。AWQ、GPTQ 或 FP8 是否更快取决于 GPU、batch size 和量化 kernel；权重变小不代表端到端吞吐按相同比例提高。固定 KV dtype 时，Attention 读取历史 KV Cache 的字节数不会因为权重量化而下降。
+
+### KV Cache 精度变化
+
+将 KV Cache 从 BF16/FP16 改为 FP8，会直接减少 Attention 在 decode 阶段读取历史 K/V 的数据量。长上下文或高并发场景通常更容易获得容量和吞吐收益；量化、反量化以及 backend 支持会影响实际延迟。部分 Attention backend 可以直接在 FP8 域执行更多计算，其他实现可能需要转换回更高精度。
+
+FP8 KV Cache 会在权重量化误差之外增加缓存量化误差。K/V scale 的粒度和校准方式会直接影响生成质量。vLLM 的 [FP8 KV Cache 文档](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/)介绍了 per-tensor、per-attention-head scale 以及使用校准数据生成 scale 的方式。需要通过目标模型、目标数据集和目标上下文长度上的质量评测决定是否启用。
+
+### 典型配置
+
+| 场景 | `--quantization` | `--dtype` | `--kv-cache-dtype` | 结果 |
+|------|------------------|-----------|--------------------|------|
+| 未量化 FP16 基线 | 省略 | `float16` | `float16` | 浮点权重和激活为 FP16，KV Cache 为 FP16。 |
+| 未量化 BF16 基线 | 省略 | `bfloat16` | `bfloat16` | 浮点权重、激活和 KV Cache 为 BF16；KV 容量与 FP16 相同。 |
+| AWQ W4A16，FP16 KV | `awq` | `float16` | `float16` | 量化层权重为 AWQ INT4，普通激活和 KV Cache 为 FP16。权重释放显存，但单 token KV 大小不变。 |
+| AWQ W4A16，FP8 KV | `awq` | `float16` | `fp8` | AWQ 减少权重显存，FP8 直接减少单 token KV 显存，两种收益叠加。 |
+| FP8 权重，BF16 KV | `fp8` | `bfloat16` | `bfloat16` | 量化层使用 FP8 方案，普通浮点张量和 KV Cache 使用 BF16；单 token KV 大小仍为 2 bytes/value。 |
+
+AWQ 与 FP16 KV Cache 的完整命令如下。模型路径需要指向已经完成 AWQ 量化的 checkpoint：
+
+```bash
+vllm serve /path/to/model-awq \
+  --quantization awq \
+  --dtype float16 \
+  --kv-cache-dtype float16
+```
+
+这组参数表示 AWQ INT4 权重、FP16 普通激活和 FP16 KV Cache。`--quantization awq` 不会把 KV Cache 转换成 INT4；如需压缩 KV Cache，需要单独设置 `--kv-cache-dtype fp8`。
+
+### 对比实验的控制变量
+
+比较权重精度时，应固定模型架构、请求长度、并发量和 `--kv-cache-dtype`，分别改变 `--dtype` 或 `--quantization`。比较 KV Cache 精度时，应固定 checkpoint、`--dtype`、`--quantization` 和工作负载，只改变 `--kv-cache-dtype`。否则无法判断显存、性能或生成质量的变化来自权重量化还是 KV Cache 量化。
+
+### 参考文档
+
+| 文档 | 内容 |
+|------|------|
+| [vLLM `--dtype`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-dtype) | 基础浮点权重和激活 dtype。 |
+| [vLLM `--quantization`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-quantization) | 权重量化方法与 checkpoint 自动识别规则。 |
+| [vLLM `--kv-cache-dtype`](https://docs.vllm.ai/en/latest/configuration/engine_args/#-kv-cache-dtype) | KV Cache 存储 dtype 和支持格式。 |
+| [vLLM Quantized KV Cache](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/) | FP8 KV Cache、scale 和校准方式。 |
+| [LLM Compressor AWQ](https://docs.vllm.ai/projects/llm-compressor/en/latest/examples/awq/) | AWQ 校准、量化和 checkpoint 保存示例。 |
