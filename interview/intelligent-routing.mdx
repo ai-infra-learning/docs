@@ -1,0 +1,94 @@
+---
+title: "智能路由"
+description: "Semantic Router 多轮上下文与路由决策面试题"
+---
+
+## 多轮对话上下文
+
+Semantic Router 在多轮对话中是否会传递上下文？
+
+**会。** 使用 Chat Completions API 时，客户端需要在每轮请求的 `messages` 中重新提交历史消息；使用 Responses API 时，Semantic Router 可以根据 `previous_response_id` 读取对话链，并还原成完整的 `messages`。
+
+[启用 Responses API 存储且请求没有设置 `store: false`](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/extproc/req_filter_response_api.go#L239-L250) 时，Semantic Router 会把每轮 Response 的 input、output 和 `previous_response_id` 保存到 [Response Store](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/responsestore/interface.go#L11-L34)，存储后端支持[进程内存和 Redis](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/responsestore/factory.go#L8-L20)。下一轮请求传入 `previous_response_id` 后，Router 先查询对应的 Response，再沿其中保存的上一条 Response ID 逐条向前查找，最终还原完整会话。内存后端会在 Router 重启后丢失记录；Redis 后端可供多个 Router 副本共享，数据是否持久化取决于 Redis 的持久化配置。
+
+需要区分“传递给模型的上下文”和“用于路由分类的上下文”。后端模型会收到请求携带的完整 `messages`；但 Domain、Keyword、Embedding 和 Complexity 等路由信号默认只分析最后一条用户消息，并不会利用全部历史判断当前意图。具体实现可参考 [消息提取](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/extproc/utils_fast.go#L160-L224)和 [Signal 输入分发](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/classification/classifier_signal_dispatch.go#L16-L111)。
+
+## 话题切换时的路由决策
+
+在一个多轮对话中，假如一开始讨论经济问题，后来又讨论数学问题，Semantic Router 如何决策？
+
+默认情况下，Router 根据当前用户消息判断意图。当前消息是明确的数学问题时，会匹配 Math Decision 并选择数学模型。请求中携带的经济问题历史仍会传给数学模型，但不同模型不能复用彼此的 KV Cache，因此数学模型需要对完整上下文重新执行 Prefill。
+
+如果启用了 [Protection](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/website/docs/tutorials/learning/protection.md)，Math Decision 会先提出数学模型，Protection 再决定是否切换。`scope` 决定哪些请求共享“当前模型”状态。
+
+Conversation 是一条可以包含多轮问答的对话线程，不是单轮问答。Session 是更大的业务会话，可以包含多个 Conversation。例如：
+
+```text
+Session S1
+├── Conversation C1：讨论经济问题（多轮问答）
+└── Conversation C2：讨论数学问题（多轮问答）
+```
+
+Session 和 Conversation 的边界由业务方定义，并通过 [`x-session-id` 和 `x-conversation-id`](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/website/docs/tutorials/learning/protection.md#L29-L58) 传给 Semantic Router。`scope: conversation` 需要两个 ID；`scope: session` 只需要 Session ID。
+
+`scope: conversation` 按 Session ID 和 Conversation ID 保存状态，只在当前 Conversation 内保护原模型；新建 Conversation 后可以重新路由。`scope: session` 只按 Session ID 保存状态，同一 Session 下的多个 Conversation 共用当前模型。
+
+当前模型仍可用、Session 未超时且未触发 Rescue Switch 时，[Session Scope 会直接保留当前模型](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/extproc/router_learning_protection.go#L454-L494)，所以它比 Conversation Scope 的切换约束更强。若数学任务必须使用数学模型，可以在 Math Decision 中配置 [`adaptations.mode: bypass`](https://github.com/vllm-project/semantic-router/blob/790e32d6ad475390c89c95eb4cc1ecc820435d87/src/semantic-router/pkg/config/learning_config.go#L180-L213)。该配置会跳过这个 Decision 的全部 Router Learning，包括 Adaptation 和 Protection，因此模型选择不会被学习层改写；历史上下文仍会正常传递。
+
+下面的配置假设 `economy-model` 和 `math-model` 已经注册。Protection 在整个 Session 内保持当前模型，但 Math Decision 会绕过全部 Router Learning：
+
+```yaml
+global:
+  router:
+    learning:
+      enabled: true                  # 启用跨请求的 Router Learning
+      protection:
+        enabled: true                # 启用模型连续性保护
+        scope: session               # 按 Session ID 共享当前模型状态
+        identity:
+          headers:
+            session: x-session-id    # 客户端需要传递这个请求头
+            conversation: x-conversation-id  # Session Scope 下不参与状态键
+
+routing:
+  strategy: priority                 # 多个 Decision 命中时，优先级高者胜出
+  signals:
+    keywords:
+      - name: economy_keywords
+        operator: OR                 # 任意一个关键词匹配即可
+        method: ngram                # 使用字符 N-gram 近似匹配
+        keywords: ["经济", "通胀", "GDP", "economy", "inflation"]
+        case_sensitive: false
+        ngram_threshold: 0.4         # 相似度阈值
+      - name: math_keywords
+        operator: OR
+        method: ngram
+        keywords: ["方程", "积分", "矩阵", "equation", "calculus"]
+        case_sensitive: false
+        ngram_threshold: 0.4
+
+  decisions:
+    - name: math
+      priority: 200                  # 高于 Economy Decision
+      rules:
+        operator: AND                # 所有条件都要满足，此处只有一个
+        conditions:
+          - type: keyword            # 引用上面的 Keyword Signal
+            name: math_keywords
+      modelRefs:
+        - model: math-model          # Math Decision 的模型
+      adaptations:
+        mode: bypass                 # 跳过该 Decision 的全部 Router Learning
+
+    - name: economy
+      priority: 100
+      rules:
+        operator: AND
+        conditions:
+          - type: keyword
+            name: economy_keywords
+      modelRefs:
+        - model: economy-model
+```
+
+同一 Session 的前几轮讨论经济问题时，Economy Decision 选择 `economy-model`。后续消息“求解方程 2x + 3 = 9”命中优先级更高的 Math Decision，并选择 `math-model`；`bypass` 使 Adaptation 和 Protection 都不再改写该结果，最终请求直接发给 `math-model`。如果只想跳过 Protection、仍保留 Adaptation，可以改用 `adaptations.protection.mode: bypass`。
