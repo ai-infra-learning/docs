@@ -72,3 +72,47 @@ total_bytes
 | `precision_bytes` | 每个 K/V 元素占用的字节数；例如 FP16/BF16 为 2 bytes，FP8 为 1 byte |
 
 可以使用 [Modular LLM Inference Handbook 的 KV Cache 计算说明](https://handbook.modular.com/inference-optimization/kv-cache-offloading/)对照标准公式，也可以通过 [KVCache.AI Calculator](https://kvcache.ai/tools/kv-cache-calculator/)选择具体模型、序列数量和 KV 精度进行估算。
+
+## KV Cache 压缩与物理块回收
+
+**面试题：在 vLLM 中删除 90% 的 KV Cache 条目后，为什么 VRAM 几乎不下降？**
+
+端侧模型生成 token 时，会把历史 token 的 Key 和 Value 保存在 KV Cache 中。后续每一步可以直接复用这些结果，不必重新计算历史 token 的 K/V；代价是 KV Cache 会随上下文长度持续增长。
+
+[NVIDIA Efficient AI Lab 的分析](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/)给出了一个例子：采用 4-bit 量化权重的 Qwen3-32B 运行在 24 GB GPU 上时，大约生成 24,000 个 token 后就可能因为显存不足而停止。[Akshay Pachaar](https://x.com/akshay_pachaar) 也曾在 X 上将同一现象整理成面试题：既然注意力具有稀疏性，删除 90% 的低重要性 KV Cache 后，显存占用为什么仍然不变？
+
+![删除大部分 KV Cache 后 VRAM 仍未下降的面试题](/interview/images/kv-cache-compression-interview-question.png)
+
+### 逻辑删除与物理释放
+
+问题不在模型，而在 KV Cache 的内存管理粒度。
+
+vLLM 这类推理系统采用源自 [PagedAttention](https://arxiv.org/abs/2309.06180) 的分页式 KV Cache 管理，将显存划分成固定大小的物理块。块大小可以配置，常见配置是每块容纳 16 个 token。压缩算法按 token 选择保留项，显存分配器却按物理块回收空间：只有一个物理块中的所有位置都为空，这个块才能被释放。
+
+假设 16,000 个 token 分布在约 1,000 个物理块中。压缩算法删除其中 14,400 个，只留下 1,600 个重要 token：
+
+- 如果幸存 token 被紧凑地排列，只需要约 `1,600 ÷ 16 = 100` 个块，其余约 900 个块可以释放。
+- 如果幸存 token 分散在原来的 1,000 个块中，并且几乎每个块都至少保留一个 token，那么这 1,000 个块仍然处于占用状态，分配器几乎无法回收显存。
+
+![幸存 token 分散在物理块中导致显存无法回收](/interview/images/kv-cache-block-fragmentation.png)
+
+因此，“删除 90% KV Cache”可能只表示逻辑条目减少了 90%，并不代表物理显存也减少了 90%。KV Cache 主体显存更接近下面的关系：
+
+```text
+物理显存占用 ∝ 非空物理块数量 × 单个物理块大小
+```
+
+很多实验在预分配的连续 Tensor 上统计逻辑压缩率，没有模拟生产推理引擎中的物理块、并发请求和运行中的内存分配器，因此逻辑压缩率不能直接等同于可回收的 VRAM。
+
+### 物理块紧凑化
+
+生产系统需要让逻辑删除最终形成完整的空块，常见方向包括：
+
+- **Block-aware eviction**：按物理块选择淘汰对象，直接制造可释放的完整空块。
+- **Compaction**：周期性搬移幸存 token，填补块内空洞，将空闲位置集中到尾部并释放完整物理块。
+
+NVIDIA 的分析介绍了 TriAttention 的 Forward-Packing Compaction：大约每生成 128 个 token 执行一次紧凑化。顺序保持方案把幸存 token 向前移动，避免额外的位置映射；Hole-filling 方案只用新一轮幸存 token 填充旧空洞，数据搬移更少，但必须显式记录逻辑位置。
+
+<Tip>
+  面试中的一句话回答：删除 90% 的 token 只是逻辑压缩；Paged KV Cache 只有在整个物理块为空时才能归还显存。幸存 token 分散造成块内碎片，因此需要 Block-aware eviction 或 Compaction 才能真正降低 VRAM。
+</Tip>
