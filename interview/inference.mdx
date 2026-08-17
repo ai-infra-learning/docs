@@ -83,7 +83,7 @@ total_bytes
 
 端侧模型生成 token 时，会把历史 token 的 Key 和 Value 保存在 KV Cache 中。后续每一步可以直接复用这些结果，不必重新计算历史 token 的 K/V；代价是 KV Cache 会随上下文长度持续增长。
 
-[NVIDIA Efficient AI Lab 的分析](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/)给出了一个例子：采用 4-bit 量化权重的 Qwen3-32B 运行在 24 GB GPU 上时，大约生成 24,000 个 token 后就可能因为显存不足而停止。[Akshay Pachaar](https://x.com/akshay_pachaar) 也曾在 X 上将同一现象整理成面试题：既然注意力具有稀疏性，删除 90% 的低重要性 KV Cache 后，显存占用为什么仍然不变？
+[NVIDIA Efficient AI Lab 的分析](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/)给出了一个例子：采用 4-bit 量化权重的 Qwen3-32B 运行在 24 GB GPU 上时，大约生成 24,000 个 token 后就可能因为显存不足而停止。[Akshay Pachaar](https://x.com/akshay_pachaar/status/2082076293450072510) 也曾在 X 上将同一现象整理成面试题：既然注意力具有稀疏性，删除 90% 的低重要性 KV Cache 后，显存占用为什么仍然不变？
 
 ### 逻辑删除与物理释放
 
