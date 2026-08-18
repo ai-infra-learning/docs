@@ -81,10 +81,6 @@ total_bytes
 >
 > 你正在 vLLM 上部署一个推理模型，但它在长序列生成过程中总是耗尽 GPU 显存。于是你加入 KV Cache 压缩，淘汰了 90% 的缓存 token。压缩后 VRAM 使用量几乎没有下降，模型仍然会因显存不足而停止。为什么？
 
-端侧模型生成 token 时，会把历史 token 的 Key 和 Value 保存在 KV Cache 中。后续每一步可以直接复用这些结果，不必重新计算历史 token 的 K/V；代价是 KV Cache 会随上下文长度持续增长。
-
-[NVIDIA Efficient AI Lab 的分析](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/)给出了一个例子：采用 4-bit 量化权重的 Qwen3-32B 运行在 24 GB GPU 上时，大约生成 24,000 个 token 后就可能因为显存不足而停止。[Akshay Pachaar](https://x.com/akshay_pachaar/status/2082076293450072510) 也曾在 X 上将同一现象整理成面试题：既然注意力具有稀疏性，删除 90% 的低重要性 KV Cache 后，显存占用为什么仍然不变？
-
 ### 逻辑删除与物理释放
 
 问题不在模型，而在 KV Cache 的内存管理粒度。
@@ -106,15 +102,34 @@ vLLM 这类推理系统采用源自 [PagedAttention](https://arxiv.org/abs/2309.
 
 很多实验在预分配的连续 Tensor 上统计逻辑压缩率，没有模拟生产推理引擎中的物理块、并发请求和运行中的内存分配器，因此逻辑压缩率不能直接等同于可回收的 VRAM。
 
-### 物理块紧凑化
+### KV Cache 压缩
 
-生产系统需要让逻辑删除最终形成完整的空块，常见方向包括：
+许多 KV Cache 淘汰方法通过观察 Attention Score 判断应该保留哪些 token，代表方法包括：
 
-- **Block-aware eviction**：按物理块选择淘汰对象，直接制造可释放的完整空块。
-- **Compaction**：周期性搬移幸存 token，填补块内空洞，将空闲位置集中到尾部并释放完整物理块。
+- [**H2O**](https://arxiv.org/abs/2306.14048)：在每个 Decode Step 为缓存 token 累积历史 Attention Score，同时保留最近 token 和累计得分较高的 Heavy Hitter。缓存达到固定预算后，持续淘汰累计得分较低的 token。
+- [**Scissorhands**](https://arxiv.org/abs/2305.17118)：基于“重要性具有持续性”的假设，认为过去显著影响输出的 Pivotal Token 以后仍更可能重要。它根据历史 Attention 信号提高这些 token 的保留概率，将 KV Cache 维持在固定预算内。
+- [**TOVA**](https://arxiv.org/abs/2401.06104)：缓存达到容量上限后，在每个 Decode Step 淘汰当前 Attention Score 最低的 token。它不预留固定的最近窗口，也不固定偏向序列开头的 token。
+- [**SnapKV**](https://arxiv.org/abs/2404.14469)：在 Prefill 结束时，使用提示末尾的 Observation Window 评估历史 token，并为每个 Attention Head 选择成簇的重要 KV 位置。该方法只执行一次评分，避免在整个 Decode 阶段持续累积 Attention Score。
+- [**PyramidKV**](https://arxiv.org/abs/2406.02069)：利用 Attention 信息在模型层间逐步汇聚的现象，为较低 Layer 分配更多 KV Cache，为较高 Layer 分配更少缓存。它将统一预算改为按 Layer 变化的金字塔式预算。
+- [**Ada-KV**](https://arxiv.org/abs/2407.11550)：针对不同 Attention Head 的模式差异，自适应地分配 Head-wise KV Cache 预算。它可以与已有的 Attention Score 淘汰方法组合，减少统一预算造成的保留误差。
+- [**R-KV**](https://arxiv.org/abs/2505.24133)：面向长链路推理，在 Decode 阶段结合最近观察 token 的 Attention 权重与 Key 向量的余弦相似度。它联合衡量 token 的重要性和语义冗余，优先保留重要且不重复的推理上下文。
 
-NVIDIA 的分析介绍了 TriAttention 的 Forward-Packing Compaction：大约每生成 128 个 token 执行一次紧凑化。顺序保持方案把幸存 token 向前移动，避免额外的位置映射；Hole-filling 方案只用新一轮幸存 token 填充旧空洞，数据搬移更少，但必须显式记录逻辑位置。
+#### 生产部署中的两个基础设施问题
 
-<Tip>
-  面试中的一句话回答：删除 90% 的 token 只是逻辑压缩；Paged KV Cache 只有在整个物理块为空时才能归还显存。幸存 token 分散造成块内碎片，因此需要 Block-aware eviction 或 Compaction 才能真正降低 VRAM。
-</Tip>
+- **Attention Score 不可用**：FlashAttention 等高性能 Attention Kernel 通过 SRAM 分块完成 Attention 计算，不会在 HBM 中生成完整的 `N × N` Attention Score Matrix。依赖完整历史分数的方法因此无法直接取得评分信号；例如，H2O 的参考实现会退回 Eager Attention 并显式生成完整矩阵，同时失去 FlashAttention 的性能收益。
+- **淘汰 token 无法释放物理块**：Paged KV Cache 只有在整个物理块为空时才能归还显存，反复执行 token 级淘汰会让幸存 token 分散在不同块中。R-KV 报告的 90% 显存节省基于预分配的连续 Tensor，而不是 vLLM 的分页式内存管理；[Quest](https://arxiv.org/abs/2406.10774) 则保留完整 KV Cache，只选择每次 Query 需要读取的物理页，因此显存占用仍会随上下文增长。
+
+#### TriAttention 的两项方案
+
+[TriAttention](https://arxiv.org/abs/2604.04921) 针对这两个问题分别提出 Pre-RoPE Geometry 和 Forward-Packing Compaction：
+
+- **Pre-RoPE Geometry**：不读取运行时 Attention Score，而是利用应用 RoPE 前 Q/K 向量的稳定几何结构估计 token 重要性。评分过程不依赖 FlashAttention 未写入显存的完整分数矩阵。
+- **Forward-Packing Compaction**：执行 token 级淘汰后，周期性搬移幸存 token 并填补块内空洞。TriAttention 大约每生成 128 个 token 执行一次紧凑化，按原有逻辑顺序将幸存 token 向前排列，使末尾形成完整空块并归还给分配器。
+
+在 Qwen3-8B 的 AIME 2025、32K token 长推理实验中，TriAttention 在达到 Full Attention 相同准确率时，将解码吞吐提高到 2.5 倍，并将 KV Cache 显存占用降低到约 1/10.7。
+
+### 参考资料
+
+- [KV Cache Compression and Its Infra Problems](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/)
+- [TriAttention: Efficient Long Reasoning with Trigonometric KV Compression](https://arxiv.org/abs/2604.04921)
+- [Akshay Pachaar：KV Cache 压缩面试题](https://x.com/akshay_pachaar/status/2082076293450072510)
