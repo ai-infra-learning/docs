@@ -9,10 +9,7 @@ CUDA 性能优化需要把 GPU 架构、CUDA 编程模型、内存体系和性�
 
 ## 章节详解
 
-
-## 第二部分：章节详解
-
-### 1 GPU 架构与 CUDA 的执行
+### 1. GPU 架构与 CUDA 的执行
 
 GPU 架构基础围绕三个问题展开：GPU 为什么快，SM 和 warp scheduler 如何工作，以及 CUDA 为什么要用 thread、warp、block、grid 这样的层级来组织并行任务。
 
@@ -43,16 +40,7 @@ CUDA 的基本执行流程展示了 CPU 和 GPU 如何配合：
 
 #### 1.2 SM、warp scheduler 与执行流水线
 
-|               | V100 (2017) | A100 (2020)   | H100 (2022) | B200 (2024) |
-| :------------ | :---------- | :------------ | :---------- | :---------- |
-| 制程            | 12nm        | 7nm           | 4nm         | 4nm         |
-| Tensor Core   | 第1代         | 第3代           | 第4代         | 第5代         |
-| 标志性精度         | FP16        | TF32 + BF16   | FP8         | FP4         |
-| 内存            | 16GB HBM2   | 40/80GB HBM2e | 80GB HBM3   | 180GB HBM3e |
-| 内存带宽          | 900 GB/s    | 1.55 TB/s     | 3.35 TB/s   | ~8 TB/s     |
-| NVLink        | 300 GB/s    | 600 GB/s      | 900 GB/s    | 1.8 TB/s    |
-| 计算能力          | 7.0         | 8.0           | 9.0         | 10.0        |
-| **CUDA_ARCH** | **700**     | **800**       | **900**     | **1000**    |
+<Accordion title="GPU 硬件架构分解">
 
 - GPU Device
 	- Streaming Multiprocessor (SMs)
@@ -70,6 +58,8 @@ CUDA 的基本执行流程展示了 CPU 和 GPU 如何配合：
 		- Registers
 	- Interconnect
 		- NVLink / NVSwitch
+
+</Accordion>
 
 Blackwell 中 SM 的组织方式和 warp 调度机制，是理解现代 NVIDIA GPU 执行模型的重要入口。
 
@@ -179,7 +169,7 @@ DSMEM 也就是 distributed shared memory。它把参与 cluster 的多个 SM �
 
 总结来说，CUDA 的层级结构让大问题可以被拆成很多 block，再由 block 拆成很多 thread。普通协作发生在 block 内，更高级的跨 block 协作则依赖 thread block cluster 和 DSMEM。
 
-### 2 CUDA 编程基础与启动配置
+### 2. CUDA 编程基础与启动配置
 
 CUDA kernel 编写、启动参数以及多维输入映射的核心问题是：如何把数据任务映射到 CUDA 线程层级上，并让 kernel 启动配置符合硬件执行方式。
 
@@ -230,7 +220,69 @@ CUDA grid 本身也有维度限制，例如 X 维最多可到 2,147,483,647 个 
 
 #### 2.2 CUDA kernel 基本写法
 
+<Accordion title="CUDA 案例">
+
+```cpp
+//------------------------------------------------------
+// Kernel: myKernel running on the device (GPU)
+//   - input : device pointer to float array of length N
+//   - N   : total number of elements in the input
+//------------------------------------------------------
+__global__ void myKernel(float* input, int N) {
+    // Compute a unique global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+ 
+    // Only process valid elements
+    if (idx < N) {
+        input[idx] *= 2.0f;
+    }
+} 
+ 
+// This code runs on the host (CPU)
+int main() {
+    // 1) Problem size: one million floats
+    const int N = 1'000'000; 
+ 
+    float* h_input = nullptr;
+    cudaMallocHost(&h_input, N * sizeof(float)); 
+ 
+    // Initialize host data (for example, all ones)
+    for (int i = 0; i < N; ++i) {
+        h_input[i] = 1.0f;
+    } 
+ 
+    // Allocate device memory for input on the device (d_)
+    float* d_input = nullptr;
+    cudaMalloc(&d_input, N * sizeof(float)); 
+ 
+    // Copy data from the host to the device using cudaMemcpyHostToDevice 
+    cudaMemcpy(d_input, h_input, N * sizeof(float), 
+      cudaMemcpyHostToDevice); 
+ 
+    // 2) Tune launch parameters
+    const int threadsPerBlock = 256; // multiple of 32
+    const int blocksPerGrid = (N + threadsPerBlock - 1) / 
+      threadsPerBlock; // 3,907, in this case 
+ 
+    // Launch myKernel across blocksPerGrid number of blocks
+    // Each block has threadsPerBlock number of threads
+    // Pass a reference to the d_input device array
+    myKernel<<<blocksPerGrid, threadsPerBlock>>>(d_input, N);
+    // Wait for the kernel to finish running on the device
+    cudaDeviceSynchronize();
+    // When finished, copy results (stored in d_input) from device to host
+    // (stored in h_input) using cudaMemcpyDeviceToHost
+    cudaMemcpy(h_input, d_input, N * sizeof(float), cudaMemcpyDeviceToHost);
+    // Cleanup: Free memory on the device and host
+    cudaFree(d_input);
+    cudaFreeHost(h_input);
+    return 0; // return 0 for success
+}
+```
+</Accordion>
+
 一个 kernel 用 `__global__` 修饰，表示它在 GPU device 上执行，由 CPU host 端启动。例如：
+
 
 ```cpp
 __global__ void myKernel(float* input, int N) {
@@ -260,6 +312,59 @@ CUDA 调试和 CPU 程序不同，错误可能是“延迟暴露”的，因此�
 
 #### 2.3 2D/3D 输入映射
 
+
+<Accordion title="CUDA 案例（2d_kernel）">
+```cpp
+// 2d_kernel.cu
+// 2d_kernel.cu
+#include <cuda_runtime.h>
+#include <iostream>
+//------------------------------------------------------
+// Kernel: my2DKernel running on the device (GPU)
+//   - input  : device pointer to float array of size width×height
+//   - width  : number of columns
+//   - height : number of rows
+//------------------------------------------------------
+__global__ void my2DKernel(float* input, int width, int height) {
+    // Compute 2D thread coordinates
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    // Only process valid pixels
+    if (x < width && y < height) {
+    int idx = y * width + x;
+    input[idx] *= 2.0f;
+    }
+}
+int main() {
+    // Image dimensions
+    const int width  = 1024;
+    const int height = 1024;
+    const int N      = width * height;
+    // 1) Allocate and initialize host image
+    float* h_image = nullptr;
+    cudaMallocHost(&h_image, N * sizeof(float));
+    for (int i = 0; i < N; ++i) {
+    h_image[i] = 1.0f;  // e.g.， initialize all pixels to 1.0f
+    }
+    // 2) Allocate device image and copy data to device
+    cudaStream_t s; cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    float* d_image = nullptr;
+    cudaMallocAsync(&d_image, N * sizeof(float), s);
+    cudaMemcpyAsync(d_image, h_image, N * sizeof(float),
+    cudaMemcpyHostToDevice， s);
+    my2DKernel<<<blocksPerGrid2D， threadsPerBlock2D，
+    0, s>>>(d_image, width, height);
+    cudaMemcpyAsync(h_image, d_image, N * sizeof(float),
+    cudaMemcpyDeviceToHost， s);
+    cudaStreamSynchronize(s);
+    cudaFreeAsync(d_image, s);
+    cudaStreamDestroy(s);
+}
+```
+</Accordion>
+
+
+
 输入也可以是 2D 或 3D 结构。
 
 如果输入是图像，本身就是二维结构，就可以使用二维 block 和二维 grid。比如一个 1024 x 1024 的矩阵，可以用：
@@ -285,7 +390,7 @@ if (x < width && y < height) {
 
 如果是 3D 体数据，也可以使用 `dim3(x, y, z)` 把线程映射到三维空间。大多数 CUDA 性能示例会使用 1D 或 2D tiled 配置，但理解 3D 映射有助于处理体数据、三维网格等任务。
 
-### 3 GPU 内存体系与数据移动
+### 3. GPU 内存体系与数据移动
 
 内存管理、内存层级、TMEM/TMA 和 Unified Memory 都围绕一个核心问题：GPU 性能优化的关键往往不是“多算几次”，而是“少等数据”。
 
@@ -519,7 +624,7 @@ CUDA 提供了一些优化接口：
 统一内存更强调编程的便利性，而传统显式内存管理方式更强调对数据传输过程和存储位置的精确控制。因此，在高性能 CUDA 应用中，通常仍采用显式内存管理方式以获得更好的性能优化空间；而统一内存则广泛应用于原型开发、算法验证以及 CPU-GPU 协同计算等场景。随着 GPU 架构和统一内存技术的不断发展，两者之间的性能差距正在逐渐缩小。
 
 
-### 4 Occupancy 调优与正确性检查
+### 4. Occupancy 调优与正确性检查
 
 Occupancy、GPU 利用率、launch bounds、Occupancy API 以及 Compute Sanitizer 关注两个问题：如何让 GPU 有足够多的有效工作，以及如何保证 CUDA 程序本身是正确的。
 
@@ -682,7 +787,7 @@ Compute Sanitizer 主要包含四类工具，它们有助于检测越界内存�
 > CUDA 优化不能只看速度，必须先保证 kernel 的功能正确。只有解决了：程序是否算对、是否安全访问内存、线程同步是否合理等问题，后面的 profiling 结果才有意义。
 
 
-### 5 性能分析
+### 5. 性能分析
 
 Roofline、Nsight 工具和 NVTX 可以组成性能分析闭环。
 
