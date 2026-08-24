@@ -496,12 +496,17 @@ GPU 全局：L2 cache
 
 > 越靠近计算单元，速度越快、容量越小、成本越高；越远离计算单元，容量越大、延迟越高。优化 CUDA kernel，本质上就是尽量让数据在靠近 SM 和 Tensor Core 的地方复用，减少反复访问 HBM。
 
+<Accordion title="register">
 register 是最快的存储，每个线程私有，用来保存局部变量和临时变量。Blackwell 每个 SM 有 64K 个 32-bit registers，每个线程最多可使用 255 个寄存器。但寄存器不是越多越好。如果每个线程用太多寄存器，一个 SM 能同时容纳的线程数量就会下降，occupancy 可能降低。更糟的是，如果寄存器不够，编译器会把数据 spill 到 local memory。
+</Accordion>
 
+<Accordion title="local memory">
 local memory 这个名字容易误导。它虽然叫 local，但并不是一块独立的高速片上内存。很多情况下，local memory 是寄存器溢出后落到 global memory / HBM 支撑的空间，延迟很高。因此，local memory 使用过多往往说明 register pressure 有问题。
 
 补充一点：local memory 通常不是程序员主动使用的。多数 CUDA 代码里不会显式写“使用 local memory”，它更多是 CUDA 编译器在寄存器放不下线程私有数据时自动生成的“备用空间”。例如，一个线程里有太多局部变量、线程私有数组太大、数组索引无法在编译期确定，或者复杂函数调用产生很多临时值时，编译器可能无法把所有数据都放进 register，于是把一部分数据 spill 到 local memory。因此，平时写 CUDA 程序时很少“主动使用 local memory”是正常的。但在性能优化时必须关注它，因为它可能悄悄出现并拖慢 kernel。可以通过编译参数 `-Xptxas -v` 查看是否出现 `spill loads` / `spill stores`，也可以在 Nsight Compute 中观察 local memory load/store、registers per thread 和 spilling 相关指标。
+</Accordion>
 
+<Accordion title="shared memory / L1 cache">
 shared memory / L1 cache 位于 SM 内，延迟远低于 HBM。二者都和 SM 内部片上 SRAM 资源相关，但角色不同：
 
 - shared memory，也叫 SMEM，由程序员显式管理，适合 block 内线程共享数据。
@@ -515,11 +520,17 @@ shared memory / L1 cache 位于 SM 内，延迟远低于 HBM。二者都和 SM �
 - 需要同步。
 - 可能出现 bank conflict。
 - 使用太多 shared memory 会减少每个 SM 可驻留的 block 数，影响 occupancy。
+</Accordion>
 
+<Accordion title="TMEM L2 cache">
 TMEM 是 Blackwell 中与 Tensor Core 路径相关的片上存储。它不是普通 CUDA C++ 指针可以直接读写的空间，而是服务 Tensor Core 指令和矩阵乘加累加路径。现代 AI 计算中，Tensor Core 数据路径非常关键。
+</Accordion>
 
+<Accordion title="L2 cache">
 L2 cache 是全 GPU 共享缓存，位于所有 SM 和 HBM 之间。可以把它理解成一个全局缓冲层：当某个 SM 从 global memory 读取数据时，数据可能先经过 L2；如果后续其他 SM 或同一个 SM 再访问相同或相邻的数据，就可能从 L2 中命中，而不必重新访问 HBM。Blackwell Tuning Guide 提到 GB200 GPU 的 L2 cache 可到 126 MB，这个容量比每个 SM 内部的 shared memory / L1 大很多，因此更适合做跨 SM 的数据复用缓冲。
+</Accordion>
 
+<Accordion title="global memory / HBM">
 global memory 是 CUDA 编程视角的设备全局内存；在 A100、H100、B200 这类数据中心 GPU 上，它在硬件上通常对应 HBM。也就是说：
 
 ```text
@@ -534,6 +545,7 @@ HBM 全称是 High Bandwidth Memory，即高带宽内存。它容量大、带宽
 比如一个 warp 有 32 个线程，如果第 0 个线程读取 `A[0]`，第 1 个线程读取 `A[1]`，一直到第 31 个线程读取 `A[31]`，那么这些访问在地址上是连续的，硬件可以把它们合并成少数几次高效的内存事务。相反，如果 32 个线程访问的地址很分散，例如分别访问 `A[0]`、`A[1024]`、`A[2048]` 这样的跨步地址，硬件就很难把它们合并成连续事务，可能需要发起更多内存请求。这样即使 HBM 的理论带宽很高，实际有效带宽也会下降。
 
 在大模型 decode 阶段，HBM 带宽瓶颈尤其明显。decode 通常是逐 token 生成，每一步都需要读取大量模型权重，但 batch 或当前 token 的计算量相对有限。也就是说，GPU 需要不断从 HBM 中搬运大规模权重数据，但每搬一次数据能做的计算不一定足够多，导致算术强度偏低。这类场景就容易 memory-bound：Tensor Core 或 CUDA Core 可能没有被完全喂饱，性能主要受 HBM 带宽和数据移动效率限制。（vLLM 通过 PagedAttention、continuous batching 改善推理吞吐和 KV cache 管理）
+</Accordion>
 
 小结：
 >图中画出的 SMEM、L1、TMEM、L2、DRAM 是主要硬件数据通路；而 register、local memory、constant memory 等名称更多来自完整 CUDA 内存模型或特定用途。理解这两种视角后，再看内存优化，就能更清楚地区分“代码里看到的内存名称”和“数据在硬件上实际经过的路径”。
