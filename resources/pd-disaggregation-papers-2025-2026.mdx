@@ -1,0 +1,82 @@
+---
+title: "2025–2026 年 PD 分离论文"
+description: "Prefill-Decode 分离研究进展、实验结果与开源状态"
+---
+
+本文只收录直接研究 Prefill-Decode（P/D）执行边界、资源池、调度或 KV Cache 跨阶段传输的工作。检索截止时间为 **2026 年 8 月 16 日**，外链状态复核于 **2026 年 8 月 24 日**，来源限于论文原文、作者项目页和官方代码仓库。
+
+## 结论
+
+2025–2026 年的研究重点已经从“把 Prefill 和 Decode 放到两组 GPU”转向三个更具体的问题：动态调整 P/D 边界与资源比例；在多轮、突发和异构负载下决定 Prefill 应在哪里执行；降低 KV Cache 传输对 TTFT 的影响。
+
+优先阅读下面 9 篇：
+
+| 阅读顺序 | 论文 | 关注点 |
+|---|---|---|
+| 1 | [Beyond the Buzz](https://arxiv.org/abs/2506.05508) | 系统回答 P/D 分离在什么模型、流量和延迟目标下才有收益 |
+| 2 | [FlowKV](https://arxiv.org/abs/2504.03775) | 连续 KV 布局、传输流水线与负载感知调度 |
+| 3 | [DynaServe](https://arxiv.org/abs/2504.09285) | 用动态 Token 边界替代固定的 Prefill/Decode 切分点 |
+| 4 | [semi-PD](https://arxiv.org/abs/2504.19867) | 分离计算但统一存储，避免权重复制和跨 GPU KV 传输 |
+| 5 | [TaiChi](https://arxiv.org/abs/2508.01989) | 在聚合与分离之间连续切换，以 Goodput 为目标调度 |
+| 6 | [AMPD](https://arxiv.org/abs/2602.14516) | 面向 Agent 和迭代检索的多轮 Prefill 动态路由 |
+| 7 | [PPD](https://arxiv.org/abs/2603.13358) | 将轻量 Append-Prefill 留在 Decode 节点，复用本地 KV Cache |
+| 8 | [KVServe](https://arxiv.org/abs/2605.13734) | 根据网络、SLO 和质量预算动态选择 KV 压缩方案 |
+| 9 | [Kairos](https://arxiv.org/abs/2607.02043) | Prefill 池拥塞时，将请求安全地偏转到 Decode 节点 |
+
+<Note>
+  本文把“经典 P/D 分离”限定为 Prefill 与 Decode 在不同 GPU 或 Worker 上执行，并在阶段边界传递 KV Cache。单 GPU 内的 SM/CU 隔离会单独标记；只优化 KV Cache 存储或卸载、但不改变 P/D 执行关系的论文不计为新的 P/D 架构。
+</Note>
+
+## 2025 年：固定分离走向动态边界
+
+2025 年的论文主要修正静态 P/D 资源池的两个缺陷：KV Cache 传输开销，以及输入/输出长度变化造成的阶段负载失衡。
+
+| 时间 | 论文与核心新意 | 实验对象与论文结果 | 架构判定 | 代码状态 |
+|---|---|---|---|---|
+| 2025-04 | [FlowKV: A Disaggregated Inference Framework with Low-Latency KV Cache Transfer and Load-Aware Scheduling](https://arxiv.org/abs/2504.03775) 将跨层 KV 布局改为连续布局，以分段内存分配减少 NCCL 调用，并让 P/D 节点在负载失衡时承担混合任务。 | Llama 3.1 8B/70B、A100、LongBench；平均 KV 传输延迟从 0.944 秒降到 0.053 秒，LongBench 推理加速 15.2%–48.9%。 | **经典 P/D 的动态扩展**：正常路径仍跨节点传 KV，节点角色可随负载调整。 | 论文未链接官方实现；截至检索日未找到作者仓库。 |
+| 2025-04 | [DynaServe: Unified and Elastic Execution for Dynamic Disaggregated LLM Serving](https://arxiv.org/abs/2504.09285) 用 Micro-request 在任意 Token 边界拆分请求，由 Lead/Follow GPU 协作执行，不再把切分点固定在首 Token。 | 两台 4×A100-80GB 服务器，Qwen 2.5 14B/32B/72B，Azure Code、BurstGPT、arXiv Summarization、Mini Reasoning；Goodput 最高比共置 vLLM 高 91%，比固定 P/D 高 61%。 | **混合分离**：真实跨 GPU 传递状态，但切分边界不是固定的 Prefill/Decode 边界。 | 论文未提供代码链接。 |
+| 2025-04 | [semi-PD: Towards Efficient LLM Serving via Phase-Wise Disaggregated Computation and Unified Storage](https://arxiv.org/abs/2504.19867) 在同一 GPU 内用 SM 级资源分区并发执行两个阶段，同时共享权重和 KV 存储。 | Llama 3 8B/70B/405B、DeepSeek-V2-Lite/V3，覆盖 A100、A800、H200；DeepSeek 请求平均端到端延迟降低 1.27–2.58 倍，Llama 满足延迟约束的请求数提高 1.55–1.72 倍。 | **不是经典跨 GPU P/D**：分离的是计算资源，存储与 GPU 仍共享。 | [官方代码](https://github.com/infinigence/Semi-PD)已公开，基于 SGLang，支持 NVIDIA MPS 和 AMD GPU。 |
+| 2025-05 | [Arrow: Adaptive Scheduling Mechanisms for Disaggregated LLM Inference Architecture](https://arxiv.org/abs/2505.11916) 将 Worker 设计为无状态实例，根据实时负载在 Prefill 与 Decode 角色之间切换，并执行 SLO 感知请求调度。 | 两台 8×H20-141GB 服务器，Qwen3-8B/32B、Llama 3.1 70B，四类真实 Trace；可持续请求率比固定 P/D vLLM 高 1.59–2.55 倍。 | **经典 P/D 的弹性版本**：阶段通常位于独立实例，实例角色可切换。 | 论文未提供代码链接。 |
+| 2025-06 | [Beyond the Buzz: A Pragmatic Take on Inference Disaggregation](https://arxiv.org/abs/2506.05508) 在大规模设计空间中联合分析模型映射、并行策略、Batch、P/D 速率匹配和延迟目标。 | 覆盖 Llama 8B/70B/405B 与 DeepSeek-R1，模拟数十万个配置点；结论是大模型、Prefill-heavy 流量和可动态匹配 P/D 速率时收益最明显。 | **真正研究经典 P/D**，但论文性质是设计空间与模拟研究，不是新的 Serving Engine。 | 未提供论文 Artifact；[NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)是相关的开源部署框架。论文后续发表于 [MLSys 2026](https://proceedings.mlsys.org/paper_files/paper/2026/hash/d49cee5f3a79d97d719df255689d83d7-Abstract-Conference.html)。 |
+| 2025-07 | [Nexus: Proactive Intra-GPU Disaggregation of Prefill and Decode in LLM Serving](https://arxiv.org/abs/2507.06608) 预测 GPU 资源饱和点和带宽争用，主动调整 Prefill/Decode 的单 GPU 资源分区。 | 多种 LLM 与工作负载；相对 vLLM 最高提高 2.2 倍吞吐、降低 20 倍 TTFT 和 2.5 倍 TBT，并达到或超过跨 GPU 的 vLLM P/D。 | **不是经典跨 GPU P/D**：Prefill 与 Decode 仍在同一 GPU，通过空间复用隔离。 | 论文未提供代码链接。 |
+| 2025-08 | [Prefill-Decode Aggregation or Disaggregation? Unifying Both for Goodput-Optimized LLM Serving](https://arxiv.org/abs/2508.01989) 提出 TaiChi，把实例划分为 P-heavy 与 D-heavy，并通过 Flowing Decode、长度感知 Prefill 和 Latency Shifting 在聚合与分离之间切换。 | 8×A100-80GB，Qwen 2.5 14B/32B，Chatbot 与 Summarization；比聚合方案提高 9%–47% Goodput，比固定 P/D 提高 29%–77%。 | **混合 P/D**：支持纯分离，但最佳配置允许 D-heavy 实例处理部分 Prefill。 | 论文说明计划后续开源，截至检索日未提供仓库。 |
+| 2025-08 | [Taming the Chaos: Coordinated Autoscaling for Heterogeneous and Disaggregated LLM Inference](https://arxiv.org/abs/2508.19559) 提出 HeteroScale，用拓扑感知放置和统一 Token 速率指标协调扩缩 Prefill 与 Decode 池。 | 字节跳动生产环境、数万张 GPU；平均 GPU 利用率提高 26.6 个百分点，每天节省数十万 GPU 小时，同时维持 SLO。 | **经典 P/D 的生产级 Autoscaling**。 | 论文未提供代码链接。 |
+
+## 2026 年：多轮负载与动态 Prefill 路由
+
+2026 年的新工作不再假设每次请求只有一次完整 Prefill。多轮对话和 Agent 工作流包含大量短 Append-Prefill，研究开始根据请求、队列和网络状态动态决定这些 Token 的执行位置。
+
+| 时间 | 论文与核心新意 | 实验对象与论文结果 | 架构判定 | 代码状态 |
+|---|---|---|---|---|
+| 2026-02 | [Efficient Multi-round LLM Inference over Disaggregated Serving](https://arxiv.org/abs/2602.14516) 提出 AMPD，根据实时队列决定增量 Prefill 在 P 节点还是 D 节点执行，并用 Prefill 重排与离线规划联合选择 P/D 并行配置。 | 4 台 8×H20-96GB 服务器，Qwen3-32B、Llama 3.1 70B、Mixtral 8×7B，ToolBench、GAIA、HotpotQA、DuReader；相对 Dynamo 的 SLO Attainment 平均提高 67.29%，相对共置 vLLM 平均提高 339.74%。 | **动态 P/D**：保留独立池，但部分增量 Prefill 可以在 Decode 侧执行。 | 论文未提供代码链接。 |
+| 2026-03 | [Not All Prefills Are Equal: PPD Disaggregation for Multi-turn LLM Serving](https://arxiv.org/abs/2603.13358) 区分 Full Prefill 与 Append-Prefill。PPD 根据 SLO 和负载，把后续轮次的轻量 Append-Prefill 留在持有 KV Cache 的 Decode 节点。 | vLLM 原型、4×H100、ShareGPT 与 WildChat；Full Prefill 与 Append-Prefill 对 TPOT 的干扰约为 48% 与 2%，PPD 将后续轮次 TTFT 平均降低约 68%，并在测试点保持稳定服务。 | **动态 P/D**：首轮使用经典 P/D，后续轮次可在 D 节点本地 Prefill。 | [官方代码](https://github.com/freelulul/vllm-ppd)已公开，仓库标注 ICML 2026。 |
+| 2026-05 | [KVServe: Service-Aware KV Cache Compression for Communication-Efficient Disaggregated LLM Serving](https://arxiv.org/abs/2605.13734) 将 KV 压缩方法组成可搜索策略空间，通过离线贝叶斯搜索和在线 Bandit 按网络、SLO 与质量预算选择传输配置。 | 集成 vLLM，覆盖多种数据集、模型、GPU 与网络；在 P/D 分离场景最高获得 9.13 倍 JCT 加速，在 KV 状态分离场景最高降低 32.8 倍 TTFT。 | **不是新的 P/D 切分方案**：它以已有 P/D 或 KV 状态分离为前提，优化通信路径。 | [官方代码](https://github.com/hpdps-group/KVServe)已公开，包含 P/D Baseline 与测试脚本。 |
+| 2026-07 | [Towards Load-Aware Prefill Deflection for Disaggregated LLM Serving](https://arxiv.org/abs/2607.02043) 提出 Kairos。Prefill 池排队时，调度器搜索不会突破现有 Decode TBT SLO 的 Chunk 序列，把完整 Prefill 偏转到空闲 Decode 节点，并消除该请求的跨节点 KV 传输。 | Azure A100 集群、2P2D、DeepSeek-V2-Lite 与生产风格突发 Trace；P95 TTFT 最高降低 81%，SLO Attainment 最高提高 79%，单请求路由开销低于 1 毫秒。 | **动态 P/D**：默认是独立池，拥塞时允许 Decode 节点临时执行 Prefill。 | 论文提供 `github.com/sudokara/Kairos` 作为代码地址；截至外链复核日，该地址返回 404。 |
+
+## KV 传输与硬件方向
+
+下面的工作以经典 P/D 为基础，但核心贡献落在传输介质、压缩或硬件专用化。它们适合在确定 P/D 架构后继续阅读。
+
+| 论文 | 定位 | 结果与代码 |
+|---|---|---|
+| [TraCT: Disaggregated LLM Serving with CXL Shared Memory KV Cache at Rack-Scale](https://arxiv.org/abs/2512.18194) | 在 Dynamo 上用 CXL 共享内存同时承担 KV 传输与 Rack 级 Prefix Cache，绕过 RDMA NIC 路径。 | 两台 A6000、DeepSeek-R1-Distill-Llama-8B；平均 TTFT 最高降低 9.8 倍、P99 降低 6.2 倍、峰值吞吐提高 1.6 倍。论文承诺发表后开源，截至检索日未链接仓库。 |
+| [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548) | 在传统 Storage-to-Prefill 路径外增加 Storage-to-Decode，再经 RDMA 向 P 节点传递，以利用 D 侧空闲 NIC。 | 三种模型和生产 Agent Trace；在线吞吐平均提高 1.96 倍且不违反 SLO。论文未提供代码链接。 |
+| [SpectrumKV: Per-Token Mixed-Precision KV Cache Transfer for Prefill-Decode Disaggregated LLM Serving](https://arxiv.org/abs/2606.08635) | 按 Token 重要性使用 FP16、INT8、INT4 混合精度传 KV，并用部署探针判断模型是否能容忍 INT4。 | Qwen 2.5 7B、Mistral 7B、Gemma 2 9B；在 50% KV 预算下显著优于二值 Token 剪枝，传输路径 TTFT 降低 50%–62%。论文未提供代码链接。 |
+
+## 基础工作与 Dynamo 的位置
+
+这些论文仍是理解新工作的基线。论文首次公开时间与正式发表时间需要分开看。
+
+| 工作 | 时间与定位 | 是否真正 P/D | 代码 |
+|---|---|---|---|
+| [Splitwise](https://arxiv.org/abs/2311.18677) | 2023 年预印本、ISCA 2024；强调阶段专用硬件池、异构 GPU 和逐层 KV 传输。 | 是。 | [Microsoft Research 项目页](https://www.microsoft.com/en-us/research/publication/splitwise-efficient-generative-llm-inference-using-phase-splitting/)提供论文与相关资源，但未提供完整 Serving Engine。 |
+| [DistServe](https://arxiv.org/abs/2401.09670) | OSDI 2024；以 TTFT/TPOT SLO 下的 Goodput 为目标，为两个阶段独立选择并行策略与资源数。 | 是。 | [官方代码](https://github.com/LLMServe/DistServe)已公开。 |
+| [Mooncake](https://arxiv.org/abs/2407.00079) | 2024 年预印本、FAST 2025；Kimi 的 KVCache-centric 架构，把 P/D 集群、分布式 KV 存储与缓存调度结合。它是 2025 年正式发表，不是 2025 年首次提出。 | 是。 | [官方代码](https://github.com/kvcache-ai/Mooncake)与 FAST 2025 Trace 已公开。 |
+| [P/D-Serve](https://arxiv.org/abs/2408.08147) | 2024 年预印本、NSDI 2025；重点是数万 NPU 上的 P/D 编组、RoCE KV 传输和故障恢复。 | 是。 | 论文未提供完整系统仓库。 |
+| [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) | 2025 年 3 月开源的推理框架，不是一篇独立学术论文。它提供 P/D Worker、KV-aware Router、Planner 和 NIXL 数据传输；研究后续主要是 MLSys 2026 的 Beyond the Buzz，以及构建在 Dynamo 上的 TraCT。 | 是，框架原生支持独立 P/D Worker。 | 官方仓库持续开发；部署能力与某篇论文的实验结论应分开引用。 |
+
+## 不应直接计入 P/D 新论文的工作
+
+Chunked Prefill、Prefix Cache、KV Cache Offloading、远程 KV Store 和 Attention/FFN 分离都可能与 P/D 组合，但它们本身不等于 Prefill 与 Decode 位于不同 Worker。判断一篇论文是否属于 P/D，至少需要确认请求在 Prefill 后发生执行实例切换，或论文明确改变了这种切换边界。
+
+semi-PD、Nexus、MuxWise 和 RAPID-Serve 的价值在于单 GPU 内的阶段隔离或复用。它们与 DistServe 式跨 GPU 分离解决相同的干扰问题，但没有相同的权重复制、KV 网络传输和独立扩缩容边界。KVServe、DualPath、SpectrumKV 则以 P/D 已经存在为前提，主要解决传输与存储瓶颈。

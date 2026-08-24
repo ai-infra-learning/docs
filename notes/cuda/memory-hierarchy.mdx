@@ -1,0 +1,15 @@
+---
+title: "CUDA 内存层次"
+description: "Register、Shared Memory、Cache 与 Global Memory 的作用和访问边界"
+---
+
+CUDA Kernel 的性能通常取决于数据从 Global Memory 进入计算单元的方式，以及数据能否在片上存储中重复使用。
+
+| 存储层次 | 可见范围 | 典型用途 | 常见限制 |
+|----------|----------|----------|----------|
+| Register | 单个 Thread | 标量、中间结果和地址计算 | 使用过多会降低 Occupancy，溢出后进入 Local Memory |
+| Shared Memory | 单个 Block | Block 内数据复用、Tiling 和线程协作 | 容量有限，需要避免 Bank Conflict |
+| L1/L2 Cache | SM 或整个 GPU | 缓存近期访问的数据 | 命中率受访问模式和工作集大小影响 |
+| Global Memory | 整个 GPU | 输入、输出和大规模持久数据 | 延迟高，需要合并访存并减少传输次数 |
+
+优化数据访问时，优先检查 Global Memory 事务是否合并，再判断 Shared Memory 是否能提高数据复用率。片上存储并非越多越好，它会与 Block 并发数和 Occupancy 共同竞争 SM 资源。
