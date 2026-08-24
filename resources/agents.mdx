@@ -1,6 +1,6 @@
 ---
 title: "Agent"
-description: "Agent 基础、Coding Agent、Harness Engineering 与自动化 AI 研究"
+description: "Agent 基础、Coding Agent、Memory、Harness Engineering 与自动化 AI 研究"
 ---
 
 ## Agent 基础与 Coding Agent
@@ -11,6 +11,12 @@ description: "Agent 基础、Coding Agent、Harness Engineering 与自动化 AI 
 | [从零开始理解 Agent](https://mp.weixin.qq.com/s/Ur3jsyDYobBocXd8ts0gpw) | 教程 | 从极简实现出发，逐层拆解 OpenClaw、Claude Code 等 AI Agent 的循环、工具、记忆和 Skill 等核心概念。 |
 | [nanoAgent](https://github.com/GitHubxsy/nanoAgent) | 实践项目 | 通过小型代码和配套章节讲解大模型、Agent 与 Skill 的底层原理，并展示从最小 Agent Loop 到工程化能力的演进。 |
 | [Self-Evolving Coding Agents 最新综述](https://mp.weixin.qq.com/s/hSrJLcZN3j7J7X02N2HIMg) | 综述 | 系统梳理 Coding Agent 如何利用测试、编译和执行轨迹持续更新框架、记忆、技能与工具、模型以及协作工作流，并讨论进化时机、反馈证据、评估与安全挑战。 |
+
+## Agent Memory
+
+| 资源 | 类型 | 简介 |
+|------|------|------|
+| [A Survey of Agent Memory in the Second Half: Towards Self-Evolving and Long-Horizon Agents](https://arxiv.org/abs/2602.06052) | 综述论文 | 从记忆载体、认知机制和记忆主体三个维度整理 Agent Memory，并讨论单 Agent 与多 Agent 系统中的记忆操作、可学习的管理策略、评测与开放问题。 |
 
 ## Harness Engineering
 
@@ -24,6 +30,7 @@ Harness Engineering 指的是一种开发方式：工程师设计环境、规则
 | [Minions: Stripe’s One-Shot, End-to-End Coding Agents - Part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2) | 官方博客 | 继续讨论 Minions 在大规模使用中的可靠性、人工审查、评测与迭代机制，以及每周合并大量 Agent PR 的实践经验。 |
 | [Vibe Coding AReaL：零手打代码开发分布式 RL 训练框架](https://zhuanlan.zhihu.com/p/2003269671630165191) | 博客 | 记录使用 Coding Agent 开发分布式强化学习训练框架 AReaL 的过程，关注任务拆解、反馈循环和无手写代码协作方式。 |
 | [Are Agent Harnesses Bringing Back Vibe Coding?](https://www.youtube.com/watch?v=13HP_bSeNjU) | 视频 | 讨论 Agent Harness 如何通过工具、上下文、约束和验证机制提升 Coding Agent 的自治能力，并重新界定 Vibe Coding。 |
+| [HarnessEval: The Era of Harness for Benchmarking](https://mirros.ai/blog/harnesseval)（[代码](https://github.com/mirros-lab/harnesseval-w)） | 研究博客 / 开源项目 | 将 Harness 用于交互式世界模型评测：Agent 根据案例选择 Skill、拆解问题并调用子 Agent，最终输出可核查的 Evidence Tree，而不只提供汇总分数。 |
 
 ## 自动化 AI 研究
 
