@@ -1,0 +1,15 @@
+---
+title: "CUDA 异步执行"
+description: "Stream、Event、异步内存拷贝与计算通信重叠"
+---
+
+CUDA Stream 表示一条有序的设备工作队列。同一 Stream 中的操作按提交顺序执行，不同 Stream 在不存在依赖且硬件资源允许时可以并发运行。
+
+| 机制 | 作用 |
+|------|------|
+| Stream | 组织 Kernel、内存拷贝和其他设备操作的执行顺序 |
+| Event | 记录设备时间点，并在不同 Stream 之间表达依赖 |
+| Asynchronous copy | 在满足内存和硬件条件时，使数据传输与 Kernel 执行重叠 |
+| Synchronization | 在 Host、Device 或 Stream 边界等待先前操作完成 |
+
+Host 与 Device 之间的真正异步拷贝通常需要 Pinned Host Memory。是否能够形成计算与传输重叠，还取决于 GPU 的 Copy Engine、数据方向、Stream 依赖和 Kernel 资源占用。

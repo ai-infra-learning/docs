@@ -1,0 +1,116 @@
+/* Compact, product-style top navigation. */
+@media (min-width: 1024px) {
+  #navbar .nav-tabs {
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  #navbar .nav-tabs-item {
+    height: auto;
+    padding: 0.5rem 0.75rem;
+    border-radius: 9999px;
+    line-height: 1.25rem;
+    transition:
+      color 160ms ease,
+      background-color 160ms ease;
+  }
+
+  #navbar .nav-tabs-item > div {
+    display: none;
+  }
+
+  #navbar .nav-tabs-item:hover {
+    color: #111827;
+    background: rgb(17 24 39 / 5%);
+  }
+
+  #navbar .nav-tabs-item[data-active] {
+    color: #15803d;
+    background: rgb(22 163 74 / 10%);
+    text-shadow: none;
+  }
+
+  .dark #navbar .nav-tabs-item:hover {
+    color: #f3f4f6;
+    background: rgb(255 255 255 / 7%);
+  }
+
+  .dark #navbar .nav-tabs-item[data-active] {
+    color: #4ade80;
+    background: rgb(74 222 128 / 12%);
+  }
+}
+
+/* Use a single header row when there is enough room for all seven sections. */
+@media (min-width: 1380px) {
+  :root {
+    --topbar-tabs-height: 0rem !important;
+  }
+
+  #navbar > div:not(#navbar-transition) {
+    max-width: none;
+  }
+
+  #navbar div:has(> .nav-tabs) {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    display: flex !important;
+    height: 4rem;
+    padding: 0;
+    pointer-events: none;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #navbar .nav-tabs {
+    height: 4rem;
+    pointer-events: auto;
+  }
+
+  #navbar a:has(> .nav-logo) {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  #navbar a:has(> .nav-logo)::after {
+    color: #111827;
+    content: "AI Infra";
+    font-family: Inter, "SF Pro Display", "Segoe UI", sans-serif;
+    font-size: 1.0625rem;
+    font-weight: 650;
+    letter-spacing: -0.025em;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .dark #navbar a:has(> .nav-logo)::after {
+    color: #f9fafb;
+  }
+
+  #navbar div:has(> #search-bar-entry) {
+    z-index: 20;
+    order: 2;
+    flex: 0 0 13rem;
+  }
+
+  #navbar #search-bar-entry {
+    height: 2.5rem;
+    border-radius: 9999px;
+    background: rgb(17 24 39 / 4%);
+    box-shadow: inset 0 0 0 1px rgb(17 24 39 / 6%);
+  }
+
+  .dark #navbar #search-bar-entry {
+    background: rgb(255 255 255 / 6%);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 8%);
+  }
+
+  #navbar div:has(> nav[aria-label="Main"]) {
+    z-index: 20;
+    order: 3;
+    flex: 0 0 auto;
+    margin-left: 1rem;
+  }
+}

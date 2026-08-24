@@ -1,0 +1,16 @@
+---
+title: "CUDA Kernel 优化"
+description: "访存、Tiling、向量化、Occupancy 与分支发散优化"
+---
+
+Kernel 优化应从实际瓶颈出发。Memory-bound Kernel 优先减少内存事务和提高数据复用，Compute-bound Kernel 则关注指令吞吐、流水线和 Tensor Core 利用率。
+
+| 优化方向 | 核心目标 |
+|----------|----------|
+| 合并访存 | 让相邻 Thread 访问连续地址，减少 Global Memory 事务数量 |
+| Tiling | 将数据分块放入 Shared Memory 或 Register，提高复用率 |
+| 向量化 | 使用更宽的 Load/Store，在满足对齐条件时减少指令数量 |
+| 分支控制 | 减少同一 Warp 内的执行路径分歧 |
+| Occupancy | 保留足够的活跃 Warp 隐藏延迟，同时避免为了追求占用率牺牲数据复用 |
+
+Occupancy 是资源约束下的并发度指标，不是最终性能目标。寄存器或 Shared Memory 使用增加可能降低 Occupancy，但如果它显著减少 Global Memory 访问，Kernel 仍可能获得更高吞吐。
