@@ -119,6 +119,29 @@
         ]
       },
       {
+        "tab": "技术笔记",
+        "groups": [
+          {
+            "group": "GPU 编程",
+            "pages": [
+              {
+                "group": "CUDA",
+                "expanded": true,
+                "pages": [
+                  {
+                    "group": "CUDA 编程模型",
+                    "expanded": true,
+                    "pages": [
+                      "notes/cuda/gpu-hardware-model"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
         "tab": "面试题",
         "groups": [
           {

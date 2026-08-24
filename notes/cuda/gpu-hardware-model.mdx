@@ -1,0 +1,128 @@
+---
+title: "GPU 硬件模型"
+sidebarTitle: "GPU 硬件模型"
+keywords: ["CUDA", "GPU", "Grid", "Thread Block", "Thread Block Cluster", "Warp", "Thread", "GPC", "SM", "SIMT"]
+---
+
+## GPU 的硬件组成
+
+就 CUDA 编程而言，可以把 GPU 看作多个<strong>流多处理器（Streaming Multiprocessor，SM）</strong>的集合，这些 SM 又组成若干<strong>图形处理集群（Graphics Processing Cluster，GPC）</strong>。每个 SM 包含<strong>本地寄存器文件（Register File）</strong>、<strong>统一数据缓存（Unified Data Cache）</strong>和若干执行计算的<strong>功能单元（Functional Unit）</strong>。Unified Data Cache 为<strong>共享内存（Shared Memory）</strong>和 <strong>L1 Cache</strong> 提供物理资源，二者占用的容量可以在运行时配置。
+
+<Frame caption="GPU 包含多个 SM，每个 SM 又包含多个 Functional Unit。GPC 由若干 SM 组成，GPU 则由连接到 GPU Memory 的一组 GPC 构成。CPU 通常包含若干 Core，以及连接到 System Memory 的 Memory Controller。CPU 与 GPU 通过 PCIe 或 NVLink 等互连连接。图源：[CUDA Programming Guide 13.3，1.2.2 GPU Hardware Model](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#gpu-cpu-system-diagram)。">
+  <img style={{ width: "680px", margin: "0 auto" }} src="/images/notes/cuda/gpu-cpu-system-diagram.png" alt="CUDA GPU、GPC、SM、GPU Memory、CPU 和 System Memory 的概念硬件模型" />
+</Frame>
+
+## 线程层次结构
+
+应用程序启动<strong>核函数（Kernel）</strong>时，会启动大量<strong>线程（Thread）</strong>，通常数以百万计。CUDA 将这些 Thread 组织成<strong>线程块（Thread Block）</strong>，再将 Thread Block 组织成<strong>网格（Grid）</strong>。
+
+### Thread
+
+Thread 是执行 Kernel 代码的单个实例。同一次 Kernel Launch 中的 Thread 执行相同的 Kernel 代码，但会根据各自的索引处理不同的数据元素。
+
+### Thread Block
+
+一组 Thread 构成一个 Thread Block。Thread Block 为其中的 Thread 提供共同的协作范围：同一个 Thread Block 内的 Thread 可以同步，也可以通过片上的 Shared Memory 交换数据。
+
+### Grid
+
+一组 Thread Block 构成一个 Grid。同一个 Grid 中的所有 Thread Block 具有相同的大小和维度。Grid 和 Thread Block 都可以按一维、二维或三维组织，这些维度便于把 Thread 映射到具体的工作单元或数据项。
+
+<Frame caption="Thread Block 组成 Grid。每个箭头表示一个 Thread；图中的箭头数量不代表实际的 Thread 数量。图源：[CUDA Programming Guide 13.3，1.2.2.1 Thread Blocks and Grids](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#thread-hierarchy-grid-of-thread-blocks)。">
+  <img style={{ width: "760px", margin: "0 auto" }} src="/images/notes/cuda/grid-of-thread-blocks.png" alt="多个 Thread 组成 Thread Block，多个 Thread Block 组成 Grid" />
+</Frame>
+
+### Thread Block Cluster
+
+<strong>计算能力（Compute Capability）</strong> 9.0 及以上的 GPU 提供可选的<strong>线程块集群（Thread Block Cluster）</strong>。一个 Thread Block Cluster 由多个 Thread Block 组成，与 Thread Block 和 Grid 一样，可以按一维、二维或三维布局。
+
+指定 Thread Block Cluster 不会改变 Grid 的维度，也不会改变 Thread Block 在 Grid 中的索引。Thread Block 仍处在原来的 Grid 位置，同时还具有它在所属 Thread Block Cluster 中的位置。
+
+<Frame caption="指定 Thread Block Cluster 后，Thread Block 在 Grid 中的位置保持不变，同时还具有它在所属 Thread Block Cluster 中的位置。图源：[CUDA Programming Guide 13.3，1.2.2.1.1 Thread Block Clusters](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#figure-thread-block-clusters)。">
+  <img style={{ width: "760px", margin: "0 auto" }} src="/images/notes/cuda/grid-of-clusters.png" alt="Grid 中的 Thread Block 进一步组成多个 Thread Block Cluster" />
+</Frame>
+
+## Thread Block 的调度
+
+### Thread Block 与 SM
+
+一个 Thread Block 的所有 Thread 由单个 SM 执行。通常，Thread Block 会在该 SM 上运行直至完成。因此，Thread Block 内的 Thread 可以高效地通信和同步，并通过片上的 Shared Memory 交换数据。
+
+一个 Grid 可能包含数百万个 Thread Block，而执行这个 Grid 的 GPU 可能只有几十或几百个 SM。一个 SM 可以同时保留一个或多个活动 Thread Block。
+
+<Frame caption="每个 SM 上有一个或多个活动 Thread Block。本例中，每个 SM 同时调度三个 Thread Block。Grid 中的 Thread Block 以何种顺序分配给各个 SM，没有任何保证。图源：[CUDA Programming Guide 13.3，1.2.2.1 Thread Blocks and Grids](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#thread-block-scheduling)。">
+  <img style={{ width: "520px", margin: "0 auto" }} src="/images/notes/cuda/thread-block-scheduling.png" alt="Grid 中的 Thread Block 被分配到多个 SM，每个 SM 同时运行多个活动 Thread Block" />
+</Frame>
+
+CUDA 不保证不同 Thread Block 的调度顺序。未使用显式跨 Block 同步机制时，一个 Thread Block 不能依赖另一个 Thread Block 的结果，后者可能要等当前 Thread Block 完成后才有机会运行。CUDA 编程模型通常要求 Thread Block 能够按任意顺序执行，也能够并行或串行执行。
+
+### Thread Block Cluster 与 GPC
+
+Thread Block Cluster 在 Thread Block 与 Grid 之间增加了一层可选分组，使多个 Thread Block 能够跨 SM 通信、同步并协同完成同一任务。
+
+指定 Thread Block Cluster 后，Grid 中相邻的 Thread Block 会按照 Cluster 的维度组成一组。同一个 Thread Block Cluster 中的所有 Thread Block 会同时调度到同一个图形处理集群（Graphics Processing Cluster，GPC）内的 SM。
+
+Cluster 内的 Thread 可以通过 <strong>Cooperative Groups</strong> 执行 Cluster 级同步，并访问其他 Thread Block 的 Shared Memory。Cluster 中各个 Thread Block 的 Shared Memory 共同构成<strong>分布式共享内存（Distributed Shared Memory）</strong>。例如，一个数据分片无法由单个 Thread Block 完成时，可以拆分给多个 Thread Block，各自加载一部分数据，再通过同步和 Distributed Shared Memory 协同计算。
+
+Thread Block Cluster 的最大尺寸取决于具体设备及其配置。为兼容不同 GPU，通常最多配置 8 个 Thread Block；实际支持的上限可以通过 [`cudaOccupancyMaxPotentialClusterSize`](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/group__CUDART__OCCUPANCY.html#group__CUDART__OCCUPANCY_1g6d65e4932b9ab03d6544e37f111d7ec9) 查询。
+
+<Frame caption="指定 Thread Block Cluster 后，其中的 Thread Block 按 Thread Block Cluster 的形状排列在 Grid 中。同一个 Thread Block Cluster 的 Thread Block 会同时调度到同一个 GPC 内的 SM。图源：[CUDA Programming Guide 13.3，1.2.2.1.1 Thread Block Clusters](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#thread-block-scheduling-with-clusters)。">
+  <img style={{ width: "520px", margin: "0 auto" }} src="/images/notes/cuda/thread-block-scheduling-with-clusters.png" alt="同一个 Thread Block Cluster 中的 Thread Block 同时调度到一个 GPC 内的多个 SM" />
+</Frame>
+
+## SM 内的 Warp 与 SIMT
+
+### Warp 与 Lane
+
+同一个 Thread Block 内的 Thread 每 32 个组成一个<strong>线程束（Warp）</strong>。Warp 中的 32 个位置称为<strong>执行通道（Lane）</strong>，编号为 0 到 31；每个有效 Thread 对应一个 Lane。每个 Warp 都重新从 Lane 0 开始编号。
+
+如果一个 Thread Block 的 Thread 总数不是 32 的整数倍，最后一个 Warp 仍然存在，但其中一部分 Lane 没有对应的有效 Thread。
+
+### SIMT
+
+Warp 使用<strong>单指令多线程（Single-Instruction Multiple-Threads，SIMT）</strong>模型执行 Kernel 代码。Warp 中的 Thread 执行同一份 Kernel 代码，但每个 Thread 可以沿不同的分支执行，不要求所有 Thread 遵循相同的执行路径。
+
+在 CUDA 编程模型中，一个 Warp 每次执行一条共同指令，参与当前指令的 Thread 称为<strong>活动线程（Active Thread）</strong>。实际硬件可以采用不同的物理执行方式，只要其行为符合 CUDA 编程模型；程序不应依赖 Kernel 到具体硬件执行单元的内部映射。
+
+### Warp Divergence
+
+当同一个 Warp 内只有部分 Thread 进入某个控制流分支时，执行该分支期间，其余 Thread 会被暂时屏蔽。不同 Thread 采用不同代码路径的情况称为 <strong>Warp Divergence</strong>。
+
+Warp 内的 Thread 采用相同控制流路径时，GPU 的执行资源利用率最高。Thread Block 可以包含任意合法数量的 Thread，但通常应让 Thread 总数成为 32 的倍数；否则，最后一个 Warp 中未使用的 Lane 会降低该 Warp 的 Functional Unit 和内存访问利用率。
+
+## 线程层次与硬件映射
+
+CUDA 使用 Thread、Thread Block、Thread Block Cluster 和 Grid 组织 Kernel 的计算任务，GPU 则由 GPC 和 SM 等硬件资源执行这些任务。两组概念之间存在以下关系：
+
+- Thread 组成 Thread Block，Thread Block 再组成 Grid；启用 Thread Block Cluster 时，相邻的 Thread Block 还会组成 Thread Block Cluster。
+- 一个 Thread Block 由一个 SM 执行，而一个 SM 可以同时保留多个活动 Thread Block。
+- 同一个 Thread Block Cluster 中的 Thread Block 会同时调度到一个 GPC 内的 SM。
+- 同一个 Thread Block 内的 Thread 每 32 个组成一个 Warp，并以 SIMT 模型执行。
+
+<Frame caption="CUDA 线程层次结构与 GPU 硬件映射。左侧表示 Grid、Thread Block Cluster、Thread Block、Warp 和 Thread 的组织关系；右侧表示 GPU、GPC、SM 及 SM 内部资源；跨列箭头表示任务进入硬件执行的关系。">
+  <img src="/images/notes/cuda/cuda-execution-hardware-mapping.png" alt="CUDA Thread、Warp、Thread Block、Thread Block Cluster 和 Grid 与 GPU、GPC、SM 的整体关系" />
+</Frame>
+
+## 组件关系与数量限制
+
+下表汇总了 CUDA 编程模型与 GPU 硬件主要组件之间的关系及其数量上限。
+
+| 组件 | 类别 | 调度与执行范围 | 组成与关系 | 数量限制或范围 |
+| --- | --- | --- | --- | --- |
+| Grid | 编程模型 | 一次 Kernel Launch 选定的 GPU | 包含本次 Kernel Launch 的全部 Thread Block | 最多 3 维：<br />1 维 Grid：最多 `2³¹−1 = 2,147,483,647` 个 Thread Block；<br />2 维 Grid：最多 `(2³¹−1) × 65,535 ≈ 1.407 × 10¹⁴` 个 Thread Block；<br />3 维 Grid：最多 `(2³¹−1) × 65,535 × 65,535 ≈ 9.223 × 10¹⁸` 个 Thread Block。 |
+| Thread Block Cluster | 编程模型 | 单个 GPC | 可选地将相邻的 Thread Block 分组；Cluster 中的 Thread Block 同时调度到同一个 GPC 内的多个 SM，每个 Thread Block 仍只由一个 SM 执行 | Compute Capability 9.0+；为兼容不同 GPU，Cluster 通常最多配置 8 个 Thread Block。具体设备或 MIG 配置的上限可能更小或更大，可通过 [`cudaOccupancyMaxPotentialClusterSize`](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/group__CUDART__OCCUPANCY.html#group__CUDART__OCCUPANCY_1g6d65e4932b9ab03d6544e37f111d7ec9) API 查询。 |
+| Thread Block | 编程模型 | 单个 SM | 包含一组 Thread；所有 Thread 由同一个 SM 执行，一个 SM 可以同时驻留多个 Thread Block | 最多 3 维；`x、y ≤ 1024`，`z ≤ 64`，且 Thread 总数 `x × y × z ≤ 1024` |
+| Warp | 编程模型 | SM 内 | 同一个 Thread Block 内的 Thread 每 32 个组成一个 Warp；每个有效 Thread 对应一个 Lane | 固定包含 32 个 Thread，Lane 编号为 `0–31`；一个 Thread Block 最多包含 32 个 Warp |
+| Thread | 编程模型 | 所属 Warp 内 | Kernel 代码的单个执行实例，根据自身索引处理数据 | `threadIdx.x` 的范围为 `0` 到 `blockDim.x − 1`，`y、z` 维同理；数量由 Thread Block 的大小决定 |
+| GPU | 硬件 | — | 包含若干 GPC，执行选定设备上的 Grid | GPC 和 SM 数量取决于 GPU 型号；可调用 [`cudaGetDeviceProperties`](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/group__CUDART__DEVICE.html#group__CUDART__DEVICE_1g1bf9d625a931d657e08db2b4391170f0) 获取设备属性，再读取 [`cudaDeviceProp::multiProcessorCount`](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/structcudaDeviceProp.html#structcudaDeviceProp_13e36d9d236f97095ef2b496cd2f98121) 字段获得 SM 数量 |
+| GPC | 硬件 | GPU 内 | 包含若干 SM，是 Thread Block Cluster 的调度范围 | GPC 数量和每个 GPC 包含的 SM 数量取决于具体架构，没有 CUDA 通用固定值 |
+| SM | 硬件 | GPC 内 | 执行 Thread Block，可同时驻留一个或多个 Thread Block 及其 Warp 和 Thread | 每个 SM 可驻留的 Thread Block、Warp 和 Thread 上限随 Compute Capability 而异，见 [Device and Streaming Multiprocessor (SM) Information per Compute Capability](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/05-appendices/compute-capabilities.html#compute-capabilities-table-device-and-streaming-multiprocessor-sm-information-per-compute-capability)。实际驻留数量还受 Register 和 Shared Memory 使用量限制；Thread Block 的设备上限可通过 [`cudaDeviceProp::maxBlocksPerMultiProcessor`](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/structcudaDeviceProp.html#structcudaDeviceProp_17f337476973ea65db85c277f4646f0b3) 查询。 |
+
+## 参考资料
+
+- [CUDA Programming Guide 13.3：GPU Hardware Model](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#gpu-hardware-model)
+- [CUDA Programming Guide 13.3：Thread Blocks and Grids](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#thread-blocks-and-grids)
+- [CUDA Programming Guide 13.3：Thread Block Clusters](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#thread-block-clusters)
+- [CUDA Programming Guide 13.3：Warps and SIMT](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/01-introduction/programming-model.html#warps-and-simt)
+- [CUDA Programming Guide 13.3：2.1.10 Thread Block Clusters](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/02-basics/intro-to-cuda-cpp.html#thread-block-clusters)
+- [CUDA Programming Guide 13.3：Features and Technical Specifications](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/05-appendices/compute-capabilities.html#features-and-technical-specifications)
