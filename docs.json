@@ -112,6 +112,7 @@
             "group": "主题分类",
             "pages": [
               "projects/inference",
+              "projects/performance",
               "projects/agents",
               "projects/cluster-infrastructure"
             ]
