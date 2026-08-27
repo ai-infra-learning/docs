@@ -316,7 +316,6 @@ CUDA 调试和 CPU 程序不同，错误可能是“延迟暴露”的，因此�
 <Accordion title="CUDA 案例（2d_kernel）">
 ```cpp
 // 2d_kernel.cu
-// 2d_kernel.cu
 #include <cuda_runtime.h>
 #include <iostream>
 //------------------------------------------------------
@@ -331,10 +330,11 @@ __global__ void my2DKernel(float* input, int width, int height) {
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     // Only process valid pixels
     if (x < width && y < height) {
-    int idx = y * width + x;
-    input[idx] *= 2.0f;
+        int idx = y * width + x;
+        input[idx] *= 2.0f;
     }
 }
+
 int main() {
     // Image dimensions
     const int width  = 1024;
@@ -344,21 +344,35 @@ int main() {
     float* h_image = nullptr;
     cudaMallocHost(&h_image, N * sizeof(float));
     for (int i = 0; i < N; ++i) {
-    h_image[i] = 1.0f;  // e.g.， initialize all pixels to 1.0f
+        h_image[i] = 1.0f;  // e.g., initialize all pixels to 1.0f
     }
+
     // 2) Allocate device image and copy data to device
-    cudaStream_t s; cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    cudaStream_t s;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+
     float* d_image = nullptr;
     cudaMallocAsync(&d_image, N * sizeof(float), s);
+
     cudaMemcpyAsync(d_image, h_image, N * sizeof(float),
-    cudaMemcpyHostToDevice， s);
-    my2DKernel<<<blocksPerGrid2D， threadsPerBlock2D，
-    0, s>>>(d_image, width, height);
+        cudaMemcpyHostToDevice, s);
+
+    // 3) Launch kernel with 2D grid configuration
+    dim3 threadsPerBlock2D(16, 16);
+    dim3 blocksPerGrid2D(
+        (width + threadsPerBlock2D.x - 1) / threadsPerBlock2D.x,
+        (height + threadsPerBlock2D.y - 1) / threadsPerBlock2D.y
+    );
+    my2DKernel<<<blocksPerGrid2D, threadsPerBlock2D,
+        0, s>>>(d_image, width, height);
+
     cudaMemcpyAsync(h_image, d_image, N * sizeof(float),
-    cudaMemcpyDeviceToHost， s);
+        cudaMemcpyDeviceToHost, s);
     cudaStreamSynchronize(s);
     cudaFreeAsync(d_image, s);
     cudaStreamDestroy(s);
+
+    return 0;
 }
 ```
 </Accordion>
@@ -370,8 +384,8 @@ int main() {
 如果输入是图像，本身就是二维结构，就可以使用二维 block 和二维 grid。比如一个 1024 x 1024 的矩阵，可以用：
 
 ```cpp
-dim3 threads(16, 16);
-dim3 blocks((width + 15) / 16, (height + 15) / 16);
+dim3 threadsPerBlock2D(16, 16);
+dim3 blocksPerGrid2D((width + 15) / 16, (height + 15) / 16);
 ```
 
 这个配置中，每个 block 有 `16 x 16 = 256` 个线程，仍然符合常见起点。kernel 内部可以计算二维坐标：
