@@ -1,0 +1,28 @@
+---
+title: "性能分析"
+description: "LLM 推理、GPU 互联与 PyTorch 工作负载的 Benchmark 和 Profiling 项目"
+---
+
+## LLM 推理 Benchmark
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [ai-dynamo/aiperf](https://github.com/ai-dynamo/aiperf) | 面向生成式 AI Serving 的端到端 Benchmark 工具，支持并发、请求速率、Trace Replay 和多轮会话负载，统计 TTFT、TTFO、ITL、吞吐量及推理服务端指标。AIPerf 是 GenAI-Perf 当前已支持功能的后续替代工具。 | [官方文档](https://docs.nvidia.com/aiperf/) |
+| [vllm-project/guidellm](https://github.com/vllm-project/guidellm) | 面向 OpenAI-compatible Endpoint 的 SLO-aware Benchmark 工具，提供并发、恒定请求速率、Poisson 和 Sweep 等流量模型，并输出 JSON、CSV 与 HTML 报告。 | [官方文档](https://vllm-project.github.io/guidellm/) |
+| [kubernetes-sigs/inference-perf](https://github.com/kubernetes-sigs/inference-perf) | Kubernetes 社区维护的模型服务器无关 Benchmark 工具，支持 Goodput、自动饱和检测、多阶段负载、Trace Replay 和多轮 Agent 会话，可用于验证路由与自动扩缩容。 | [使用文档](https://github.com/kubernetes-sigs/inference-perf/tree/main/docs) |
+| [llm-d/llm-d-benchmark](https://github.com/llm-d/llm-d-benchmark) | 面向分布式推理集群的 Benchmark 编排框架，统一执行部署、压测、结果收集和环境清理，并通过可插拔 Harness 测试 PD 分离、路由和自动扩缩容等场景。 | [KubeCon 教程](https://github.com/llm-d/llm-d-benchmark/tree/main/docs/tutorials/kubecon) |
+| [mlcommons/inference](https://github.com/mlcommons/inference) | MLPerf Inference 的参考实现与标准化 Benchmark 套件，通过统一模型、数据集、负载场景、准确率和合规规则比较不同硬件与软件系统的推理性能。 | [官方文档](https://docs.mlcommons.org/inference/) |
+
+## GPU 与通信 Benchmark
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [NVIDIA/nvbandwidth](https://github.com/NVIDIA/nvbandwidth) | 测量 CPU 与 GPU、GPU 与 GPU 之间的带宽和延迟，覆盖 Copy Engine、Kernel Copy、TMA、指定 GPU Pair 以及单节点和多节点测试，可用于检查 PCIe、NVLink 与 IMEX 链路。 | [使用说明](https://github.com/NVIDIA/nvbandwidth#usage) |
+| [NVIDIA/nccl-tests](https://github.com/NVIDIA/nccl-tests) | 检查 NCCL Collective 的正确性和性能，支持单机多卡与 MPI 多节点运行，可测量 AllReduce、AllGather、ReduceScatter 等操作的延迟、算法带宽和总线带宽。 | [性能指标说明](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md) |
+| [NVIDIA/nvbench](https://github.com/NVIDIA/nvbench) | CUDA Kernel 微基准库，支持参数扫描、冷启动、批量测量以及 GPU 时间、CPU 时间、吞吐量和显存带宽统计，适合 Kernel 调优与性能回归测试。 | [项目文档](https://github.com/NVIDIA/nvbench/tree/main/docs) |
+
+## Profiler
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [pytorch/kineto](https://github.com/pytorch/kineto) | PyTorch Profiler 使用的底层 CPU 与 GPU Profiling 库，提供低开销 GPU Timeline、硬件性能计数器和诊断能力，并可导出 Chrome 或 Perfetto Trace。 | [PyTorch Profiler](https://docs.pytorch.org/docs/stable/profiler.html) |

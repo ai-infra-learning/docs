@@ -111,7 +111,9 @@
           {
             "group": "主题分类",
             "pages": [
+              "projects/llm-gateway",
               "projects/inference",
+              "projects/performance",
               "projects/agents",
               "projects/cluster-infrastructure"
             ]
