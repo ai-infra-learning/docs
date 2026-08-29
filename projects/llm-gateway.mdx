@@ -1,0 +1,13 @@
+---
+title: "LLM 网关"
+description: "LLM API 统一接入、模型路由、流量治理与可观测性项目"
+---
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [smg-project/smg](https://github.com/smg-project/smg) | 面向自托管推理引擎和云模型提供商的模型路由网关，统一 HTTP 与 gRPC 后端接入，并提供 KV Cache 感知路由、Worker 生命周期管理和 Prefill-Decode 分离能力。 | [官方文档](https://lightseek.org/smg/) |
+| [BerriAI/litellm](https://github.com/BerriAI/litellm) | 通过 OpenAI 兼容接口统一访问多家模型提供商；集中式代理提供路由、故障转移、鉴权、限流、用量与预算管理，也可作为 Python SDK 使用。 | [官方文档](https://docs.litellm.ai/docs/simple_proxy) |
+| [envoyproxy/ai-gateway](https://github.com/envoyproxy/ai-gateway) | 基于 Envoy Gateway 与 Envoy Proxy 的 Kubernetes AI Gateway，通过 Gateway API 与专用 CRD 配置模型后端、协议转换、认证、流量路由和 Token 级限流。 | [官方文档](https://aigateway.envoyproxy.io/docs/) |
+| [agentgateway/agentgateway](https://github.com/agentgateway/agentgateway) | 面向 Agent 通信的代理，统一处理 Agent 到 LLM、工具和其他 Agent 的流量，并提供 LLM、MCP、A2A 路由以及安全策略和可观测性。 | [官方文档](https://agentgateway.dev/docs/) |
+| [higress-group/higress](https://github.com/higress-group/higress) | 基于 Istio 与 Envoy 的云原生 API Gateway，通过 Wasm 插件统一管理 LLM API 与 MCP API，并提供负载均衡、限流、安全和可观测性能力。 | [官方文档](https://higress.ai/en/docs/latest/overview/what-is-higress/) |
+| [maximhq/bifrost](https://github.com/maximhq/bifrost) | 可独立部署或嵌入 Go 应用的 AI Gateway，通过 OpenAI 兼容接口连接多家模型提供商，并提供路由、重试与故障转移、虚拟密钥、用量治理和 MCP 集成。 | [官方文档](https://docs.getbifrost.ai/overview) |
