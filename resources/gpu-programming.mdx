@@ -45,8 +45,7 @@ description: "GPU 架构、CUDA、Triton、CUTLASS、TileLang 与 FlashAttention
 
 | 资源 | 类型 | 简介 |
 |------|------|------|
-| [FlashAttention为什么又快又节省GPU显存？](https://www.bilibili.com/video/BV1TU8x6hEVb) | 视频 | 从 GPU 的 SRAM/HBM 存储层级和数据搬运成本出发，推导 Kernel Fusion、Online Softmax 与 Tiling 如何让 FlashAttention 在保持精确 Attention 计算的同时减少 HBM 读写和显存占用。 |
-| [FlashAttention：为什么加速推理的同时还能节省显存](https://zhangchitc.github.io/codex/078_flash_attention/visual.html) | 交互式可视化 | 通过八个交互式分屏展示 Attention 的矩阵计算、Kernel Fusion、Online Softmax 递推和 QKV Tiling，直观解释 FlashAttention 如何减少 HBM 数据搬运与中间结果存储。 |
+| [FlashAttention 为什么又快又节省 GPU 显存？](https://www.bilibili.com/video/BV1TU8x6hEVb)（[配套资料](https://zhangchitc.github.io/codex/078_flash_attention/visual.html)） | 视频 | 从 GPU 的 SRAM/HBM 存储层级和数据搬运成本出发，推导 Kernel Fusion、Online Softmax 与 Tiling 如何让 FlashAttention 在保持精确 Attention 计算的同时减少 HBM 读写和显存占用。 |
 | [FlashAttention from First Principles](https://ai.gopubby.com/flashattention-from-first-principles-part-1-5a9f2407d739#bypass) | 博客 | 从标准 Attention 的内存瓶颈出发，推导分块、Online Softmax 和避免物化完整注意力矩阵的实现思路。 |
 | [FlashAttention - Visually and Exhaustively Explained](https://ai.gopubby.com/flashattention-visually-and-exhaustively-explained-d6124670f7fb#bypass) | 博客 | 使用可视化示例解释 FlashAttention 的 Tiling、重计算、Online Softmax、前向与反向过程。 |
 | [Flash Attention 2.0 with Tri Dao](https://www.youtube.com/watch?v=IoMSGuiwV3g&t=2240s) | 视频 | Tri Dao 讲解 FlashAttention-2 的算法设计、并行划分、GPU 利用率和相对第一版的优化。 |
