@@ -5,36 +5,36 @@ description: "Agent 基础、Coding Agent、Memory、Harness Engineering 与自�
 
 ## Agent 基础与 Coding Agent
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Learn Claude Code](https://github.com/shareAI-lab/learn-claude-code) | 实践课程 | 从零构建类 Claude Code 的 AI Agent，12 个渐进式课程涵盖 Agent Loop、工具调用、子代理、上下文压缩、任务系统、多代理协作和 Worktree 隔离。 |
-| [从零开始理解 Agent](https://mp.weixin.qq.com/s/Ur3jsyDYobBocXd8ts0gpw) | 教程 | 从极简实现出发，逐层拆解 OpenClaw、Claude Code 等 AI Agent 的循环、工具、记忆和 Skill 等核心概念。 |
-| [nanoAgent](https://github.com/GitHubxsy/nanoAgent) | 实践项目 | 通过小型代码和配套章节讲解大模型、Agent 与 Skill 的底层原理，并展示从最小 Agent Loop 到工程化能力的演进。 |
-| [Self-Evolving Coding Agents 最新综述](https://mp.weixin.qq.com/s/hSrJLcZN3j7J7X02N2HIMg) | 综述 | 系统梳理 Coding Agent 如何利用测试、编译和执行轨迹持续更新框架、记忆、技能与工具、模型以及协作工作流，并讨论进化时机、反馈证据、评估与安全挑战。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Learn Claude Code](https://github.com/shareAI-lab/learn-claude-code) | 实践课程 | 从零构建类 Claude Code 的 AI Agent，12 个渐进式课程涵盖 Agent Loop、工具调用、子代理、上下文压缩、任务系统、多代理协作和 Worktree 隔离。 | |
+| [从零开始理解 Agent](https://mp.weixin.qq.com/s/Ur3jsyDYobBocXd8ts0gpw) | 教程 | 从极简实现出发，逐层拆解 OpenClaw、Claude Code 等 AI Agent 的循环、工具、记忆和 Skill 等核心概念。 | |
+| [nanoAgent](https://github.com/GitHubxsy/nanoAgent) | 实践项目 | 通过小型代码和配套章节讲解大模型、Agent 与 Skill 的底层原理，并展示从最小 Agent Loop 到工程化能力的演进。 | |
+| [Self-Evolving Coding Agents 最新综述](https://mp.weixin.qq.com/s/hSrJLcZN3j7J7X02N2HIMg) | 综述 | 系统梳理 Coding Agent 如何利用测试、编译和执行轨迹持续更新框架、记忆、技能与工具、模型以及协作工作流，并讨论进化时机、反馈证据、评估与安全挑战。 | |
 
 ## Agent Memory
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [A Survey of Agent Memory in the Second Half: Towards Self-Evolving and Long-Horizon Agents](https://arxiv.org/abs/2602.06052) | 综述论文 | 从记忆载体、认知机制和记忆主体三个维度整理 Agent Memory，并讨论单 Agent 与多 Agent 系统中的记忆操作、可学习的管理策略、评测与开放问题。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [A Survey of Agent Memory in the Second Half: Towards Self-Evolving and Long-Horizon Agents](https://arxiv.org/abs/2602.06052) | 综述论文 | 从记忆载体、认知机制和记忆主体三个维度整理 Agent Memory，并讨论单 Agent 与多 Agent 系统中的记忆操作、可学习的管理策略、评测与开放问题。 | |
 
 ## Harness Engineering
 
 Harness Engineering 指的是一种开发方式：工程师设计环境、规则和测试反馈系统，让 AI Agent 自动生成并改进代码。
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) | 官方博客 | Anthropic 总结跨多个上下文窗口运行 Coding Agent 的方法，包括初始化 Agent、进度文件、功能清单、增量提交和端到端测试。 |
-| [Harness Engineering: Leveraging Codex in an Agent-First World](https://openai.com/index/harness-engineering/) | 官方博客 | OpenAI 总结 Agent-first 软件工程实践，重点介绍仓库知识、可读环境、架构约束、自动化反馈和 Agent-to-Agent Review。 |
-| [Minions: Stripe’s One-Shot, End-to-End Coding Agents](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents) | 官方博客 | 介绍 Stripe 内部 Coding Agent Minions 如何从任务描述出发完成实现、验证并提交 Pull Request，以及支撑它的工程环境。 |
-| [Minions: Stripe’s One-Shot, End-to-End Coding Agents - Part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2) | 官方博客 | 继续讨论 Minions 在大规模使用中的可靠性、人工审查、评测与迭代机制，以及每周合并大量 Agent PR 的实践经验。 |
-| [Vibe Coding AReaL：零手打代码开发分布式 RL 训练框架](https://zhuanlan.zhihu.com/p/2003269671630165191) | 博客 | 记录使用 Coding Agent 开发分布式强化学习训练框架 AReaL 的过程，关注任务拆解、反馈循环和无手写代码协作方式。 |
-| [Are Agent Harnesses Bringing Back Vibe Coding?](https://www.youtube.com/watch?v=13HP_bSeNjU) | 视频 | 讨论 Agent Harness 如何通过工具、上下文、约束和验证机制提升 Coding Agent 的自治能力，并重新界定 Vibe Coding。 |
-| [HarnessEval: The Era of Harness for Benchmarking](https://mirros.ai/blog/harnesseval)（[代码](https://github.com/mirros-lab/harnesseval-w)） | 研究博客 / 开源项目 | 将 Harness 用于交互式世界模型评测：Agent 根据案例选择 Skill、拆解问题并调用子 Agent，最终输出可核查的 Evidence Tree，而不只提供汇总分数。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) | 官方博客 | Anthropic 总结跨多个上下文窗口运行 Coding Agent 的方法，包括初始化 Agent、进度文件、功能清单、增量提交和端到端测试。 | |
+| [Harness Engineering: Leveraging Codex in an Agent-First World](https://openai.com/index/harness-engineering/) | 官方博客 | OpenAI 总结 Agent-first 软件工程实践，重点介绍仓库知识、可读环境、架构约束、自动化反馈和 Agent-to-Agent Review。 | |
+| [Minions: Stripe’s One-Shot, End-to-End Coding Agents](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents) | 官方博客 | 介绍 Stripe 内部 Coding Agent Minions 如何从任务描述出发完成实现、验证并提交 Pull Request，以及支撑它的工程环境。 | |
+| [Minions: Stripe’s One-Shot, End-to-End Coding Agents - Part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2) | 官方博客 | 继续讨论 Minions 在大规模使用中的可靠性、人工审查、评测与迭代机制，以及每周合并大量 Agent PR 的实践经验。 | |
+| [Vibe Coding AReaL：零手打代码开发分布式 RL 训练框架](https://zhuanlan.zhihu.com/p/2003269671630165191) | 博客 | 记录使用 Coding Agent 开发分布式强化学习训练框架 AReaL 的过程，关注任务拆解、反馈循环和无手写代码协作方式。 | |
+| [Are Agent Harnesses Bringing Back Vibe Coding?](https://www.youtube.com/watch?v=13HP_bSeNjU) | 视频 | 讨论 Agent Harness 如何通过工具、上下文、约束和验证机制提升 Coding Agent 的自治能力，并重新界定 Vibe Coding。 | |
+| [HarnessEval: The Era of Harness for Benchmarking](https://mirros.ai/blog/harnesseval) | 研究博客 / 开源项目 | 将 Harness 用于交互式世界模型评测：Agent 根据案例选择 Skill、拆解问题并调用子 Agent，最终输出可核查的 Evidence Tree，而不只提供汇总分数。 | [代码](https://github.com/mirros-lab/harnesseval-w) |
 
 ## 自动化 AI 研究
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [autoresearch](https://github.com/karpathy/autoresearch) | 实践项目 | 让 AI Agent 在单 GPU 上自动修改 nanochat 训练代码，以固定 5 分钟预算运行实验、评估结果并保留有效改动，形成最小化的自动研究闭环。 |
-| [First Steps Toward Automated AI Research](https://www.recursive.com/articles/first-steps-toward-automated-ai-research) | 研究博客 | Recursive 对自动研究系统的早期实践总结，涵盖长周期并行探索、结果验证，以及在 NanoChat、NanoGPT Speedrun 和 GPU Kernel 优化任务上的实验。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [autoresearch](https://github.com/karpathy/autoresearch) | 实践项目 | 让 AI Agent 在单 GPU 上自动修改 nanochat 训练代码，以固定 5 分钟预算运行实验、评估结果并保留有效改动，形成最小化的自动研究闭环。 | |
+| [First Steps Toward Automated AI Research](https://www.recursive.com/articles/first-steps-toward-automated-ai-research) | 研究博客 | Recursive 对自动研究系统的早期实践总结，涵盖长周期并行探索、结果验证，以及在 NanoChat、NanoGPT Speedrun 和 GPU Kernel 优化任务上的实验。 | |
