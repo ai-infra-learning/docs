@@ -5,71 +5,71 @@ description: "LLM Serving、缓存、调度、PD 分离、推测解码与量化"
 
 ## 系统概览与实践
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Time to First Token](https://github.com/patchy631/time-to-first-token) | 学习路线 | 一套为期 10 周、每天约 30 分钟的 LLM 推理 Serving 实践路线，以持续构建同一个 OpenAI 兼容服务为主线，覆盖 Roofline、vLLM、SGLang、可观测性、压测、量化、推测解码、KV Cache 淘汰、PD 分离、Kubernetes 与可复现 Benchmark。 |
-| [ai-inference-resources](https://github.com/aerlabsAI/ai-inference-resources) | 资源合集 | 面向 AI 推理系统工程师的精选资源合集，涵盖 LLM Serving、GPU Kernel 编程、Attention、量化、分布式推理和生产部署。 |
-| [Inside vLLM: Anatomy of a High-Throughput LLM Inference System](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html) | 官方博客 | 从请求生命周期切入 vLLM，梳理输入处理、调度、模型执行、连续批处理和 KV Cache 管理等核心组件。 |
-| [vLLM 源码解析](https://zhuanlan.zhihu.com/p/691038809) | 博客 | 以源码为主线介绍 vLLM 的请求处理、调度器、Worker、模型执行和 PagedAttention 等实现。 |
-| [nano-vllm 源码解析](https://www.bilibili.com/video/BV1xY3wzZEFJ/?spm_id_from=333.337.search-card.all.click&vd_source=e9ad6164e9e6dacc7d15834004d914dc) | 视频 | 基于精简版 nano-vllm 拆解推理引擎的调度循环、KV Cache、批处理和模型执行流程。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Time to First Token](https://github.com/patchy631/time-to-first-token) | 学习路线 | 一套为期 10 周、每天约 30 分钟的 LLM 推理 Serving 实践路线，以持续构建同一个 OpenAI 兼容服务为主线，覆盖 Roofline、vLLM、SGLang、可观测性、压测、量化、推测解码、KV Cache 淘汰、PD 分离、Kubernetes 与可复现 Benchmark。 | |
+| [ai-inference-resources](https://github.com/aerlabsAI/ai-inference-resources) | 资源合集 | 面向 AI 推理系统工程师的精选资源合集，涵盖 LLM Serving、GPU Kernel 编程、Attention、量化、分布式推理和生产部署。 | |
+| [Inside vLLM: Anatomy of a High-Throughput LLM Inference System](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html) | 官方博客 | 从请求生命周期切入 vLLM，梳理输入处理、调度、模型执行、连续批处理和 KV Cache 管理等核心组件。 | |
+| [vLLM 源码解析](https://zhuanlan.zhihu.com/p/691038809) | 博客 | 以源码为主线介绍 vLLM 的请求处理、调度器、Worker、模型执行和 PagedAttention 等实现。 | |
+| [nano-vllm 源码解析](https://www.bilibili.com/video/BV1xY3wzZEFJ/?spm_id_from=333.337.search-card.all.click&vd_source=e9ad6164e9e6dacc7d15834004d914dc) | 视频 | 基于精简版 nano-vllm 拆解推理引擎的调度循环、KV Cache、批处理和模型执行流程。 | |
 
 ## Agent 推理
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [AgentX Industry Impact: Optimizations for Agentic Workloads](https://inferencex.semianalysis.com/agentx/optimizations) | 技术专题 | 汇总 AgentX 真实 Agent 推理负载推动的 50 余项上游优化，覆盖 vLLM、SGLang、TensorRT-LLM、Dynamo、LMCache 等项目的 KV Cache、路由、调度、卸载与数据传输。 |
-| [AgentX - InferenceXv3: Does CUDA Moat Hold up in Agentic Inferencing?](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) | 行业分析 | 介绍 InferenceXv3 与 AgentX 的百万上下文、多轮 Agent 推理基准，分析 KV Cache 复用与卸载、路由、上下文并行及软硬件优化对真实负载性能的影响。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [AgentX Industry Impact: Optimizations for Agentic Workloads](https://inferencex.semianalysis.com/agentx/optimizations) | 技术专题 | 汇总 AgentX 真实 Agent 推理负载推动的 50 余项上游优化，覆盖 vLLM、SGLang、TensorRT-LLM、Dynamo、LMCache 等项目的 KV Cache、路由、调度、卸载与数据传输。 | |
+| [AgentX - InferenceXv3: Does CUDA Moat Hold up in Agentic Inferencing?](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) | 行业分析 | 介绍 InferenceXv3 与 AgentX 的百万上下文、多轮 Agent 推理基准，分析 KV Cache 复用与卸载、路由、上下文并行及软硬件优化对真实负载性能的影响。 | |
 
 ## KV Cache
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [LMCache 技术：计算与存储解耦下的分布式缓存演进](https://mp.weixin.qq.com/s/jt3FP6WoQHDGGNVAKr0wKg) | 论文合集 | 以 LMCache 为主线串联 CacheGen、CacheBlend、TraCT 等相关工作，梳理 KV Cache 压缩、知识融合、传输与分布式缓存系统的演进。 |
-| [KV Cache Compression and Its Infra Problems](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/) | 官方博客 | 从基础设施视角梳理 KV Cache 压缩，分析 FlashAttention 不暴露 Attention Score、PagedAttention 块内碎片使逻辑淘汰无法回收显存两类落地问题，并介绍 TriAttention 与 Forward-Packing Compaction 的解决思路。 |
-| [KV Caching in LLMs, Clearly Explained](https://x.com/akshay_pachaar/status/2020840784782913605) | X 文章 | 从自回归生成与 Attention 计算出发，解释 KV Cache 如何复用历史 K/V、消除重复投影计算，以及 Prefill、TTFT、显存开销、上下文长度与 GQA/MQA 之间的权衡。 |
-| [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) | 论文 | 提出 PagedAttention，以分页方式管理非连续 KV Cache，减少内存碎片和冗余复制，是 vLLM 高吞吐 Serving 的核心工作。 |
-| [CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion](https://arxiv.org/abs/2405.16444) | 论文 | 复用不同知识块的 KV Cache，并选择性重算少量 Token 以融合跨块注意力，在保持生成质量的同时降低 RAG 的 TTFT。 |
-| [SnapKV: LLM Knows What You are Looking for Before Generation](https://arxiv.org/abs/2404.14469) | 论文 | 从提示末尾的观察窗口识别各 Attention Head 关注的位置，仅保留聚类后的重要 KV，在无需微调的情况下压缩长上下文 KV Cache。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [LMCache 技术：计算与存储解耦下的分布式缓存演进](https://mp.weixin.qq.com/s/jt3FP6WoQHDGGNVAKr0wKg) | 论文合集 | 以 LMCache 为主线串联 CacheGen、CacheBlend、TraCT 等相关工作，梳理 KV Cache 压缩、知识融合、传输与分布式缓存系统的演进。 | |
+| [KV Cache Compression and Its Infra Problems](https://research.nvidia.com/labs/eai/blogs/kv-cache-compression-and-its-infra-problems/) | 官方博客 | 从基础设施视角梳理 KV Cache 压缩，分析 FlashAttention 不暴露 Attention Score、PagedAttention 块内碎片使逻辑淘汰无法回收显存两类落地问题，并介绍 TriAttention 与 Forward-Packing Compaction 的解决思路。 | |
+| [KV Caching in LLMs, Clearly Explained](https://x.com/akshay_pachaar/status/2020840784782913605) | X 文章 | 从自回归生成与 Attention 计算出发，解释 KV Cache 如何复用历史 K/V、消除重复投影计算，以及 Prefill、TTFT、显存开销、上下文长度与 GQA/MQA 之间的权衡。 | |
+| [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) | 论文 | 提出 PagedAttention，以分页方式管理非连续 KV Cache，减少内存碎片和冗余复制，是 vLLM 高吞吐 Serving 的核心工作。 | |
+| [CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion](https://arxiv.org/abs/2405.16444) | 论文 | 复用不同知识块的 KV Cache，并选择性重算少量 Token 以融合跨块注意力，在保持生成质量的同时降低 RAG 的 TTFT。 | |
+| [SnapKV: LLM Knows What You are Looking for Before Generation](https://arxiv.org/abs/2404.14469) | 论文 | 从提示末尾的观察窗口识别各 Attention Head 关注的位置，仅保留聚类后的重要 KV，在无需微调的情况下压缩长上下文 KV Cache。 | |
 
 ## 调度与批处理
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369) | 论文 | 将长 Prefill 切成固定大小的块，并在每个块中搭载 Decode 请求，以降低流水线气泡和批次间计算量波动。 |
-| [Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve](https://arxiv.org/abs/2403.02310) | 论文 | 将 Chunked Prefill 与无停顿调度结合，在控制 Time Between Tokens 的同时提升吞吐并降低 Prefill 对 Decode 的干扰。 |
-| [DeepSpeed-FastGen: High-throughput Text Generation for LLMs](https://arxiv.org/abs/2401.08671) | 论文 | 介绍 Dynamic SplitFuse、DeepSpeed-Inference 和 MII，通过动态组合 Prefill 与 Decode 工作提升生成吞吐和响应性。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills](https://arxiv.org/abs/2308.16369) | 论文 | 将长 Prefill 切成固定大小的块，并在每个块中搭载 Decode 请求，以降低流水线气泡和批次间计算量波动。 | |
+| [Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve](https://arxiv.org/abs/2403.02310) | 论文 | 将 Chunked Prefill 与无停顿调度结合，在控制 Time Between Tokens 的同时提升吞吐并降低 Prefill 对 Decode 的干扰。 | |
+| [DeepSpeed-FastGen: High-throughput Text Generation for LLMs](https://arxiv.org/abs/2401.08671) | 论文 | 介绍 Dynamic SplitFuse、DeepSpeed-Inference 和 MII，通过动态组合 Prefill 与 Decode 工作提升生成吞吐和响应性。 | |
 
 ## PD 分离
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670) | 论文 | 将 Prefill 与 Decode 放到不同 GPU，并分别优化资源分配和并行策略，以同时满足 TTFT 与 TPOT 的服务目标。 |
-| [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677) | 论文 | 根据 Prefill 的计算密集特征和 Decode 的内存密集特征拆分硬件池，实现分阶段独立扩缩容和异构资源配置。 |
-| [TetriInfer: Inference without Interference](https://arxiv.org/abs/2401.11181) | 论文 | 结合固定大小的 Prompt 分块、Prefill-Decode 分离和资源预测驱动的两级调度，减少混合工作负载之间的干扰。 |
-| [MemServe: Context Caching for Disaggregated LLM Serving with Elastic Memory Pool](https://arxiv.org/abs/2406.17565) | 论文 | 通过弹性分布式内存池统一管理 KV Cache，把跨请求上下文缓存与 Prefill-Decode 分离结合起来。 |
-| [Mooncake: A KVCache-centric Disaggregated Architecture](https://arxiv.org/abs/2407.00079) | 论文 | Kimi 的 KV Cache 中心化推理架构，分离 Prefill 与 Decode 集群，并利用 CPU、DRAM 和 SSD 构建分布式 KV Cache。 |
-| [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548) | 论文 | 为多轮 Agent 推理增加 Storage-to-Decode KV Cache 加载路径，并用全局调度平衡 Prefill 与 Decode 侧的存储带宽。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670) | 论文 | 将 Prefill 与 Decode 放到不同 GPU，并分别优化资源分配和并行策略，以同时满足 TTFT 与 TPOT 的服务目标。 | |
+| [Splitwise: Efficient Generative LLM Inference Using Phase Splitting](https://arxiv.org/abs/2311.18677) | 论文 | 根据 Prefill 的计算密集特征和 Decode 的内存密集特征拆分硬件池，实现分阶段独立扩缩容和异构资源配置。 | |
+| [TetriInfer: Inference without Interference](https://arxiv.org/abs/2401.11181) | 论文 | 结合固定大小的 Prompt 分块、Prefill-Decode 分离和资源预测驱动的两级调度，减少混合工作负载之间的干扰。 | |
+| [MemServe: Context Caching for Disaggregated LLM Serving with Elastic Memory Pool](https://arxiv.org/abs/2406.17565) | 论文 | 通过弹性分布式内存池统一管理 KV Cache，把跨请求上下文缓存与 Prefill-Decode 分离结合起来。 | |
+| [Mooncake: A KVCache-centric Disaggregated Architecture](https://arxiv.org/abs/2407.00079) | 论文 | Kimi 的 KV Cache 中心化推理架构，分离 Prefill 与 Decode 集群，并利用 CPU、DRAM 和 SSD 构建分布式 KV Cache。 | |
+| [DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference](https://arxiv.org/abs/2602.21548) | 论文 | 为多轮 Agent 推理增加 Storage-to-Decode KV Cache 加载路径，并用全局调度平衡 Prefill 与 Decode 侧的存储带宽。 | |
 
 ## 推测解码
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192) | 论文 | 让较小的 Draft Model 一次提出多个候选 Token，再由目标模型并行验证，在不改变输出分布的前提下减少串行解码步骤。 |
-| [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318) | 论文 | 给出 Speculative Sampling 算法和理论分析，通过近似模型生成候选并由目标模型校正，实现无损采样加速。 |
-| [Break the Sequential Dependency of LLM Inference Using Lookahead Decoding](https://arxiv.org/abs/2402.02057) | 论文 | 利用 Jacobi 迭代并行发现和验证高质量 N-gram，不依赖额外 Draft Model，减少自回归解码的串行依赖。 |
-| [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774) | 论文 | 在原模型上增加多个解码头预测后续 Token，并通过 Tree Attention 并行验证候选，避免部署独立 Draft Model。 |
-| [How Speculative Decoding Boosts vLLM Performance by up to 2.8x](https://blog.vllm.ai/2024/10/17/spec-decode.html) | 官方博客 | 介绍 vLLM 中推测解码的实现、配置、适用工作负载和基准结果，说明加速收益与开销的来源。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192) | 论文 | 让较小的 Draft Model 一次提出多个候选 Token，再由目标模型并行验证，在不改变输出分布的前提下减少串行解码步骤。 | |
+| [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318) | 论文 | 给出 Speculative Sampling 算法和理论分析，通过近似模型生成候选并由目标模型校正，实现无损采样加速。 | |
+| [Break the Sequential Dependency of LLM Inference Using Lookahead Decoding](https://arxiv.org/abs/2402.02057) | 论文 | 利用 Jacobi 迭代并行发现和验证高质量 N-gram，不依赖额外 Draft Model，减少自回归解码的串行依赖。 | |
+| [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774) | 论文 | 在原模型上增加多个解码头预测后续 Token，并通过 Tree Attention 并行验证候选，避免部署独立 Draft Model。 | |
+| [How Speculative Decoding Boosts vLLM Performance by up to 2.8x](https://blog.vllm.ai/2024/10/17/spec-decode.html) | 官方博客 | 介绍 vLLM 中推测解码的实现、配置、适用工作负载和基准结果，说明加速收益与开销的来源。 | |
 
 ## 量化
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [PyTorch 官方量化资料](https://docs.pytorch.org/docs/main/quantization.html#introduction-to-quantization) | 官方文档 | 汇总 PyTorch 量化的核心概念、后训练量化、量化感知训练、相关 API 和后端支持。 |
-| [PyTorch 量化实战项目](https://github.com/Laicheng0830/Pytorch_Model_Quantization/blob/main/pose_estimation.py) | 实践项目 | 以姿态估计模型为例演示 PyTorch 模型量化、校准、转换和量化前后的推理结果比较。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [PyTorch 官方量化资料](https://docs.pytorch.org/docs/main/quantization.html#introduction-to-quantization) | 官方文档 | 汇总 PyTorch 量化的核心概念、后训练量化、量化感知训练、相关 API 和后端支持。 | |
+| [PyTorch 量化实战项目](https://github.com/Laicheng0830/Pytorch_Model_Quantization/blob/main/pose_estimation.py) | 实践项目 | 以姿态估计模型为例演示 PyTorch 模型量化、校准、转换和量化前后的推理结果比较。 | |
 
 ## LLM 应用系统
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Parrot: Efficient Serving of LLM-based Applications with Semantic Variable](https://arxiv.org/abs/2405.19888) | 论文 | 用 Semantic Variable 暴露多个 LLM 请求之间的数据流关系，让 Serving 系统执行跨请求分析、调度和缓存优化。 |
-| [Teola: Towards End-to-End Optimization of LLM-based Applications](https://arxiv.org/abs/2407.00326) | 论文 | 将应用工作流表示为细粒度数据流图，跨 LLM 与非 LLM 组件执行并行、流水线和端到端调度优化。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Parrot: Efficient Serving of LLM-based Applications with Semantic Variable](https://arxiv.org/abs/2405.19888) | 论文 | 用 Semantic Variable 暴露多个 LLM 请求之间的数据流关系，让 Serving 系统执行跨请求分析、调度和缓存优化。 | |
+| [Teola: Towards End-to-End Optimization of LLM-based Applications](https://arxiv.org/abs/2407.00326) | 论文 | 将应用工作流表示为细粒度数据流图，跨 LLM 与非 LLM 组件执行并行、流水线和端到端调度优化。 | |

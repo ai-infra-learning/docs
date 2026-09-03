@@ -5,50 +5,51 @@ description: "GPU 架构、CUDA、Triton、CUTLASS、TileLang 与 FlashAttention
 
 ## GPU 架构
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Building a Tiny GPU to Understand AI Hardware Engineering](https://levelup.gitconnected.com/building-a-tiny-gpu-to-understand-ai-hardware-engineering-62bb08f2d1d1) | 博客 | 通过构建一个微型 GPU 模型理解线程执行、SIMT、Warp 调度、内存访问和矩阵计算等 AI 加速器基础机制。 |
-| [A History of NVIDIA Stream Multiprocessor](https://fabiensanglard.net/cuda/index.html) | 博客 | 按 Tesla、Fermi、Kepler、Maxwell、Pascal 和 Turing 的演进梳理 NVIDIA SM、CUDA Core、Warp 与专用计算单元的变化。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Building a Tiny GPU to Understand AI Hardware Engineering](https://levelup.gitconnected.com/building-a-tiny-gpu-to-understand-ai-hardware-engineering-62bb08f2d1d1) | 博客 | 通过构建一个微型 GPU 模型理解线程执行、SIMT、Warp 调度、内存访问和矩阵计算等 AI 加速器基础机制。 | |
+| [A History of NVIDIA Stream Multiprocessor](https://fabiensanglard.net/cuda/index.html) | 博客 | 按 Tesla、Fermi、Kepler、Maxwell、Pascal 和 Turing 的演进梳理 NVIDIA SM、CUDA Core、Warp 与专用计算单元的变化。 | |
 
 ## CUDA
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [NVIDIA Accelerated Computing Hub](https://github.com/NVIDIA/accelerated-computing-hub) | 资源合集 | NVIDIA 维护的 GPU 计算开放学习资料库，汇集用户指南、教程、示例、最佳实践和优化方法，覆盖 CUDA C++、加速 Python、标准并行、Warp、nvmath-python 与 GPU 部署，并提供可在 Brev 或 Colab 运行的交互式内容。 |
-| [CUDA 教程合集 - 比飞鸟贵重的多_HKL](https://space.bilibili.com/218427631/lists/4695308?type=series) | 视频合集 | 中文 CUDA 系列课程，从并行编程和 Kernel 基础逐步进入内存层次、常用算子实现与性能优化。 |
-| [CUDA Programming Course - High-Performance Computing with GPUs](https://www.youtube.com/watch?v=86FAWCzIe_4) | 视频课程 | 系统介绍 CUDA 编程模型、线程层次、GPU 内存、Kernel 编写和高性能计算中的常见优化方法。 |
-| [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) | 博客 | 从朴素 SGEMM 开始，逐步加入合并访存、共享内存、Block Tiling、向量化、自动调优和 Warp Tiling，逼近 cuBLAS 性能。 |
-| [LeetCUDA](https://github.com/xlite-dev/LeetCUDA) | 资源合集 | 面向初学者的现代 CUDA 学习笔记，包含 PyTorch、200 多个 CUDA Kernel、Tensor Core、HGEMM 和 FA-2 MMA。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [NVIDIA Accelerated Computing Hub](https://github.com/NVIDIA/accelerated-computing-hub) | 资源合集 | NVIDIA 维护的 GPU 计算开放学习资料库，汇集用户指南、教程、示例、最佳实践和优化方法，覆盖 CUDA C++、加速 Python、标准并行、Warp、nvmath-python 与 GPU 部署，并提供可在 Brev 或 Colab 运行的交互式内容。 | |
+| [CUDA 教程合集 - 比飞鸟贵重的多_HKL](https://space.bilibili.com/218427631/lists/4695308?type=series) | 视频合集 | 中文 CUDA 系列课程，从并行编程和 Kernel 基础逐步进入内存层次、常用算子实现与性能优化。 | |
+| [CUDA Programming Course - High-Performance Computing with GPUs](https://www.youtube.com/watch?v=86FAWCzIe_4) | 视频课程 | 系统介绍 CUDA 编程模型、线程层次、GPU 内存、Kernel 编写和高性能计算中的常见优化方法。 | |
+| [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) | 博客 | 从朴素 SGEMM 开始，逐步加入合并访存、共享内存、Block Tiling、向量化、自动调优和 Warp Tiling，逼近 cuBLAS 性能。 | |
+| [LeetCUDA](https://github.com/xlite-dev/LeetCUDA) | 资源合集 | 面向初学者的现代 CUDA 学习笔记，包含 PyTorch、200 多个 CUDA Kernel、Tensor Core、HGEMM 和 FA-2 MMA。 | |
 
 ## TileLang
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [TileLang Puzzles](https://github.com/tile-ai/tilelang-puzzles) | 实践项目 | 通过 10 个渐进式练习入门 TileLang，从基础操作逐步推进到 GEMM 和 FlashAttention。每道练习均可独立运行，并提供参考实现。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [TileLang Puzzles](https://github.com/tile-ai/tilelang-puzzles) | 实践项目 | 通过 10 个渐进式练习入门 TileLang，从基础操作逐步推进到 GEMM 和 FlashAttention。每道练习均可独立运行，并提供参考实现。 | |
 
 ## CUTLASS
 
-| 资源 | 类型 | 简介 | 配套资料 |
-|------|------|------|----------|
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
 | [Learn CUTLASS the Hard Way!](https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way/) | 博客 | 从朴素 FP32 GEMM 逐步推进到 BF16、Tensor Core、Swizzling、流水线、自动调优和 CUTLASS Kernel，并以 RTX 4090 为主要实验平台。 | [视频](https://www.youtube.com/watch?v=_ZOK0WmGm7o) |
 | [Learn CUTLASS the Hard Way - Part 2!](https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way-2/) | 博客 | 面向 H100 与 Hopper 架构，介绍 Thread Block Cluster、TMA、Warp Specialization 等特性，并使用 CUTLASS 优化 GEMM。 | |
 
 ## Triton
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [Deep Dive into Triton Internals (Part 1)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals/) | 博客 | 总览 Triton 从 Python DSL 到 TTIR、TTGIR、LLVM IR、PTX 和 CUBIN 的编译与代码生成流程。 |
-| [Deep Dive into Triton Internals (Part 2)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals-2/) | 博客 | 跟踪 `triton.compile` 在 Python 前端和 C++ 原生层中的调用路径，解释 AST Source、缓存键和编译阶段的组织方式。 |
-| [Deep Dive into Triton Internals (Part 3)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals-3/) | 博客 | 深入 Triton 的 MLIR 后端，说明各类 Pass 如何逐步降低 IR 并生成面向 NVIDIA GPU 的代码。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [Deep Dive into Triton Internals (Part 1)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals/) | 博客 | 总览 Triton 从 Python DSL 到 TTIR、TTGIR、LLVM IR、PTX 和 CUBIN 的编译与代码生成流程。 | |
+| [Deep Dive into Triton Internals (Part 2)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals-2/) | 博客 | 跟踪 `triton.compile` 在 Python 前端和 C++ 原生层中的调用路径，解释 AST Source、缓存键和编译阶段的组织方式。 | |
+| [Deep Dive into Triton Internals (Part 3)](https://www.kapilsharma.dev/posts/deep-dive-into-triton-internals-3/) | 博客 | 深入 Triton 的 MLIR 后端，说明各类 Pass 如何逐步降低 IR 并生成面向 NVIDIA GPU 的代码。 | |
 
 ## FlashAttention
 
-| 资源 | 类型 | 简介 |
-|------|------|------|
-| [FlashAttention from First Principles](https://ai.gopubby.com/flashattention-from-first-principles-part-1-5a9f2407d739#bypass) | 博客 | 从标准 Attention 的内存瓶颈出发，推导分块、Online Softmax 和避免物化完整注意力矩阵的实现思路。 |
-| [FlashAttention - Visually and Exhaustively Explained](https://ai.gopubby.com/flashattention-visually-and-exhaustively-explained-d6124670f7fb#bypass) | 博客 | 使用可视化示例解释 FlashAttention 的 Tiling、重计算、Online Softmax、前向与反向过程。 |
-| [Flash Attention 2.0 with Tri Dao](https://www.youtube.com/watch?v=IoMSGuiwV3g&t=2240s) | 视频 | Tri Dao 讲解 FlashAttention-2 的算法设计、并行划分、GPU 利用率和相对第一版的优化。 |
-| [Flash Attention 学习过程【详】解](https://www.bilibili.com/video/BV1FM9XYoEQ5) | 视频 | 中文讲解 FlashAttention 的计算流程、公式推导、分块策略和实现中的关键细节。 |
-| [ELI5: FlashAttention](https://gordicaleksa.medium.com/eli5-flash-attention-5c44017022ad) | 博客 | 以直观方式解释 Attention 的显存访问开销，以及 FlashAttention 如何通过 IO-aware 计算降低 HBM 读写。 |
-| [Designing Hardware-Aware Algorithms: FlashAttention](https://www.digitalocean.com/community/tutorials/flashattention) | 教程 | 从 GPU 内存层次和 Roofline 视角介绍硬件感知算法设计，并用 FlashAttention 展示计算与数据搬运的权衡。 |
-| [FlashAttention: Fast and Memory-Efficient Exact Attention With IO-Awareness](https://www.nvidia.com/en-us/on-demand/session/gtc24-s62546/) | 技术演讲 | NVIDIA GTC 演讲，系统介绍 IO-aware 精确 Attention、Kernel 实现与训练长上下文模型的性能收益。 |
+| 资源 | 类型 | 简介 | 资料 |
+|------|------|------|------|
+| [FlashAttention 为什么又快又节省 GPU 显存？](https://www.bilibili.com/video/BV1TU8x6hEVb) | 视频 | 从 GPU 的 SRAM/HBM 存储层级和数据搬运成本出发，推导 Kernel Fusion、Online Softmax 与 Tiling 如何让 FlashAttention 在保持精确 Attention 计算的同时减少 HBM 读写和显存占用。 | [配套资料](https://zhangchitc.github.io/codex/078_flash_attention/visual.html) |
+| [FlashAttention from First Principles](https://ai.gopubby.com/flashattention-from-first-principles-part-1-5a9f2407d739#bypass) | 博客 | 从标准 Attention 的内存瓶颈出发，推导分块、Online Softmax 和避免物化完整注意力矩阵的实现思路。 | |
+| [FlashAttention - Visually and Exhaustively Explained](https://ai.gopubby.com/flashattention-visually-and-exhaustively-explained-d6124670f7fb#bypass) | 博客 | 使用可视化示例解释 FlashAttention 的 Tiling、重计算、Online Softmax、前向与反向过程。 | |
+| [Flash Attention 2.0 with Tri Dao](https://www.youtube.com/watch?v=IoMSGuiwV3g&t=2240s) | 视频 | Tri Dao 讲解 FlashAttention-2 的算法设计、并行划分、GPU 利用率和相对第一版的优化。 | |
+| [Flash Attention 学习过程【详】解](https://www.bilibili.com/video/BV1FM9XYoEQ5) | 视频 | 中文讲解 FlashAttention 的计算流程、公式推导、分块策略和实现中的关键细节。 | |
+| [ELI5: FlashAttention](https://gordicaleksa.medium.com/eli5-flash-attention-5c44017022ad) | 博客 | 以直观方式解释 Attention 的显存访问开销，以及 FlashAttention 如何通过 IO-aware 计算降低 HBM 读写。 | |
+| [Designing Hardware-Aware Algorithms: FlashAttention](https://www.digitalocean.com/community/tutorials/flashattention) | 教程 | 从 GPU 内存层次和 Roofline 视角介绍硬件感知算法设计，并用 FlashAttention 展示计算与数据搬运的权衡。 | |
+| [FlashAttention: Fast and Memory-Efficient Exact Attention With IO-Awareness](https://www.nvidia.com/en-us/on-demand/session/gtc24-s62546/) | 技术演讲 | NVIDIA GTC 演讲，系统介绍 IO-aware 精确 Attention、Kernel 实现与训练长上下文模型的性能收益。 | |
