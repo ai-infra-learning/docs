@@ -111,6 +111,7 @@
           {
             "group": "主题分类",
             "pages": [
+              "projects/training",
               "projects/llm-gateway",
               "projects/inference",
               "projects/performance",
