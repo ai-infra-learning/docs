@@ -114,6 +114,7 @@
               "projects/training",
               "projects/llm-gateway",
               "projects/inference",
+              "projects/gpu-programming",
               "projects/performance",
               "projects/agents",
               "projects/cluster-infrastructure"
