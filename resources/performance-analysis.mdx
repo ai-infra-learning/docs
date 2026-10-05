@@ -27,4 +27,7 @@ title: "性能分析"
 
 | 资源 | 类型 | 简介 | 资料 |
 |------|------|------|------|
+| [Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler](https://huggingface.co/blog/torch-profiler) | 博客 | 以矩阵乘法与加法为例，讲解 `torch.profiler` 的采集配置、统计表和 Perfetto 时间线，分析 CPU 调度、GPU Kernel 启动开销、预热及 `torch.compile` 的影响。 | [配套代码](https://huggingface.co/datasets/ariG23498/profiling-pytorch/tree/main) |
+| [Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP](https://huggingface.co/blog/torch-mlp-fusion) | 博客 | 从 `nn.Linear` 扩展到 GeGLU MLP，通过 Trace 比较 Eager、`torch.compile` 与手工优化 Kernel，解释张量布局、GEMM Epilogue 和 Triton 算子融合。 | [配套代码](https://huggingface.co/datasets/ariG23498/profiling-pytorch/tree/main) |
+| [Profiling in PyTorch (Part 3): Attention is all you profile](https://huggingface.co/blog/torch-attention-profile) | 博客 | 通过 Trace 比较朴素 Attention、原地 Mask 操作及 SDPA 的 Math、Efficient、Flash 和 cuDNN 后端，分析 Kernel 数量、数据搬运与融合实现的差异。 | [配套代码](https://huggingface.co/datasets/ariG23498/profiling-pytorch/tree/main) |
 | [PyTorch Profiling with NVIDIA Nsight](https://docs.lxp.lu/howto/pytorch-profiling-with-nsight/) | 教程 | 详细讲解 Nsight Systems 和 Nsight Compute 的分工、报告采集、CLI 与 UI 分析、NVTX 标记、时间线解读，以及 PyTorch 常见性能瓶颈的诊断与优化。 | |
