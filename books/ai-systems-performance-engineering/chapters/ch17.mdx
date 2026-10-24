@@ -35,7 +35,7 @@ Prefill 与 Decode 的阶段特征、基本部署方式见 [06 - PD 分离](/tal
 
 **一个项目可以覆盖多个层次，同一层也可以组合不同项目的组件。** [Dynamo](https://developer.nvidia.com/dynamo) 通过接入 vLLM、SGLang、TensorRT-LLM 等引擎执行模型，自身提供 Frontend、Router、Planner 和 KVBM 等组件，分别承担请求协调、容量调整和缓存管理。
 
-<Frame caption="根据 [vLLM Connector 接口](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/base.py)、[Dynamo KVBM](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/lib/bindings/kvbm/README.md)及下表资料整理。右侧纵框标出 Dynamo 的组件与依赖；图中列出代表实现，具体组合受版本和引擎支持情况约束。">
+<Frame caption="根据 [vLLM Connector 接口](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/base.py)、[Dynamo KVBM](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/lib/bindings/kvbm/README.md)及下表资料整理。横向色带表示职责分类，Dynamo 纵框内的组件也归入对应行；推理引擎为共用区域，具体组合受版本和引擎支持情况约束。">
   <img src="/books/ai-systems-performance-engineering/images/ch17-inference-stack.svg" alt="分离式推理的职责分层：KV Connector 位于推理引擎内部，外部缓存和传输库可以跨项目组合；右侧纵框展示 Dynamo 的组件及其接入的引擎和 NIXL" />
 </Frame>
 
