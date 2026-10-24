@@ -3,7 +3,15 @@ title: "第十七章：推理中分离式 Prefill 与 Decode 的扩展"
 description: "从 vLLM Connector、Dynamo 与 llm-d 的请求协调，到 Mooncake、LMCache 的 KV 生命周期、缓存路由与双池控制，并扩展到 EPD 和 AFD。"
 ---
 
-分离式推理把一次请求交给多个执行单元，扩展能力取决于这些单元怎样交接状态：谁选择下一阶段的 Worker，谁分配目标内存，谁确认数据可读，以及谁在失败后回收资源。PD 分离交接 KV Cache；多模态 EPD 分离增加 embedding 交接；Attention–FFN 分离（AFD）把中间激活交换放进模型逐层执行的关键路径。
+## 本章概要
+
+分离式推理把一次请求交给多个执行单元，扩展能力取决于**状态交接与资源生命周期**：谁选择下一阶段的 Worker，谁分配目标内存，谁确认数据可读，以及谁在失败后回收资源。
+
+- **PD 分离**在 Prefill 与 Decode 之间交接 KV Cache。
+- **多模态 EPD 分离**增加编码阶段与 embedding 交接。
+- **Attention–FFN 分离（AFD）**在逐层执行过程中反复交换中间激活。
+
+---
 
 ## PD 分离回顾
 
@@ -18,6 +26,8 @@ description: "从 vLLM Connector、Dynamo 与 llm-d 的请求协调，到 Moonca
 </Frame>
 
 比较部署方案时，需要固定总资源与请求分布，观察同时满足延迟约束的有效吞吐（goodput），并计入两个池的 GPU 成本。阶段特征与基本部署方式见 [06 - PD 分离](/talks/06-disaggregating-prefill-and-decoding)；并行部署和 KV 通信预算见[第十五章：多节点大模型推理——并行部署、解码优化与 MoE 路由](/books/ai-systems-performance-engineering/chapters/ch15)。
+
+---
 
 ## 引擎与 KV 传输层的衔接
 
@@ -35,7 +45,11 @@ vLLM 的 [KVConnectorBase_V1](https://github.com/vllm-project/vllm/blob/7a64fb8f
 
 例如，Prefill 已经算完一个请求，源 KV 仍可能被远端 Decode 读取。`request_finished` 可以要求延迟释放，直到完成通知到达。若在计算结束时立即把这些块分配给新请求，远端读取就可能遇到被覆盖的数据。
 
-同样，Decode 分配目标块只代表容量预留成功。接收完成之前，Attention 不能使用这些块；失败的加载需要向调度器反馈，而不能把部分有效的数据当成完整命中。**计算完成、传输完成、内存可回收，是三个不同的状态。**
+同样，Decode 分配目标块只代表容量预留成功。接收完成之前，Attention 不能使用这些块；失败的加载需要向调度器反馈，而不能把部分有效的数据当成完整命中。
+
+<Note>
+**计算完成、传输完成、内存可回收，是三个不同的状态。** 源块和目标块的释放都需要与在途操作协调。
+</Note>
 
 ### NIXL Pull 与 Push
 
@@ -54,7 +68,10 @@ vLLM 的 [KVConnectorBase_V1](https://github.com/vllm-project/vllm/blob/7a64fb8f
 | D 的选择时机 | 可以在 P 返回交接信息后选择 | 为提前注册目标空间，需要更早确定 D |
 | 资源权衡 | 源 KV 等待后续 D 读取 | D 提前保留目标空间，P 将就绪数据推送过去 |
 
-早选 D 可以把目标分配和注册提前，与 P 的工作重叠；也会让 D 的 KV 容量在真正开始生成之前就被占用。晚选 D 能利用更新的负载信息，但接收端准备工作可能落在 Prefill 之后。实际收益取决于请求时序与可重叠的工作量。
+- **早选 D**：目标分配和注册可以与 P 的工作重叠，D 的 KV 容量也会在真正开始生成之前就被占用。
+- **晚选 D**：可以利用更新的负载信息，但接收端准备工作可能落在 Prefill 之后。
+
+实际收益取决于请求时序与可重叠的工作量。
 
 <Frame caption="来源同上；实现细节见 [NIXL Push Connector 设计](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/docs/design/nixl_kv_push_connector.md)。">
   <img src="/books/ai-systems-performance-engineering/images/ch17-nixl-push-flow.png" alt="Push 路径中的目标块注册、Prefill 计算、后台写入和完成通知" />
@@ -78,6 +95,8 @@ Prefill 侧按本地 GPU Cache、LMCache、重新计算的顺序获取 KV。一�
 
 这组组合适合解释 Connector 的两种任务：**当前请求需要完成状态交接，后续请求需要保留可复用状态。** 两者可以共享数据传输基础设施，但完成条件、保存期限与失败处理不同。当前 MP 示例还依赖 vLLM 的 MultiConnector 实际块传递修复，部署版本应按示例要求核对，不能直接沿用早期 in-process LMCache 的配置。
 
+---
+
 ## KV 的存储、复用与生命周期
 
 ### 本地前缀与外部副本
@@ -98,17 +117,26 @@ Mooncake 把集群贡献的内存和存储组织成对象池，Master 返回副�
 
 ### 计算命中与传输命中
 
-假设一个请求的前 8,000 个 token 在 P 上已经缓存，后 2,000 个 token 需要计算。若 D 没有对应 KV，D 仍需要获取生成阶段所依赖的全部历史状态；P 的计算量下降，并不保证 P→D 的交接量同比下降。
+**示例：P 命中前缀，D 没有对应 KV。**
+
+假设一个请求的前 8,000 个 token 在 P 上已经缓存，后 2,000 个 token 需要计算：
+
+- **P 的计算**：复用已有前缀，只计算未命中的部分。
+- **D 的加载**：仍需要获取生成阶段所依赖的全部历史状态。
+
+P 的计算量下降，并不保证 P→D 的交接量同比下降。
 
 反过来，如果 D 已持有可复用的前缀，且 Connector 支持识别并跳过这些块，才可能减少本次加载量。[vLLM NIXL Pull Scheduler](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py) 会结合 D 的本地已计算 token 数确定外部加载范围；完全本地命中时仍需通知源端释放本次交接所保留的状态。
 
-因此，缓存指标至少要区分 P 的计算命中、D 的本地命中和外部层级命中。用一个“命中率”同时推算 Prefill FLOPs、网络流量与 Decode 容量，会掩盖它们发生在不同位置这一事实。
+因此，缓存指标至少要区分 **P 的计算命中、D 的本地命中和外部层级命中**。用一个“命中率”同时推算 Prefill FLOPs、网络流量与 Decode 容量，会掩盖它们发生在不同位置这一事实。
 
 ### 失败清理的边界
 
 一次交接中，源块可能被发送任务引用，目标块可能已经分配，存储副本也可能仍被租约保护。客户端取消请求后，这些资源需要分别结束自己的使用关系。通信超时只能说明等待超过期限；释放或复用远端可写内存之前，还需要确保旧操作不会继续访问它。
 
 错误也需要保留语义差异：可复用前缀不存在时，可以按缓存未命中处理；已承诺的 PD 交接失败时，则要遵循后端的加载失败策略。LMCache MP 的示例将 NIXL 加载失败设为 `fail`，而其 L2 适配器对失败与未命中的区分又不同。统一写成“传输失败就本地重算”会遗漏 Decode-only 部署和已提交请求的限制。
+
+---
 
 ## 请求协调与 Worker 选择
 
@@ -128,7 +156,13 @@ Mooncake 把集群贡献的内存和存储组织成对象池，Master 返回副�
   <img src="/books/ai-systems-performance-engineering/images/ch17-llmd-pd.svg" alt="llm-d 中网关、EPP、Decode Sidecar 与 Prefill/Decode Worker 的连接关系" />
 </Frame>
 
-`disagg-profile-handler` 先运行 Decode profile，再由 decider 根据 D 上未缓存的 prompt 部分决定是否选择远端 P。需要分离时再执行 Prefill profile，将 P、D 地址一起交给代理。这个顺序让“是否远程 Prefill”可以利用已选 D 的缓存信息；省略 P 的路径要求目标实例具备相应执行能力。
+`disagg-profile-handler` 按以下顺序选择实例：
+
+1. **选择 D**：运行 Decode profile，确定目标 Decode 实例。
+2. **判断是否分离**：decider 根据已选 D 上未缓存的 prompt 部分，决定是否选择远端 P。
+3. **按需选择 P**：需要分离时运行 Prefill profile，将 P、D 地址一起交给代理。
+
+这个顺序让“是否远程 Prefill”可以利用已选 D 的缓存信息；省略 P 的路径要求目标实例具备相应执行能力。
 
 在 vLLM/NIXL 路径中，Sidecar 先请求 P，获得 `KVTransferParams` 后再调用 D，由 D 拉取 KV。SGLang 的交接路径则使用 bootstrap 信息协调 P、D，可并发发起两侧请求。Sidecar 的控制顺序要适配引擎协议，不能只把后端名称替换掉。
 
@@ -138,6 +172,8 @@ Mooncake 把集群贡献的内存和存储组织成对象池，Master 返回副�
 | 跨阶段协调位置 | Frontend 与内部路由阶段 | D Pod 的 Routing Sidecar |
 | 缓存决策位置 | P 的前缀复用；该模式 D overlap 评分关闭 | decider 可以使用已选 D 的未命中部分 |
 | 关键约束 | 已派发 P 后的错误不能假定自动本地回退 | Sidecar 请求顺序取决于后端交接协议 |
+
+---
 
 ## 缓存局部性与负载感知路由
 
@@ -166,6 +202,8 @@ Radix Tree 将共享前缀压缩到共同路径，分叉处保存不同后缀。
 
 以 vLLM 为主的系统可以使用 Dynamo 的事件路由；SGLang 在这里提供的是另一种获取缓存位置的机制。二者的比较重点在信息成本与误差，而不是把 Radix Tree 当成某一个引擎独有的能力。
 
+---
+
 ## 双池容量、弹性与过载控制
 
 ### Dynamo Planner 的两个时间尺度
@@ -174,7 +212,12 @@ Radix Tree 将共享前缀压缩到共同路径，分叉处保存不同后缀。
   <img src="/books/ai-systems-performance-engineering/images/ch17-figure-7.png" alt="Planner 随工作负载调整 Prefill 与 Decode 资源池比例" />
 </Frame>
 
-Dynamo Planner 区分较慢的 throughput-based 预测与较快的 load-based 修正。预测路径使用流量、输入输出长度及性能模型估计容量需求；负载路径使用当前前向执行指标、队列与 Worker 状态调整副本数。两者同时启用时，预测路径给出副本数下界，负载路径可以在其上扩容，避免短暂空闲立即抵消为后续流量准备的容量。
+Dynamo Planner 使用两个时间尺度的控制：
+
+- **Throughput-based 预测**：使用流量、输入输出长度及性能模型估计容量需求，调整周期较慢。
+- **Load-based 修正**：使用当前前向执行指标、队列与 Worker 状态调整副本数，更快响应实时负载。
+
+两者同时启用时，预测路径给出**副本数下界**，负载路径可以在其上扩容，避免短暂空闲立即抵消为后续流量准备的容量。
 
 两个池需要不同的工作量描述。Prefill 容量受未命中输入 token 和计算形态影响；Decode 容量还受活跃序列、上下文长度、KV 占用和迭代延迟影响。单看 GPU Utilization 无法判断到底应该扩哪一侧。
 
@@ -200,6 +243,8 @@ $$
 | 生效条件 | 有可用资源，且新副本能完成加载与准备 | 有可用于判断未来可服务性的负载估计 |
 | 解决的问题 | 持续需求变化与两池容量失衡 | 容量暂时不足时减少无效计算 |
 
+---
+
 ## 多模态 EPD 分离
 
 ### 编码池与 Embedding 交接
@@ -217,11 +262,22 @@ $$
 
 以 Dynamo + vLLM 为例，独立 E 可以随图像请求量扩容，语言模型池按文本与视觉 token 的计算需求扩容。图像占比增加时，扩 E 可以缓解编码排队；若瓶颈已转移到 P 或 D，继续扩 E 就只会增加下游到达压力。是否使用较小 GPU 承担 E，还需要核对编码模型容量和 embedding 传输开销。
 
-Worker 拆分也不要求每个角色独占 GPU。Dynamo 的 EPD 分析比较了编码 Worker 与语言模型 Worker 共享 GPU，以及编码 Worker 使用独立硬件层的方案。前者分开队列与批处理，仍共享设备算力；后者增加资源隔离，也增加独立硬件成本。选择取决于编码占比、生成长度和可用硬件，不能只按 Worker 数量判断隔离程度。
+### Worker 划分与硬件放置
+
+Worker 拆分也不要求每个角色独占 GPU。Dynamo 的 EPD 分析比较了两种放置方式：
+
+- **共享 GPU**：编码 Worker 与语言模型 Worker 分开队列和批处理，仍共享设备算力。
+- **独立硬件层**：编码 Worker 使用单独的设备，增加资源隔离，也增加独立硬件成本。
+
+选择取决于编码占比、生成长度和可用硬件，不能只按 Worker 数量判断隔离程度。
+
+### Embedding 与 KV 的复用范围
 
 Embedding Cache 与 KV Prefix Cache 也需要分开统计。前者复用视觉编码结果，后者复用语言模型在具体上下文中形成的状态；相同图片放进不同 prompt，并不自动构成完整的语言模型前缀命中。图中先查 embedding cache、未命中再访问 E 的做法，可以避免重复编码，但 P 仍需完成尚未复用的语言模型计算。
 
 支持范围随后端与版本变化。例如上述 v1.2.1 文档中，vLLM 独立 E 处理 `image_url`，`video_url` 留在 P/PD 路径；不能把“三池部署”直接推导为所有多模态输入都已支持独立编码。
+
+---
 
 ## Attention–FFN 分离
 
@@ -235,9 +291,18 @@ AFD 沿模型层内的 Attention 与 FFN 边界拆分执行。Attention 侧保�
 
 [AFDConnectorBase](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/afd_plugin/connectors/base.py) 定义 `send_attn_output`、`recv_ffn_output` 等接口，传递 hidden states 以及层、阶段、token 布局等上下文。[AFDFFNWorker](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/afd_plugin/v1/worker/ffn_worker.py) 不分配 KV Cache，其工作由 Connector 元数据驱动。
 
-这条契约与 KVConnector 有明显区别：KVConnector 对接请求调度、块分配与外部缓存；AFD Connector 对接模型逐层执行，在 Attention 与 FFN rank 之间交换激活。将两个组件都称为 Connector，并不代表能用同一套数据格式或完成事件替换。
+两种 Connector 对接的执行边界不同：
 
-插件使 Attention 与 FFN 可以采用不同的资源和并行组织。Attention 一侧需要兼顾 KV 容量与访问局部性，FFN/MoE 一侧需要考虑计算批量和专家分布；把两个池拆开后，任一侧排队都会反映到逐层等待时间中。当前[插件 README](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/README.md) 明确标注实验状态，所核对快照的 GPU 目标版本为 vLLM 0.30.0，不能照搬较早博客中的兼容版本。
+- **KVConnector**：对接请求调度、块分配与外部缓存。
+- **AFD Connector**：对接模型逐层执行，在 Attention 与 FFN rank 之间交换激活。
+
+将两个组件都称为 Connector，并不代表能用同一套数据格式或完成事件替换。
+
+插件使 Attention 与 FFN 可以采用不同的资源和并行组织。Attention 一侧需要兼顾 KV 容量与访问局部性，FFN/MoE 一侧需要考虑计算批量和专家分布；把两个池拆开后，任一侧排队都会反映到逐层等待时间中。
+
+<Note>
+[插件 README](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/README.md) 明确标注**实验状态**。所核对快照的 GPU 目标版本为 **vLLM 0.30.0**，部署兼容性需按对应版本确认。
+</Note>
 
 ### 每 Token 的通信预算
 
@@ -257,6 +322,8 @@ NVIDIA 描述的异构 Decode 路径让 GPU 持有 KV 并执行 Attention，LPU 
 
 这是厂商公布的系统架构描述，与 vLLM AFD Plugin 是两个不同层次的实例。前者说明异构硬件分工，后者给出可检查的 Worker 和 Connector 契约；不能据此声称该插件已经实现或验证了 GPU/LPU 路径。
 
+---
+
 ## 架构验证的观测点
 
 验证分离方案时，除了固定模型、总资源、请求分布和 SLO，还应记录跨边界的等待与状态占用。以下观测对应前述机制，避免把所有时间合并进一个 TTFT 或 TPOT：
@@ -273,9 +340,13 @@ NVIDIA 描述的异构 Decode 路径让 GPU 持有 KV 并执行 Attention，LPU 
 
 这些是验证方案需要采集的证据，并非本页已执行的实验结果。缓存布局、传输内核和 profile 方法可继续结合[第十八章：高级 Prefill-Decode 与 KV Cache 调优](/books/ai-systems-performance-engineering/chapters/ch18)与[第十六章：大规模推理的分析、调试与调优](/books/ai-systems-performance-engineering/chapters/ch16)展开。
 
-## 源码与阅读资料
+---
 
-源码说明基于以下固定快照；部署兼容性与默认参数应以所用发行版为准。正文中的图注和关键机制已链接到对应来源。
+## 参考资料
+
+源码说明基于以下固定快照，部署兼容性与默认参数应以所用发行版为准。
+
+<Accordion title="项目源码与核对版本">
 
 | 项目 | 核对快照 | 阅读入口 |
 | --- | --- | --- |
@@ -287,4 +358,11 @@ NVIDIA 描述的异构 Decode 路径让 GPU 持有 KV 并执行 Attention，LPU 
 | LMCache | `6913259` | [MP 模式下的 PD 与跨请求复用](https://github.com/LMCache/LMCache/blob/6913259264dbebb2fa5ba1665606c40ffc5c6661/docs/source/mp/disaggregated_prefill.rst) |
 | vLLM AFD Plugin | `bcc0126` | [Connector 契约](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/docs/design/module/connector_contracts.md) |
 
-原书第十七章提供 PD 扩展的背景；EPD、AFD 与当前 Connector 实现是结合项目资料补充的扩展内容。原书 Markdown 与配图索引见[中英对照版本](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/chapters/ch17.md)。
+</Accordion>
+
+- [AI Systems Performance Engineering 中英对照版本](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/chapters/ch17.md)：原书第十七章正文与配图索引。
+- [Push-based KV Transfer with NIXL](https://vllm.ai/blog/2026-10-14-nixl-push-connector)：Pull/Push 交接时序与实现。
+- [Mooncake: Kimi’s KVCache-centric Architecture for LLM Serving](https://arxiv.org/abs/2407.00079)：缓存调度与过载下的提前拒绝。
+- [Dynamo Encoder Disaggregation](https://docs.nvidia.com/dynamo/v1.2.1/user-guides/multimodal/encoder-disaggregation)：编码拆分方式与后端支持范围。
+- [vLLM AFD Plugin](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin)：Attention/FFN 分离的软件架构。
+- [Inside NVIDIA Groq 3 LPX](https://developer.nvidia.com/blog/inside-nvidia-groq-3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-rubin-platform/#decode_phase_a_repeated_multi-engine_loop)：GPU/LPU 异构 Decode 数据流。
