@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="710" viewBox="0 0 1200 710" role="img" aria-labelledby="title desc">
+  <title id="title">分离式推理的组件分工与 Dynamo 的组合方式</title>
+  <desc id="desc">左侧按服务协调、推理引擎、缓存管理、数据传输分层，KV Connector 嵌套在推理引擎内部。右侧纵框列出 Dynamo 的 Frontend、Router、Planner、Connector 插件和可选 KVBM，以及它接入推理引擎和 NIXL 的关系。各层列出代表实现，可以跨项目组合。</desc>
+  <style>
+    text { font-family: "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #17324d; }
+    .label { font-size: 24px; font-weight: 700; }
+    .role { font-size: 18px; fill: #455c70; }
+    .project { font-size: 24px; font-weight: 600; text-anchor: middle; }
+    .detail { font-size: 18px; fill: #455c70; text-anchor: middle; }
+    .dynamo { font-size: 18px; font-weight: 600; text-anchor: middle; fill: #355328; }
+  </style>
+  <rect width="1200" height="710" rx="10" fill="#ffffff"/>
+
+  <rect x="20" y="56" width="928" height="124" rx="6" fill="#e8f2fc" stroke="#9ab7d2"/>
+  <text class="label" x="40" y="104">服务协调</text>
+  <text class="role" x="40" y="136">选实例、转发请求</text>
+  <rect x="232" y="70" width="692" height="96" rx="4" fill="#ffffff" stroke="#bdd0e1"/>
+  <text class="project" x="578" y="112">llm-d · SGLang Router · …</text>
+  <text class="detail" x="578" y="145">请求路由与阶段协调</text>
+
+  <rect x="20" y="196" width="928" height="206" rx="6" fill="#e8f3e8" stroke="#9ab995"/>
+  <text class="label" x="40" y="254">推理引擎</text>
+  <text class="role" x="40" y="286">计算与本地 KV 管理</text>
+  <rect x="232" y="210" width="692" height="178" rx="4" fill="#ffffff" stroke="#bed5ba"/>
+  <text class="project" x="578" y="254">vLLM · SGLang · TensorRT-LLM · …</text>
+  <rect x="250" y="277" width="656" height="94" rx="4" fill="#eef6ee" stroke="#9ab995"/>
+  <text class="project" x="578" y="316">KV Connector / 传输适配</text>
+  <text class="detail" x="578" y="349">引擎内接口；实现可由外部插件提供</text>
+
+  <rect x="20" y="418" width="928" height="116" rx="6" fill="#fff4dc" stroke="#c9ad6e"/>
+  <text class="label" x="40" y="466">外部缓存</text>
+  <text class="role" x="40" y="498">保存、复用与淘汰</text>
+  <rect x="232" y="432" width="292" height="88" rx="4" fill="#ffffff" stroke="#e1cd9e"/>
+  <text class="project" x="378" y="469">LMCache</text>
+  <text class="detail" x="378" y="500">缓存管理 + 传输适配</text>
+  <rect x="540" y="432" width="336" height="88" rx="4" fill="#ffffff" stroke="#e1cd9e"/>
+  <text class="project" x="708" y="469">Mooncake Store</text>
+  <text class="detail" x="708" y="500">共享缓存池</text>
+  <text class="project" x="904" y="486">…</text>
+
+  <rect x="20" y="550" width="928" height="116" rx="6" fill="#eceaf7" stroke="#aaa0c5"/>
+  <text class="label" x="40" y="598">数据传输</text>
+  <text class="role" x="40" y="630">搬运 KV 数据</text>
+  <rect x="232" y="564" width="192" height="88" rx="4" fill="#ffffff" stroke="#c5bddb"/>
+  <text class="project" x="328" y="602">NIXL</text>
+  <text class="detail" x="328" y="633">多个项目可复用</text>
+  <rect x="440" y="564" width="436" height="88" rx="4" fill="#ffffff" stroke="#c5bddb"/>
+  <text class="project" x="658" y="602">Mooncake Transfer Engine</text>
+  <text class="detail" x="658" y="633">可独立使用，也被 Store 等组件调用</text>
+  <text class="project" x="904" y="618">…</text>
+
+  <rect x="970" y="12" width="210" height="654" rx="8" fill="#f4f8ed" stroke="#83a663" stroke-width="2" stroke-dasharray="8 5"/>
+  <text class="label" x="1075" y="42" text-anchor="middle" fill="#355328">Dynamo</text>
+  <rect x="984" y="70" width="182" height="96" rx="4" fill="#ffffff" stroke="#b7cba4"/>
+  <text class="dynamo" x="1075" y="106">Frontend / Router</text>
+  <text class="detail" x="1075" y="140">Planner：容量调整</text>
+  <text class="detail" x="1075" y="246">接入左侧推理引擎</text>
+  <rect x="984" y="277" width="182" height="94" rx="4" fill="#ffffff" stroke="#b7cba4"/>
+  <text class="dynamo" x="1075" y="314">DynamoConnector</text>
+  <text class="detail" x="1075" y="347">插件，在引擎内运行</text>
+  <rect x="984" y="432" width="182" height="88" rx="4" fill="#ffffff" stroke="#b7cba4"/>
+  <text class="dynamo" x="1075" y="468">KVBM（可选）</text>
+  <text class="detail" x="1075" y="500">分层缓存管理</text>
+  <text class="dynamo" x="1075" y="602">使用 NIXL</text>
+  <text class="detail" x="1075" y="633">调用左侧传输库</text>
+
+  <text class="detail" x="600" y="697">横向按职责分层；右侧列出 Dynamo 的组件与依赖，各层可以跨项目组合。</text>
+</svg>

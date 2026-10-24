@@ -7,13 +7,15 @@ description: "结合 vLLM、Dynamo、llm-d、Mooncake 和 LMCache，说明 KV �
 
 分离式推理让多个 Worker 分工完成一次请求。Worker 指执行推理计算的服务实例，下面用 P、D 分别表示 Prefill 和 Decode 实例。拆分后需要解决的核心问题是：**计算结果传给谁、存在哪里、何时可以使用和释放**。
 
-- **PD 分离**在 Prefill 与 Decode 之间交接 KV Cache。
-- **多模态 EPD 分离**增加编码阶段，将图像编码得到的 embedding（特征向量）传给语言模型。
-- **Attention–FFN 分离（AFD）**把一层中的 Attention 和 FFN 分开执行，反复传递两部分计算所需的中间激活。
+- **PD 分离**：在 Prefill 与 Decode 之间交接 KV Cache。
+- **多模态 EPD 分离**：增加编码阶段，将图像编码得到的 embedding（特征向量）传给语言模型。
+- **Attention–FFN 分离（AFD）**：把一层中的 Attention 和 FFN 分开执行，反复传递两部分计算所需的中间激活。
 
 ---
 
 ## PD 分离回顾
+
+Prefill 与 Decode 的阶段特征、基本部署方式见 [06 - PD 分离](/talks/06-disaggregating-prefill-and-decoding)。
 
 <Frame caption="原书图 17-1，图片获取自[中英对照 Markdown 仓库](https://github.com/notlate-cn/ai-systems-performance-engeering/tree/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/assets/images/ch17)。">
   <img src="/books/ai-systems-performance-engineering/images/ch17-figure-1.png" alt="长 Prefill 阻塞同一 GPU 上的 Decode 迭代" />
@@ -25,15 +27,57 @@ description: "结合 vLLM、Dynamo、llm-d、Mooncake 和 LMCache，说明 KV �
   <img src="/books/ai-systems-performance-engineering/images/ch17-figure-2.png" alt="共置与分离配置在 TTFT、TPOT 约束下的有效吞吐比较" />
 </Frame>
 
-比较部署方案时，需要固定总资源与请求分布，观察同时满足延迟约束的有效吞吐（goodput），并计入两个池的 GPU 成本。阶段特征与基本部署方式见 [06 - PD 分离](/talks/06-disaggregating-prefill-and-decoding)；并行部署和 KV 通信预算见[第十五章：多节点大模型推理——并行部署、解码优化与 MoE 路由](/books/ai-systems-performance-engineering/chapters/ch15)。
+比较部署方案时，需要固定总资源与请求分布，观察同时满足延迟约束的有效吞吐（goodput），并计入两个池的 GPU 成本。并行部署和 KV 通信预算见[第十五章：多节点大模型推理——并行部署、解码优化与 MoE 路由](/books/ai-systems-performance-engineering/chapters/ch15)。
+
+---
+
+## 分离式推理的组件分工
+
+**一个项目可以覆盖多个层次，同一层也可以组合不同项目的组件。** [Dynamo](https://developer.nvidia.com/dynamo) 通过接入 vLLM、SGLang、TensorRT-LLM 等引擎执行模型，自身提供 Frontend、Router、Planner 和 KVBM 等组件，分别承担请求协调、容量调整和缓存管理。
+
+<Frame caption="根据 [vLLM Connector 接口](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/base.py)、[Dynamo KVBM](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/lib/bindings/kvbm/README.md)及下表资料整理。右侧纵框标出 Dynamo 的组件与依赖；图中列出代表实现，具体组合受版本和引擎支持情况约束。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-inference-stack.svg" alt="分离式推理的职责分层：KV Connector 位于推理引擎内部，外部缓存和传输库可以跨项目组合；右侧纵框展示 Dynamo 的组件及其接入的引擎和 NIXL" />
+</Frame>
+
+**KV Connector 是引擎内的扩展接口，具体实现可以来自外部项目。** 例如，[DynamoConnector](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/lib/bindings/kvbm/python/kvbm/vllm_integration/connector/dynamo_connector.py) 继承 vLLM 的 `KVConnectorBase_V1`，分别在 Scheduler 和 Worker 中运行，将 vLLM 接入 KVBM。图中将该插件列入 Dynamo 纵框，表示实现来源；它的运行位置仍在引擎内。
+
+缓存管理决定 KV 存在哪里、保留多久以及能否复用；传输库执行具体的内存读写。Dynamo、Mooncake 和 LMCache 都涉及这两类工作：
+
+| 项目 | KV 保存与复用 | 数据怎么传 |
+| --- | --- | --- |
+| Dynamo | [KVBM](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/lib/bindings/kvbm/README.md) 管理分层缓存，可按需接入 | KVBM 调用 NIXL；NIXL 是可独立使用的传输库，也能被 vLLM、LMCache 等项目调用 |
+| Mooncake | [Mooncake Store](https://github.com/kvcache-ai/Mooncake/blob/6a835cbf934aa50c287261f255c83e6faffecb71/docs/source/design/architecture.md) 管理共享缓存池中的对象、副本和生命周期 | Store 调用 Mooncake Transfer Engine；Transfer Engine 也可单独用于 P、D 直接传输 |
+| LMCache | 缓存服务管理本地缓存，并通过适配器接入外部存储，包括 [Mooncake Store](https://github.com/LMCache/LMCache/blob/6913259264dbebb2fa5ba1665606c40ffc5c6661/docs/source/mp/l2_storage/mooncake_store.rst) | MP 模式的 [P2P Transfer Channel](https://docs.lmcache.ai/mp/p2p.html#transfer-engine-backends) 可选择 NIXL 或 Mooncake Transfer Engine；访问 Store 则走对应的存储适配器 |
+
+例如，`vLLM → LMCacheMPConnector → LMCache → Mooncake Store → Mooncake Transfer Engine` 是可配置的组合；若只需要 P、D 直接交接 KV，也可以通过引擎 Connector 调用传输库，省去共享缓存池。
 
 ---
 
 ## Connector 连接引擎与 KV 传输
 
-### vLLM 从查询 KV 到完成传输
+**KV Connector（连接器）让推理引擎能够使用其他实例或外部缓存中的 KV。** 它向调度器报告可复用的 KV，将请求对应到具体的缓存块，调用传输库或缓存服务完成加载、保存，并报告完成或失败。调度器据此决定请求何时继续计算、哪些块可以释放。
 
-vLLM 的 Connector（连接器）通过 [KVConnectorBase_V1](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/base.py) 向调度器报告外部有哪些 KV 可以复用。调度器分配本地 GPU 块后，Connector 再把块的位置和传输任务交给 Worker 执行。这里需要区分：**外部找到了 KV，不等于 KV 已经加载到本地、可以用于计算。**
+例如，P 算完一个请求后，D 需要知道 KV 存在 P 的哪些块中、应放入自己的哪些块，以及数据何时可用。Connector 将这些信息与引擎的调度、内存管理衔接起来，底层的 NIXL 或 Mooncake Transfer Engine 则执行具体的数据搬运。
+
+### vLLM 的 Connector 架构与执行流程
+
+vLLM 的 Connector 分别运行在 Scheduler 进程和各个 Worker 进程中：**调度侧确定需要传输哪些 KV，Worker 侧执行加载和保存。**
+
+<Frame caption="来源：[vLLM — Disaggregated Prefilling](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/docs/features/disagg_prefill.md#development)。图中的 `connector_metadata` 在本文采用的源码版本中对应 `kv_connector_metadata`。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-vllm-connector-architecture.png" alt="vLLM Connector 结构：Scheduler 内的 Connector 向各个 Worker 下发传输信息，Worker 内的 Connector 通过数据传输层与其他 vLLM 实例交换 KV" />
+</Frame>
+
+图中，从 Scheduler 指向 Worker 的细箭头随 `SchedulerOutput` 下发请求、块位置等传输信息；底部的双向粗箭头表示实际 KV 数据的传输。`Paged KV buffer` 是 Worker 持有的分页 KV 缓存，Worker 侧 Connector 将这些缓存块与底层传输库对接。
+
+调度侧 Connector 通过 [KVConnectorBase_V1](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/base.py) 向调度器报告外部有哪些 KV 可以复用。调度器分配本地 GPU 块后，Connector 再把块的位置和传输任务交给 Worker 执行。这里需要区分：**外部找到了 KV，不等于 KV 已经加载到本地、可以用于计算。**
+
+<Frame caption="来源：[vLLM — Disaggregated Prefilling 的 Worker 时序图](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/docs/features/disagg_prefill.md#development)。图中的 `wait_for_kv_layer` 对应本文源码版本的 `wait_for_layer_load`；图展示接口调用位置，具体 Connector 决定按层传输还是按请求传输。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-vllm-connector-workflow.png" alt="vLLM Worker 内 ModelRunner、Attention 与 Connector 的调用时序：启动 KV 加载、计算前等待当前层 KV、计算后保存 KV，以及提交保存和同步" />
+</Frame>
+
+Worker 侧由 ModelRunner 调用 `start_load_kv` 启动加载。对于按层加载的实现，Attention 在使用该层 KV 前调用 `wait_for_layer_load` 等待就绪；计算出 KV 后，可以通过 `save_kv_layer` 提交保存。`wait_for_save` 负责提交保存任务并执行必要的同步，异步传输的最终完成结果再交回调度器。
+
+调度器与 Worker 通过以下接口衔接一次传输：
 
 | 接口 | 告诉调度器或 Worker 什么 | 接下来做什么 |
 | --- | --- | --- |
@@ -50,6 +94,44 @@ vLLM 的 Connector（连接器）通过 [KVConnectorBase_V1](https://github.com/
 <Note>
 **算完了，不代表传完了；传输仍在进行时，相关内存不能提前分配给其他请求覆盖。** 发送端和接收端都要确认旧操作不再读写这些块，才能安全回收。
 </Note>
+
+### Dynamo 的 Decode-centric 交接
+
+原书介绍的 Dynamo 采用 **Decode-centric（以 Decode 为中心）**：请求先交给 D，由 D 决定是否把 Prefill 交给远端 P。D 提前分配接收 KV 的空间，P 完成后写回这些位置。Dynamo 的 [v0.8.0 架构流程文档](https://docs.nvidia.com/dynamo/v-0-8-0/design-docs/architecture-flow) 也描述了这条路径。
+
+<Frame caption="来源：[NVIDIA Dynamo 官方介绍](https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/)，2025 年 3 月，图 3。此图展示组件关系，Decode-centric 的请求顺序见后面的时序图。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-dynamo-architecture.png" alt="Dynamo 整体架构：API Server、Smart Router、Prefill 与 Decode Worker、Planner、事件通道、KV Cache Manager 和底层 NIXL 传输库" />
+</Frame>
+
+图中的 Prefill Engine 和 Decode Engine 可以由 vLLM 执行，内部仍保留调度器、KV 块管理和 Connector。Dynamo 在这些引擎之间协调请求，NIXL 连接实际数据路径。Smart Router 维护用于选实例的缓存位置索引；右侧 KV Cache Manager 则负责可选的缓存卸载，二者分别处理路由信息和 KV 副本。
+
+<Frame caption="原书图 17-3，来源：[中英对照 Markdown 仓库](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/chapters/ch17.md)。图中的队列传递 Prefill 任务和块信息，KV 数据在 P、D 之间直接传输。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-figure-3.png" alt="Dynamo Decode-centric 时序：D 接收请求并分配 KV 块，P 从队列领取任务，完成 Prefill 后写入 D 的目标块并通知 D 开始生成" />
+</Frame>
+
+1. **D 接收请求并分配空间**：检查本地前缀缓存，结合待计算的 Prefill 长度和排队情况决定是否使用远端 P；需要远端计算时，准备接收 KV 的块。
+2. **P 领取 Prefill 任务**：任务携带请求和 D 的目标块信息。原书图中还包含一条可选路径：P 读取 D 已缓存的前缀，减少重复计算。
+3. **P 计算并传回 KV**：P 完成缺失部分的 Prefill，通过 NIXL 将 KV 写入 D 已分配的块，然后发送完成通知。
+4. **D 开始生成**：接收完成后，把该请求加入 Decode 调度；等待 KV 期间，D 可以继续处理其他请求。
+
+这个流程中，Dynamo 协调任务交给谁，Connector 将任务中的块信息落实为引擎能够执行的传输，并把完成结果交回调度器。**先选 D 描述请求的安排顺序，Pull / Push 描述数据由谁发起读写。** 原书这条路径先选 D，再由 P 写入；其他部署可以先选 D，随后由 D 拉取 KV。
+
+<Note>
+Decode-centric 对应原书介绍的 Dynamo 架构。本文后面的 Dynamo 集成 Frontend 路径采用先 P 后 D 的顺序，两者属于不同版本和实现路径。
+</Note>
+
+### 不同 Connector 的 KV 路径
+
+直接传输的 Connector 负责把当前请求从 P 交给 D；接入缓存服务的 Connector 还可以保存 KV，供后续请求复用。下表按本文采用的源码版本比较这些实现。
+
+| vLLM Connector | KV 经过哪里 | 交接方式与用途 |
+| --- | --- | --- |
+| [NixlConnector / NixlPullConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py) | P 的 KV 内存 → D 的 KV 内存 | D 获得源端信息后发起 `READ`；P 保留源 KV，直到读取完成。该版本的 `NixlConnector` 是 Pull 实现的别名 |
+| [NixlPushConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/docs/design/nixl_kv_push_connector.md) | P 的 KV 内存 → D 的 KV 内存 | D 提供已分配的目标块信息，P 发起 `WRITE`；接收端准备可以与 Prefill 计算重叠 |
+| [MooncakeConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py) | P 的 KV 内存 → D 的 KV 内存 | D 请求 KV 并提供目标块信息，P 通过 Mooncake Transfer Engine 写入 D；用于引擎间直接交接 |
+| [MooncakeStoreConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py) | 引擎 ↔ Mooncake Store | 按对象查询、保存和加载 KV；共享存储中的副本可供后续请求使用 |
+| [LMCacheMPConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py) | 引擎 ↔ 独立 LMCache Server | 查询可复用前缀，把 KV 保存到缓存服务或加载回 GPU；具体存储层级由 LMCache 配置决定 |
+| [MultiConnector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py) | 组合多个 Connector 的路径 | 例如用 NIXL 完成当前请求的 P→D 交接，同时用 LMCache 保存 KV，供后续请求复用 |
 
 ### NIXL Pull 与 Push
 
@@ -87,9 +169,36 @@ vLLM 中的 [MooncakeConnector](https://github.com/vllm-project/vllm/blob/7a64fb
 
 [Mooncake Store Connector](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py) 则把 KV 接入共享存储。Store Master 记录 KV 对象存在哪里，管理空间分配、副本和租约；Client 通过 Transfer Engine 传输实际数据。直接传输用于两个引擎交接当前请求的 KV，共享存储则可以在请求结束后继续保存 KV，供后续请求复用。
 
+<Frame caption="来源：[Mooncake Store 架构](https://github.com/kvcache-ai/Mooncake/blob/6a835cbf934aa50c287261f255c83e6faffecb71/docs/source/design/store/mooncake-store.md#architecture)。图中展示 Client 嵌入 vLLM 进程、也可独立提供存储的部署方式。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-mooncake-store.png" alt="Mooncake Store 的 Master 管理对象位置，各个 vLLM 实例通过 Store Client 和 Transfer Engine 访问共享内存池" />
+</Frame>
+
+图中紫色连线传递对象位置、空间分配等信息，底部黑色连线通过 Transfer Engine 搬运 KV。绿色横条表示各节点共同提供的逻辑内存池，实际数据仍分散保存在各节点的内存中。
+
 ### LMCache 与 MultiConnector
 
 [LMCache 的 MP 分离式 Prefill 示例](https://github.com/LMCache/LMCache/blob/6913259264dbebb2fa5ba1665606c40ffc5c6661/docs/source/mp/disaggregated_prefill.rst) 使用 `MultiConnector` 组合两条路径：`NixlConnector` 负责本次请求的 P→D KV 交接，`LMCacheMPConnector` 负责引擎与独立 LMCache Server 之间的保存、查询和恢复。
+
+<Frame caption="根据上述 LMCache MP 示例整理；图中只画 KV 数据路径，省略请求路由与握手。两侧的 LMCache Server 分别保存各自引擎的 KV。">
+
+```mermaid
+flowchart TB
+    subgraph P["P 的 MultiConnector"]
+        PN["NixlConnector"]
+        PL["LMCacheMPConnector"]
+    end
+    subgraph D["D 的 MultiConnector"]
+        DN["NixlConnector"]
+        DL["LMCacheMPConnector"]
+    end
+    PS[("P 的 LMCache Server")]
+    DS[("D 的 LMCache Server")]
+    PN ==>|"当前请求的 KV 交接"| DN
+    PL <-->|"保存 / 加载"| PS
+    DL <-->|"保存 / 加载"| DS
+```
+
+</Frame>
 
 Prefill 侧按本地 GPU Cache、LMCache、重新计算的顺序获取 KV。一次请求结束后，保存到 LMCache 的前缀仍可服务后续请求，即使引擎 HBM 中的副本已经被淘汰。该示例为 P、D 分别部署 LMCache Server；跨服务器复用需要另行配置 P2P 与协调服务。
 
@@ -140,21 +249,48 @@ P 少算了前缀，D 仍可能需要接收完整的 prompt KV。
 
 ## Worker 选择与请求转发
 
-### Dynamo 先选 P 再选 D
+### Dynamo 集成 Frontend 先选 P 再选 D
 
 [Dynamo 集成 Frontend 的分离式路由](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/disaggregated-serving.md) 在发现匹配的 P、D 服务后，启用内部 Prefill Router。请求经预处理后先选 P；P 返回读取 KV 所需的信息，再由 Decode 路由选择 D，并把这些信息交给它。
 
+<Frame caption="译自上述 Dynamo 官方文档的请求流程图。实线表示请求与响应，虚线表示缓存事件；图中返回给 Router 的是 KV 读取信息，实际 KV 由 Worker 之间的传输路径交接。">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 90, "nodeSpacing": 55}}}%%
+flowchart TB
+    HTTP["客户端"] <-->|"请求 / 响应"| R["Frontend 内的 Router"]
+    R -->|"1. 请求 P"| P["Prefill Worker"]
+    P -->|"2. KV 读取信息"| R
+    R -->|"3. 携带信息请求 D"| D["Decode Worker"]
+    D -->|"4. 生成结果"| R
+    P -.->|"KV 缓存事件"| R
+```
+
+</Frame>
+
 在这条路径中，路由器主要根据 P 的缓存决定前缀复用。对应模式关闭了 D 的 overlap 评分，也就是选择 D 时不再按前缀缓存匹配程度加分。如果 P、D 分布在不同机架或区域，还可以根据已选 P 的位置限制 D 的候选范围，避免把 KV 传到网络路径不合适的实例。
 
-原书的 Decode-centric 图先确定 D，与上述路径的顺序不同，引用时需要区分版本和模式。在上述集成路径中，请求一旦发给 P，Prefill 或 KV 交接失败就会返回错误，不会自动改成由 D 完成全部计算。
+在上述集成路径中，请求一旦发给 P，Prefill 或 KV 交接失败就会返回错误，不会自动改成由 D 完成全部计算。
 
 ### llm-d 先选 D，再决定是否使用远端 P
 
+llm-d 在 Kubernetes 中组织 vLLM 实例，将请求路由、P/D 之间的 KV 交接、共享前缀缓存和副本扩缩容连接起来。原书图 15-4 展示了这些组件的关系。
+
+<Frame caption="原书图 15-4：基于 Kubernetes 的 llm-d / vLLM 分离式推理架构。图片来自[中英对照 Markdown 仓库](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/assets/images/ch15/fig15_995_1.png)，对应[原书第十五章的说明](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/chapters/ch15.md)。图中的缓存后端是架构示例。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-llmd-book-architecture.png" alt="原书 llm-d 架构：推理网关和调度器选择 vLLM 实例，Prefill 与 Decode 通过 NIXL 交接 KV，也可接入共享前缀缓存，Variant Autoscaler 调整两类实例的副本数" />
+</Frame>
+
+图中 P、D 之间经过 NIXL 的连线，以及两侧通向共享缓存的连线，对应前面介绍的两类 Connector 路径：**交接当前请求的 KV，以及保存、加载可复用的 KV。** 右侧的 Inference Scheduler 根据负载与缓存情况选择实例，Variant Autoscaler 则调整实例数量。
+
 [llm-d 的分离式服务设计](https://github.com/llm-d/llm-d/blob/d5e53624ca354290b48323a3786b4a9bba836e0b/docs/architecture/disaggregation/pd-disaggregation.md) 由 Endpoint Picker（EPP）选择实例，再由 D Pod 中的 Routing Sidecar（请求代理）分别向 P 和 D 发起请求。
+
+<Accordion title="llm-d 官方请求转发图">
 
 <Frame caption="来源：[llm-d PD Disaggregation 架构图](https://github.com/llm-d/llm-d/blob/d5e53624ca354290b48323a3786b4a9bba836e0b/docs/assets/pd-disaggregation.svg)。">
   <img src="/books/ai-systems-performance-engineering/images/ch17-llmd-pd.svg" alt="llm-d 中网关、EPP、Decode Sidecar 与 Prefill/Decode Worker 的连接关系" />
 </Frame>
+
+</Accordion>
 
 `disagg-profile-handler` 按以下顺序选择实例：
 
@@ -181,6 +317,24 @@ P 少算了前缀，D 仍可能需要接收完整的 prompt KV。
 
 [Dynamo Router](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-design.md) 根据引擎发布的 KV stored/removed（保存/移除）事件，记录哪些前缀存在哪些 Worker 或缓存层。实际 KV 由 vLLM 等组件保存，Router 保存的是位置记录。选择 Worker 时，Router 同时考虑能复用多少前缀，以及该 Worker 当前有多忙。
 
+在 **Dynamo Router + vLLM 本地 Prefix Cache** 的组合中，两侧分别执行缓存管理和路由策略：
+
+| 决策 | 负责组件 | 依据 |
+| --- | --- | --- |
+| 本地 GPU KV 块怎样分配、复用和淘汰 | vLLM 的 KV Cache Manager / [BlockPool](https://github.com/vllm-project/vllm/blob/7a64fb8fc9239cb65e0df9313fa759594dfb206a/vllm/v1/core/block_pool.py) | 引擎的缓存配置、块引用和可用空间 |
+| 某个前缀目前记录在哪些实例上 | Dynamo KV Indexer | Worker 上报的保存、移除事件 |
+| 新请求发给哪个实例 | Dynamo Router | 缓存复用收益、当前负载及路由权重 |
+
+例如，vLLM 为新请求回收了一个旧前缀的缓存块，会发布 `BlockRemoved` 事件；Dynamo 收到后更新对应的位置记录。即使事件尚未到达，实际执行时仍由 vLLM 检查缓存是否可用。提高 Router 对缓存命中的权重，会改变实例选择；本地块的保留与淘汰仍按引擎策略执行。
+
+如果再接入 [Dynamo KVBM](https://docs.nvidia.com/dynamo/v-0-8-0/components/kvbm/kvbm-in-v-llm)、LMCache 或 Mooncake Store，外部副本还受对应缓存组件的保留与淘汰策略控制。例如，GPU 中的副本已经淘汰，CPU 或存储中的副本仍可能存在；引擎需要通过 Connector 加载后才能使用。
+
+<Frame caption="来源：[Dynamo — Routing Concepts](https://github.com/ai-dynamo/dynamo/blob/3032e8a703e5680d7481b9e499a6f979ed37bba1/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/routing-concepts.md#cost-calculation)。KV Indexer 提供前缀匹配信息，Slot Tracker 跟踪正在处理的请求负载。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-dynamo-kv-routing.jpg" alt="Dynamo Router 将缓存事件更新的前缀索引与实时请求负载一起用于 Worker 评分和选择" />
+</Frame>
+
+图的上半部分是新请求的评分路径，下半部分是 Worker 更新缓存位置记录的路径。缓存命中会减少预计需要计算的 Prefill 工作量，已有请求的负载则会增加该 Worker 的预计成本。
+
 对两个候选 P，缓存更多的一侧未必更早完成。某个 Worker 若少算 4,000 个 token，却需要额外排队 300 ms，而另一个空闲 Worker 只需 100 ms 完成这些计算，最长前缀匹配就不是更好的选择。这些时间只是示例，实际选择需要使用对应模型和硬件上的测量结果。
 
 事件传到 Router 需要时间，多个 Router 看到的负载也可能不同。即使 Router 记录某份 KV 仍在，实际执行请求时它也可能已被淘汰，因此还需要引擎确认能否复用。Dynamo 也支持近似模式，并非所有部署都使用 KV 事件。
@@ -192,6 +346,22 @@ Radix Tree（基数树）把相同前缀放在同一条路径上，不同后缀�
 [SGLang Gateway 的 `CacheAwarePolicy`](https://github.com/sgl-project/sglang/blob/406786fd910dd82d03d1ce2c2e4c08b547786bc2/sgl-model-gateway/src/policies/cache_aware.rs) 记录请求文本及其被分配到的 Worker。后续请求出现相同前缀时，就据此估计哪个 Worker 可能有缓存。这省去了每次向 Worker 查询完整缓存的开销，但旧 KV 可能已经被淘汰。
 
 该实现先判断负载是否明显失衡：绝对负载差和相对比例同时越过阈值时，优先选择低负载实例；负载较平衡时，使用前缀匹配和阈值选择实例，匹配不足时转向最小负载。具体行为以链接中的策略实现为准，不把它推广到 SGLang 的所有路由模式。
+
+<Frame caption="根据上述 CacheAwarePolicy 源码整理的正常选择流程，假定候选 Worker 健康且近似树已建立。树中记录的是请求前缀与 Worker 的对应关系。">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 30}}}%%
+flowchart TB
+    B{"负载失衡"}
+    B -->|"是"| L["选择低负载 Worker"]
+    B -->|"否"| M{"近似树中的前缀<br/>匹配比例超过阈值"}
+    M -->|"是"| C["选择前缀匹配的 Worker"]
+    M -->|"否"| L
+    C --> U["在树中记录本次请求前缀<br/>与选中的 Worker"]
+    L --> U
+```
+
+</Frame>
 
 | 比较项 | Dynamo 的 KV 事件模式 | SGLang `CacheAwarePolicy` |
 | --- | --- | --- |
