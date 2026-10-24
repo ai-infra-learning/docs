@@ -419,6 +419,18 @@ $$
 
 ## 多模态 EPD 分离
 
+EPD 在多模态推理中进一步拆出 Encode（编码）阶段，让视觉编码与语言模型的 Prefill、Decode 分开调度。独立的编码池可以按图像负载调整批量和容量，减少视觉编码对语言模型计算的干扰；在文本与图像混合流量中，纯文本请求也能减少等待图像编码造成的阻塞。编码占比较高时，这有助于改善 TTFT 和满足延迟约束的 goodput。
+
+代价是增加 embedding 传输、跨 Worker 协调和排队。独立编码 Worker 如果与语言模型共享 GPU，仍会竞争算力；如果独占 GPU，则可能因图像请求不足而闲置。E、P、D 的容量也需要匹配：P 或 D 已经繁忙时，继续增加 E 可能扩大下游队列。[NVIDIA 的 EPD 分析](https://developer.nvidia.com/blog/when-to-use-encode-prefill-decode-disaggregation-to-accelerate-multimodal-model-serving/)比较了这些部署方式和负载条件。
+
+### 编码 Worker 的放置方式
+
+下图从左到右分别是聚合执行、Worker 分开但共享 GPU，以及编码池使用独立 GPU。中间方案分开队列与批处理；右侧方案进一步隔离硬件资源，并通过 NIXL 传递 embedding。图中的 P、D 仍共置，拆出 E 可以独立于 PD 分离实施。
+
+<Frame caption="来源：[NVIDIA — When to Use Encode-Prefill-Decode Disaggregation](https://developer.nvidia.com/blog/when-to-use-encode-prefill-decode-disaggregation-to-accelerate-multimodal-model-serving/)，图 3。右侧方案额外使用编码 GPU，需要计入总资源与成本。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-epd-placement.webp" alt="三种编码部署方式：聚合 Worker、编码与 PD Worker 共享 GPU、独立编码 GPU 通过 NIXL 向 PD 池传递 embedding" />
+</Frame>
+
 ### 编码池与 Embedding 交接
 
 [Dynamo 的 Encoder Disaggregation](https://docs.nvidia.com/dynamo/v1.2.1/user-guides/multimodal/encoder-disaggregation) 将视觉编码从语言模型执行路径移到独立 Encode Worker。E 计算图像 embedding，再交给下游语言模型；P 完成 prompt 计算并把 KV 交给 D。E 传的是图像特征，P 传的是语言模型的 KV，分别供后续不同的计算使用。
@@ -432,30 +444,33 @@ $$
 | E/PD | 独立 E；P 与 D 共置 | E→PD 的 embedding |
 | E/P/D | E、P、D 分别独立 | E→P 的 embedding；P→D 的 KV |
 
-以 Dynamo + vLLM 为例，独立 E 可以随图像请求量扩容，语言模型池按文本与视觉 token 的计算需求扩容。图像占比增加时，扩 E 可以缓解编码排队；若瓶颈已转移到 P 或 D，继续扩 E 就只会增加下游到达压力。是否使用较小 GPU 承担 E，还需要核对编码模型容量和 embedding 传输开销。
-
-### 独立 Worker 与独立 GPU
-
-Worker 拆分也不要求每个角色独占 GPU。Dynamo 的 EPD 分析比较了两种放置方式：
-
-- **共享 GPU**：编码 Worker 与语言模型 Worker 分开队列和批处理，仍共享设备算力。
-- **独立硬件层**：编码 Worker 使用单独的设备，增加资源隔离，也增加独立硬件成本。
-
-选择取决于编码占比、生成长度和可用硬件，不能只按 Worker 数量判断隔离程度。
-
 ### Embedding 与 KV 的复用范围
 
 Embedding Cache 与 KV Prefix Cache 也需要分开统计。前者复用视觉编码结果，后者复用语言模型针对当前 prompt 已经算出的 KV；相同图片放进不同 prompt，并不自动构成完整的语言模型前缀命中。图中先查 embedding cache、未命中再访问 E 的做法，可以避免重复编码，但 P 仍需完成尚未复用的语言模型计算。
 
 支持范围随后端与版本变化。例如上述 v1.2.1 文档中，vLLM 独立 E 处理 `image_url`，`video_url` 留在 P/PD 路径；不能把“三池部署”直接推导为所有多模态输入都已支持独立编码。
 
+### 图像负载与输出长度
+
+图像编码越重，拆分 E 越可能缓解瓶颈；输出越长，Decode 在端到端延迟中的占比越大，单独优化编码的收益就越有限。下图统计相对聚合部署的端到端延迟降幅：列是“图片数 × 每张图片的视觉 token 数”，行是输出长度 OSL。左图在 `5×128`、输出 2048 token 时为 **−2.5%**，即该配置下延迟反而增加。
+
+<Frame caption="来源：[NVIDIA EPD 实验](https://developer.nvidia.com/blog/when-to-use-encode-prefill-decode-disaggregation-to-accelerate-multimodal-model-serving/)，图 8。模型为 Qwen3.5 122B A10B NVFP4；基线和左图均使用 4 张 GB200，右图在 4 张 GB200 之外增加 2 张 RTX 6000D。数值是端到端延迟降幅，正值表示改善。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-epd-e2e-gains.webp" alt="EPD 端到端延迟降幅热力图：图片负载较重、输出较短时收益较大；共享 GPU 的编码拆分在轻图片负载、长输出时出现负收益" />
+</Frame>
+
+比较部署方案时，需要固定模型与精度、图文请求比例、图片数量与分辨率、输出长度和缓存命中条件，在相同总资源或成本预算下观察满足 TTFT、TPOT 约束的 goodput。编码 GPU 的成本和利用率也应计入，额外增加 E 的结果需要与同预算的聚合部署比较。
+
 ---
 
 ## Attention–FFN 分离
 
-### vLLM AFD Plugin 分开执行 Attention 与 FFN
-
 AFD 把同一层中的 Attention 和 FFN（前馈网络）交给不同 Worker。Attention 一侧保存历史 KV，将算出的 hidden states（中间激活）发给 FFN；FFN 算完后返回结果，供后续计算继续使用。PD 拆分请求的前后两个阶段，AFD 拆分每一层中的两部分计算，两者可以组合。
+
+收益是两侧可以分别选择设备数量、批量和并行方式：Attention 根据序列长度和 KV 显存需求配置资源，FFN/MoE 根据 token 数量和专家负载配置资源，减少两类计算共用一套部署配比的限制。[vLLM AFD Plugin](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin)将这一分工实现为独立的 Attention 服务和 FFN 服务。
+
+代价是每个拆分层都增加激活传输与同步。Decode 每生成一个 token 都要重复这些交接，任一侧排队都会拖慢后续计算，因此 TPOT 对通信延迟和两侧负载失衡更敏感。通信与计算重叠可以隐藏部分等待；批量太小、网络较慢或资源配比不合适时，传输成本可能超过独立部署的收益。
+
+### vLLM AFD Plugin 分开执行 Attention 与 FFN
 
 <Frame caption="来源：[vLLM AFD Plugin 官方介绍](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin)。图展示插件总体架构，兼容性以对应源码版本为准。">
   <img src="/books/ai-systems-performance-engineering/images/ch17-vllm-afd.svg" alt="vLLM AFD Plugin 中 Attention、FFN Worker 和 Connector 的关系" />
@@ -470,19 +485,29 @@ AFD 把同一层中的 Attention 和 FFN（前馈网络）交给不同 Worker。
 
 将两个组件都称为 Connector，并不代表能用同一套数据格式或完成事件替换。
 
-拆分后，Attention 与 FFN 可以使用不同的 GPU 数量和并行方式。Attention 一侧需要足够的 KV 显存，并尽量减少读取远端 KV；FFN/MoE 一侧需要考虑一次处理多少 token、专家分布在哪些设备上。每层计算都要等待两侧配合，因此任一侧排队都会拖慢后续计算。
-
 <Note>
 [插件 README](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/README.md) 明确标注**实验状态**。所核对快照的 GPU 目标版本为 **vLLM 0.30.0**，部署兼容性需按对应版本确认。
 </Note>
 
 ### 每个 Token 都要重复的通信
 
-PD 的主要 KV 交接发生在 P→D 阶段边界；AFD 在每个参与拆分的层交换激活。Decode 每生成一个 token 都要重复这些层内依赖，因此小消息延迟、同步和排队会直接影响 TPOT。
+Attention 输出完成后，需要经历发送、FFN 排队与计算、结果返回，才能继续依赖该结果的计算。微批流水线或 Dual Batch Overlap 可以将一个微批的等待与另一个微批的计算重叠，但可隐藏的时间受可并行工作、依赖关系和批量限制。
 
-以某一层为例，Attention 输出完成后，需要经历发送、FFN 排队与计算、结果返回，才能继续依赖该结果的计算。微批流水线或 Dual Batch Overlap 可以将一个微批的等待与另一个微批的计算重叠，但可隐藏的时间受可并行工作、依赖关系和批量限制。不能把“使用 DBO”直接写成“通信开销归零”。
+[FastAFD 解读](https://princepride.github.io/live-streaming-tools/fastafd_vllm_plugin/final/blog/)提供了插件与重叠执行的图解。分析 TPOT 时，需要区分已被计算覆盖的通信时间，以及仍处在当前 token 执行路径上的传输和等待。
 
-[FastAFD 解读](https://princepride.github.io/live-streaming-tools/fastafd_vllm_plugin/final/blog/) 提供了插件与重叠执行的图解。判断方案收益时，还需结合实际硬件、模型、微批划分、专家负载和源码支持范围；官方博客中的特定 benchmark 也不能替代完整模型与真实请求分布下的验证。
+### Attention 与 FFN 的资源配比
+
+vLLM 官方实验中，`48A16F` 表示 48 个 Attention 执行进程（rank）与 16 个 FFN 执行进程；硬件数量按芯片裸片（die）统计。EP64 是未做 Attention–FFN 分离的专家并行基线。
+
+16K 输入下，与使用 64 个 die 的 EP64 相比，同样使用 64 个 die 的 `48A16F` 单位 die 吞吐下降 **5.3%**；使用 80 个 die 的 `64A16F` 则提高 **11.3%**。拆分后的配比影响收益，按 die 归一化也不能替代相同总资源的比较。
+
+<Frame caption="来源：[vLLM AFD Plugin — 16K fixed input](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin#16k-fixed-input)。DeepSeek-V3.2 W8A8，Ascend 910C；输入固定为 16K，输出为 512–1536 token 均匀分布。横轴是运行时间，纵轴是单位 die 的输出 token 吞吐。">
+  <img src="/books/ai-systems-performance-engineering/images/ch17-afd-decode-throughput-16k.png" alt="EP64、48A16F 和 64A16F 的单位 die 吞吐随时间变化曲线，展示不同 Attention 与 FFN 配比的性能差异" />
+</Frame>
+
+<Note>
+这是饱和 Decode 吞吐实验。受机器数量限制，作者用较小物理部署模拟更大的逻辑规模，并使用会改变模型输出的强制专家均衡；它适合观察配比对性能的影响。生产部署仍需在真实专家路由下验证质量，并固定总资源、模型精度、互联条件和请求分布，比较满足相同 TTFT、TPOT 约束的 goodput。
+</Note>
 
 ### NVIDIA GPU 与 LPU 的异构 Decode
 
@@ -535,6 +560,15 @@ NVIDIA 描述的异构 Decode 路径让 GPU 持有 KV 并执行 Attention，LPU 
 - [AI Systems Performance Engineering 中英对照版本](https://github.com/notlate-cn/ai-systems-performance-engeering/blob/e3cd9597ffd7b8d7b236b4eca8b289e1affb7217/docs/chapters/ch17.md)：原书第十七章正文与配图索引。
 - [Push-based KV Transfer with NIXL](https://vllm.ai/blog/2026-10-14-nixl-push-connector)：Pull/Push 交接时序与实现。
 - [Mooncake: Kimi’s KVCache-centric Architecture for LLM Serving](https://arxiv.org/abs/2407.00079)：缓存调度与过载下的提前拒绝。
-- [Dynamo Encoder Disaggregation](https://docs.nvidia.com/dynamo/v1.2.1/user-guides/multimodal/encoder-disaggregation)：编码拆分方式与后端支持范围。
-- [vLLM AFD Plugin](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin)：Attention/FFN 分离的软件架构。
-- [Inside NVIDIA Groq 3 LPX](https://developer.nvidia.com/blog/inside-nvidia-groq-3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-rubin-platform/#decode_phase_a_repeated_multi-engine_loop)：GPU/LPU 异构 Decode 数据流。
+
+### EPD 分离
+
+- [When to Use Encode-Prefill-Decode Disaggregation to Accelerate Multimodal Model Serving](https://developer.nvidia.com/blog/when-to-use-encode-prefill-decode-disaggregation-to-accelerate-multimodal-model-serving/)（NVIDIA 官方博客，2026-09-09）：编码拆分的收益与代价、共享 GPU 与独立 GPU 的选择，以及图像负载和输出长度对收益的影响。正文的三种部署方式图取自图 3，端到端延迟热力图取自图 8；实验硬件与统计口径见原文 Test environment。
+- [Dynamo Encoder Disaggregation](https://docs.nvidia.com/dynamo/v1.2.1/user-guides/multimodal/encoder-disaggregation)（官方文档，v1.2.1）：E/PD 与 E/P/D 部署方式、embedding 交接、各推理后端的支持范围和启动示例。
+
+### Attention–FFN 分离
+
+- [Announcing vLLM AFD Plugin: Disaggregating Attention and FFN for Flexible MoE Serving](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin)（vLLM 官方博客，2026-07-23）：Attention/FFN 的资源需求、Worker 与 Connector 架构，以及不同资源配比的性能实验。正文架构图与 [16K Decode 吞吐图](https://vllm.ai/blog/2026-07-23-vllm-afd-plugin#16k-fixed-input)均来自此文；实验条件包括模拟逻辑规模和强制专家均衡。
+- [vLLM AFD Plugin README](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/README.md)（源码快照 `bcc0126`）：插件安装、版本要求、支持的后端与执行方式；[Connector 接口约定](https://github.com/vllm-project/afd-plugin/blob/bcc012632576abe34243d1373a157c896b339264/docs/design/module/connector_contracts.md)说明激活与执行信息的交接方式。
+- [Inside NVIDIA Groq 3 LPX: The Low-Latency Inference Accelerator for the NVIDIA Vera Rubin Platform](https://developer.nvidia.com/blog/inside-nvidia-groq-3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-rubin-platform/#decode_phase_a_repeated_multi-engine_loop)（NVIDIA 官方博客，2026-03-16）：GPU 执行 Attention、LPU 执行 FFN/MoE 的异构 Decode 循环，也是正文 GPU/LPU 数据流图的来源。
+- [大模型推理的内存与计算解耦：AFD 架构解析与性能验证](https://princepride.github.io/live-streaming-tools/fastafd_vllm_plugin/final/blog/)（vLLM 小课堂中文技术解读）：AFD 的资源配比、角色分工、双微批流水线与 FastAFD 优化图解，附原视频和课件链接。
