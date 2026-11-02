@@ -30,6 +30,7 @@ Harness Engineering 指的是一种开发方式：工程师设计环境、规则
 | 资源 | 类型 | 简介 | 资料 |
 |------|------|------|------|
 | [Effective Harnesses for Long-Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) | 官方博客 | Anthropic 总结跨多个上下文窗口运行 Coding Agent 的方法，包括初始化 Agent、进度文件、功能清单、增量提交和端到端测试。 | |
+| [Super-agent 设计探索：迈向更自主的 Agent 系统](https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg) | 技术文章 | DeepSeek 产品部对持续在线、多任务 Agent 的架构探索，介绍 Router/Worker 双层设计、事件驱动与异步交互，并讨论计算、状态、环境分离及 Watchdog 异常恢复机制。 | [研究原型](https://github.com/deepseek-ai/dsh-superagent-prototype) |
 | [Harness Engineering: Leveraging Codex in an Agent-First World](https://openai.com/index/harness-engineering/) | 官方博客 | OpenAI 总结 Agent-first 软件工程实践，重点介绍仓库知识、可读环境、架构约束、自动化反馈和 Agent-to-Agent Review。 | |
 | [Minions: Stripe’s One-Shot, End-to-End Coding Agents](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents) | 官方博客 | 介绍 Stripe 内部 Coding Agent Minions 如何从任务描述出发完成实现、验证并提交 Pull Request，以及支撑它的工程环境。 | |
 | [Minions: Stripe’s One-Shot, End-to-End Coding Agents - Part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2) | 官方博客 | 继续讨论 Minions 在大规模使用中的可靠性、人工审查、评测与迭代机制，以及每周合并大量 Agent PR 的实践经验。 | |
