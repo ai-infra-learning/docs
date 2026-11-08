@@ -25,3 +25,11 @@ title: "性能分析"
 | 项目 | 简介 | 参考资料 |
 |------|------|----------|
 | [pytorch/kineto](https://github.com/pytorch/kineto) | PyTorch Profiler 使用的底层 CPU 与 GPU Profiling 库，提供低开销 GPU Timeline、硬件性能计数器和诊断能力，并可导出 Chrome 或 Perfetto Trace。 | [PyTorch Profiler](https://docs.pytorch.org/docs/stable/profiler.html) |
+
+## 性能模拟
+
+| 项目 | 简介 | 参考资料 |
+|------|------|----------|
+| [aliyun/SimAI](https://github.com/aliyun/SimAI) | 面向大模型训练与推理的系统性能模拟器，结合计算工作负载、集合通信与网络模型，评估并行配置、NCCL 算法及网络拓扑对端到端耗时的影响。 | [官方教程](https://github.com/aliyun/SimAI/blob/master/docs/Tutorial.md) |
+| [astra-sim/astra-sim](https://github.com/astra-sim/astra-sim) | 分布式 AI 系统模拟框架，以 Chakra 执行图描述工作负载，结合计算、内存和网络后端，分析并行策略、集合通信与硬件配置对系统性能的影响。 | [官方文档](https://astra-sim.github.io/astra-sim-docs/index.html) |
+| [casys-kaist/LLMServingSim](https://github.com/casys-kaist/LLMServingSim) | 面向 LLM Serving 的性能模拟器，结合算子 Profiling 数据与 ASTRA-Sim，模拟请求调度、连续批处理、KV Cache、多卡并行和 Prefill-Decode 分离，输出 TTFT、TPOT、吞吐量等指标。 | [官方文档](https://llmservingsim.ai/docs/getting-started/overview) |
