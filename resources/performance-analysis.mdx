@@ -32,10 +32,3 @@ title: "性能分析"
 | [Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP](https://huggingface.co/blog/torch-mlp-fusion) | 博客 | 从 `nn.Linear` 扩展到 GeGLU MLP，通过 Trace 比较 Eager、`torch.compile` 与手工优化 Kernel，解释张量布局、GEMM Epilogue 和 Triton 算子融合。 | [配套代码](https://huggingface.co/datasets/ariG23498/profiling-pytorch/tree/main) |
 | [Profiling in PyTorch (Part 3): Attention is all you profile](https://huggingface.co/blog/torch-attention-profile) | 博客 | 通过 Trace 比较朴素 Attention、原地 Mask 操作及 SDPA 的 Math、Efficient、Flash 和 cuDNN 后端，分析 Kernel 数量、数据搬运与融合实现的差异。 | [配套代码](https://huggingface.co/datasets/ariG23498/profiling-pytorch/tree/main) |
 | [PyTorch Profiling with NVIDIA Nsight](https://docs.lxp.lu/howto/pytorch-profiling-with-nsight/) | 教程 | 详细讲解 Nsight Systems 和 Nsight Compute 的分工、报告采集、CLI 与 UI 分析、NVTX 标记、时间线解读，以及 PyTorch 常见性能瓶颈的诊断与优化。 | |
-
-## GPU 基础设施
-
-| 资源 | 类型 | 简介 | 资料 |
-|------|------|------|------|
-| [How we achieved truly serverless GPUs](https://modal.com/blog/truly-serverless-gpus) | 博客 | 介绍 Modal 降低 GPU 推理冷启动开销的系统设计，涵盖健康空闲 GPU 缓冲池、ImageFS 惰性加载与内容寻址缓存，以及进程与 CUDA 状态的检查点恢复。 | |
-| [Keeping 20,000 GPUs healthy](https://modal.com/blog/gpu-health) | 博客 | 介绍 Modal 的 GPU 集群可靠性实践，涵盖实例选型、机器镜像测试、启动检查、被动监控、定期主动检查，以及故障主机的排空与替换。 | |
