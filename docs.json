@@ -99,6 +99,7 @@
               "resources/inference",
               "resources/rag",
               "resources/gpu-programming",
+              "resources/gpu-infrastructure",
               "resources/performance-analysis",
               "resources/agents"
             ]
